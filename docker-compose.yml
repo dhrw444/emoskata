@@ -1,0 +1,16 @@
+services:
+  emoskata:
+    build: .
+    container_name: emoskata
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      TZ: Asia/Shanghai
+      PORT: "8080"
+      # 面板密码：不填则首次启动随机生成并打印到日志
+      PANEL_PASSWORD: "changeme"
+      # 对外访问地址，OAuth 回调要用。反代后填 https://你的域名
+      PUBLIC_BASE: "http://localhost:8080"
+    volumes:
+      - ./data:/app/data
