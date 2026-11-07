@@ -19,19 +19,33 @@ emos 服（emos.best）自动签到 —— 网页面板 + Telegram Bot 双向控
 
 ## 快速开始
 
+### 单文件版（推荐，容器里只跑一个文件）
+
+`emoskata.py` 是 `emos.py` + `bot.py` + `app.py` 合并后的单文件版，**只上传这一个就能跑**。
+
+```bash
+PANEL_PASSWORD=你的密码 PORT=8080 python3 emoskata.py
+```
+
 ### Docker
 
 ```bash
 docker compose up -d
 ```
 
-### 直接跑
+镜像里只有 `emoskata.py` 一个文件。
+
+### 分文件跑
 
 ```bash
 python3 app.py
 ```
 
-首次启动会打印随机面板密码，**只显示一次**。也可以自己指定：
+`app.py` 是入口，会自己拉起 `emos.py`（API 客户端）和 `bot.py`（TG Bot）。**只需要跑 app.py 一个进程**，另外两个是被导入的模块，不是独立服务。
+
+### 首次启动
+
+会打印随机面板密码，**只显示一次**。也可以自己指定：
 
 ```bash
 PANEL_PASSWORD=你的密码 python3 app.py
@@ -92,6 +106,14 @@ python3 selftest.py
 ```
 
 覆盖时间钳制、附言池、域名降级顺序、无效 token 分支。
+
+## 改代码
+
+改 `emos.py` / `bot.py` / `app.py` 后重新生成单文件版：
+
+```bash
+python3 build_single.py
+```
 
 ## 许可
 
