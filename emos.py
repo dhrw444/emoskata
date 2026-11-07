@@ -38,11 +38,18 @@ TIMEOUT = 20
 
 
 class EmosError(Exception):
-    def __init__(self, message, status=None, payload=None):
+    """status=None 且 network=True 表示本机网络问题，不是账号问题。
+
+    区分这两者很重要：断网时 8 个账号会同时失败，如果都算作账号失败，
+    退避重试配额（RETRY_DELAYS 只有 3 档）一次就被烧光，之后当天不再重试。
+    """
+
+    def __init__(self, message, status=None, payload=None, network=False):
         super().__init__(message)
         self.message = message
         self.status = status
         self.payload = payload
+        self.network = network
 
     def __str__(self):
         return "%s (HTTP %s)" % (self.message, self.status) if self.status else self.message
@@ -55,6 +62,13 @@ def _safe_json(raw):
         return json.loads(raw.decode("utf-8", "replace"))
     except Exception:
         return {"_raw": raw[:600].decode("utf-8", "replace")}
+
+
+def _status_of(e):
+    """把异常映射成对外状态。网络问题单独一类，不占重试配额。"""
+    if e.network:
+        return "network"
+    return "invalid" if e.status in (401, 403) else "failed"
 
 
 def pick_content(preferred=""):
@@ -79,7 +93,10 @@ class EmosClient:
 
     def __init__(self, token, base="", timeout=TIMEOUT):
         self.token = (token or "").strip()
-        self.bases = ([base.rstrip("/")] if base else []) + list(BASES)
+        # 配了自定义站点就只用它，不追加 emos.best 降级。
+        # 否则自建站一断，token 会被发去公共服务器 —— 那是凭据泄露，
+        # 而且 CF 回 403 会被误判成 token 失效。
+        self.bases = [base.rstrip("/")] if base else list(BASES)
         self.timeout = timeout
 
     # ---------------- 底层 ----------------
@@ -102,7 +119,9 @@ class EmosClient:
         except urllib.error.HTTPError as e:
             return e.code, _safe_json(e.read())
         except Exception as e:
-            raise EmosError("网络错误: %s" % e)
+            # 网络层失败（DNS、超时、TLS、连接被重置）—— 标出来，
+            # 上层据此判断「这次失败不该消耗重试配额」
+            raise EmosError("网络错误: %s" % e, network=True)
 
     def call(self, method, path, params=None):
         """带域名降级的调用。网络层失败才换域名，HTTP 错误原样返回。"""
@@ -185,7 +204,7 @@ class EmosClient:
             prof = self.profile()
             res["name"] = prof.get("_display") or ""
         except EmosError as e:
-            res["status"] = "invalid" if e.status in (401, 403) else "failed"
+            res["status"] = _status_of(e)
             res["message"] = e.message
             return res
 
@@ -193,7 +212,7 @@ class EmosClient:
         try:
             is_sign, _ = self.check()
         except EmosError as e:
-            res["status"] = "invalid" if e.status in (401, 403) else "failed"
+            res["status"] = _status_of(e)
             res["message"] = e.message
             return res
 
@@ -206,6 +225,13 @@ class EmosClient:
         st, body = self.do_sign(content)
 
         if st == 200:
+            msg = body.get("message") if isinstance(body, dict) else ""
+            # 有的站点用 200 + 文案表示「已签到」。必须放在 200 分支里判断，
+            # 放进 else 永远走不到。只做单向纠正，反向不动，避免把真成功吞掉。
+            if msg and any(k in str(msg) for k in ("已签到", "已经签到", "已签过")):
+                res["status"] = "already"
+                res["message"] = "今日已签到"
+                return res
             res["status"] = "signed"
             res["message"] = "签到成功"
             res["point"] = body.get("earn_point")

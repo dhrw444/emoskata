@@ -37,21 +37,10 @@ ck("bases 次位 api", c.bases[1], "https://api.emos.best")
 
 c2 = EmosClient("11_abc", "https://custom.example")
 ck("自定义 base 排首位", c2.bases[0], "https://custom.example")
-ck("自定义 base 仍带降级", len(c2.bases), 3)
+ck("自定义 base 不降级（防 token 泄露）", len(c2.bases), 1)
 
-# ---- 无效 token 的错误分支（真实联网，emos.best 401）
-c3 = EmosClient("11_definitely_invalid_token")
-res = c3.sign_once("")
-ck("无效 token 判为 invalid", res["status"], "invalid")
-ck("无效 token 有中文说明", res["message"], "Token 失效")
-ck("无效 token 不产生萝卜", res["point"], None)
-
-# ---- check 对无 token 的响应处理（/api/sign/check 无 token 也返回 200）
-try:
-    is_sign, raw = c3.check()
-    ck("check 无 token 返回 is_sign=False", is_sign, False)
-except EmosError as e:
-    ck("check 抛异常(不该发生)", "raised " + e.message, "no raise")
+# 联网分支见 test_client.py（本地 mock），这里只测纯函数，
+# 避免把 Cloudflare 的 403 当成 emos 的 401。
 
 shutil.rmtree(tmp, ignore_errors=True)
 print()

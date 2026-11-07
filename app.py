@@ -189,6 +189,10 @@ def add_log(account_id, name, status, message, carrot=None):
         conn.execute(
             "UPDATE accounts SET last_status=?,last_msg=?,last_carrot=?,last_run=? "
             "WHERE id=?", (status, message, carrot, ts, account_id))
+        # 密钥失效的账号自动停用：token 不会自己好起来，留着它每天
+        # 白撞一次接口、发一次失败通知没有任何意义。用户在面板重新启用即可。
+        if status == "invalid":
+            conn.execute("UPDATE accounts SET enabled=0 WHERE id=?", (account_id,))
 
 
 # ================================================================== 密码
@@ -354,15 +358,19 @@ def build_report(rows, started, ended):
     ok = sum(1 for r in rows if r["status"] == "signed")
     skip = sum(1 for r in rows if r["status"] == "already")
     bad = total - ok - skip
+    net = sum(1 for r in rows if r["status"] == "network")
     gained = sum(r["carrot"] or 0 for r in rows if r["status"] == "signed")
 
-    lines = ["成功 %d · 已签 %d · 失败 %d" % (ok, skip, bad)]
+    head = "成功 %d · 已签 %d · 失败 %d" % (ok, skip, bad)
+    if net:
+        head += " · 网络 %d" % net
+    lines = [head]
     if gained:
         lines.append("本次进账 <b>+%d</b> 萝卜" % gained)
     lines.append("耗时 %.1fs" % max(0.0, ended - started))
     lines.append("")
     for r in rows:
-        icon = {"signed": "✅", "already": "⚪"}.get(r["status"], "❌")
+        icon = {"signed": "✅", "already": "⚪", "network": "📡"}.get(r["status"], "❌")
         tail = ""
         if r["status"] == "signed" and r["carrot"] is not None:
             tail = " +%d" % r["carrot"]
@@ -404,15 +412,30 @@ def run_all(cfg, trigger="manual", only_id=None):
 
         gap = max(2, int(cfg.get("gap_seconds") or 8))
         content = cfg.get("content") or ""
+        net_down = False
 
         for idx, a in enumerate(accs):
+            # 网络已确认断掉时不再逐个撞墙：8 个账号各等 20 秒超时等于白耗
+            # 两分半，而且会把每号的退避配额一起烧掉。
+            if net_down:
+                row = {"id": a["id"], "name": a["name"], "status": "network",
+                       "message": "网络不可用，本次跳过", "carrot": None}
+                add_log(a["id"], a["name"], row["status"], row["message"], None)
+                rows.append(row)
+                continue
             if idx:
                 time.sleep(gap)
             client = EmosClient(a["token"], cfg.get("base_url"))
             try:
                 res = client.sign_once(content)
+            except EmosError as e:
+                res = {"status": "network" if e.network else "failed",
+                       "message": e.message, "point": None}
             except Exception as e:
                 res = {"status": "failed", "message": "异常: %s" % e, "point": None}
+
+            if res.get("status") == "network":
+                net_down = True
 
             row = {"id": a["id"], "name": a["name"],
                    "status": res.get("status", "failed"),
@@ -422,7 +445,11 @@ def run_all(cfg, trigger="manual", only_id=None):
 
             # 退避重试登记
             with _write_lock, db() as conn:
-                if row["status"] == "failed":
+                if row["status"] == "network":
+                    # 网络问题不算账号失败，不消耗重试配额
+                    conn.execute("UPDATE accounts SET retry_count=0 WHERE id=?",
+                                 (a["id"],))
+                elif row["status"] == "failed":
                     cnt = (a["retry_count"] or 0) + 1
                     conn.execute(
                         "UPDATE accounts SET retry_count=?, next_run_at=? WHERE id=?",
@@ -445,8 +472,12 @@ def _maybe_notify(cfg, rows, started, ended, trigger):
     if not rows:
         return
     ok = any(r["status"] == "signed" for r in rows)
-    bad = any(r["status"] == "failed" for r in rows)
+    bad = any(r["status"] in ("failed", "invalid") for r in rows)
     skip = any(r["status"] == "already" for r in rows)
+    # 纯网络问题不发失败通知：那是我这边连不上，不是账号出问题，
+    # 半夜推一条「签到失败」只会让人白爬起来看。
+    if not ok and not bad and not skip and all(r["status"] == "network" for r in rows):
+        return
 
     want = ((ok and cfg.get("notify_success") == "1")
             or (bad and cfg.get("notify_fail") == "1")
@@ -682,6 +713,8 @@ function toast(m){const t=document.getElementById('toast');t.textContent=m;t.cla
 setTimeout(()=>t.classList.remove('on'),1900);}
 function tag(s){if(s==='signed')return '<span class="tag t-ok">已签到</span>';
 if(s==='already')return '<span class="tag t-skip">今日已签</span>';
+if(s==='invalid')return '<span class="tag t-bad">密钥失效</span>';
+if(s==='network')return '<span class="tag t-skip">网络问题</span>';
 if(s==='failed')return '<span class="tag t-bad">失败</span>';
 return '<span class="tag t-none">未运行</span>';}
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
@@ -746,7 +779,7 @@ document.querySelector('#tbl tbody').innerHTML=list.map(a=>`<tr>
 ||'<tr><td colspan="5" class="dim">还没有账号</td></tr>';});
 api('/api/logs').then(list=>{
 document.getElementById('logs').innerHTML=list.map(l=>{
-const c=l.status==='signed'?'var(--ok)':l.status==='failed'?'var(--bad)':'var(--dim)';
+const c=l.status==='signed'?'var(--ok)':(l.status==='failed'||l.status==='invalid')?'var(--bad)':'var(--dim)';
 return `<div><span class="dim mono">${esc(l.ts)}</span> <b style="color:${c}">${esc(l.name)}</b>
 <span class="dim">${esc(l.message||'')}</span>${l.carrot?` <span style="color:var(--ok)">+${l.carrot}</span>`:''}</div>`;
 }).join('')||'<div class="dim">—</div>';});}
