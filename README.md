@@ -1,120 +1,137 @@
 # emoskata
 
-emos 服（emos.best）自动签到 —— 网页面板 + Telegram Bot 双向控制，多账号管理。
+**TG Bot 主入口 · emos 官方 Bot 登录 · 账号之间的签到关联。**
 
-**零第三方依赖**，只用 Python 3 标准库。容器镜像约 60MB。
+Python 3.10+，零第三方 Python 依赖。可上传多个源码文件，但只启动 `app.py`；也可只上传生成的 `emoskata.py`，启动同一个入口。调度、Bot 与可选管理页在一个应用进程里运行。
 
-## 为什么是 Python
+## 你在 Bot 里用到的功能
 
-`sqlite3` / `http.server` / `urllib` / `zoneinfo` / `threading` 全在标准库，`pip install` 一行都不用跑。Node 要实现同样功能得装 express + better-sqlite3（需编译原生模块）+ node-cron。
-
-## 功能
-
-- **网页面板** — 账号增删、单号/全量签到、实时状态、萝卜统计、日志、配置
-- **Telegram Bot** — `/sign` `/status` `/add` `/del` `/logs` `/notify`，inline 按钮操作
-- **emos 官方 OAuth** — 跳官方授权页，同意后密钥自动入库，不用手动复制
-- **定时签到** — 默认每天 08:00，时区可配
-- **失败退避重试** — 指数退避，不会无脑重刷
-- **通知** — TG / Bark，成功失败分开开关
-
-## 快速开始
-
-### 单文件版（推荐，容器里只跑一个文件）
-
-`emoskata.py` 是 `emos.py` + `bot.py` + `app.py` 合并后的单文件版，**只上传这一个就能跑**。
-
-```bash
-PANEL_PASSWORD=你的密码 PORT=8080 python3 emoskata.py
+```text
+✅ 签到           当前账号 + 已启用的直接关联
+👤 我的账号       登录过的账号与切换
+🔗 关联账号       添加、生成凭证、暂停、解除
+⚙️ 签到设置       自动签到、时间、个人通知
+📜 签到记录       当前账号与直接授权目标的记录
+🔐 登录           跳 emos 官方 Bot 授权
 ```
 
-### Docker
+### 官方登录
 
-```bash
-docker compose up -d
+1. 在自己的 Bot 发 `/login`，点击 **通过官方 Bot 登录**。
+2. 跳到 `@emospg_bot` 同意授权，再返回自己的 Bot。
+3. Bot 使用 `/api/user` 验证密钥、读取官方账号 ID，并登记归属。
+
+官方链接格式：
+
+```text
+https://t.me/emospg_bot?start=link_[应用创建者的emos用户ID]-[自己的Bot用户名]
 ```
 
-镜像里只有 `emoskata.py` 一个文件。
+**前一个 ID 是应用创建者的 emos 用户 ID，不是访问者的 TG 数字 ID。** Bot 用户名通过 Telegram `getMe` 验证，不靠手填。授权返回 `emosLinkAgree-[token]`；拒绝返回 `emosLinkRefuse-[TelegramID]`。
 
-### 分文件跑
+本次授权请求 10 分钟有效；有 TG 绑定字段时必须与发起者匹配。回传密钥消息尝试删除，不回显密钥，不在日志中保存原消息。不同 TG 用户不能接管已归属别人的账号。
 
-```bash
+### 账号之间的关联
+
+假设 A、B 都已经在本 Bot 登录：
+
+1. B 选择自己的账号，进入关联管理点 **生成码/链接**，或发 `/code`。
+2. B 把 **官方账号 ID + 一次性关联码** 交给自己同意的代签方。
+3. A 选择来源账号，在关联菜单输入，或发：
+   ```text
+   /link B的官方账号ID 一次性关联码
+   ```
+4. A 点签到，一起处理 A 与已开启联动的 B。
+
+- ID 只定位目标，不能单独授权。
+- 关联码随机生成，数据库只保存 SHA256，最多 10 分钟、只用一次。重新生成会使旧码失效。
+- 只建立 **A → B** 的直接签到权限。不自动反向，不把 B → C 转授给 A。
+- A 能暂停/启用外向联动；A、B 都能解除。解除后不再请求目标，也不再显示目标的日志。
+- 不修改 emos 官方账号间关系，不需要交换或复制目标的 emos token。
+
+## 部署
+
+先准备两个配置：
+
+| 变量 | 内容 |
+|---|---|
+| `TG_BOT_TOKEN` | BotFather 签发的 Bot Token |
+| `EMOS_APP_USER_ID` | 应用创建者的 emos 官方用户 ID，在主站「欢迎」里复制 |
+
+### 单文件，纯 Bot 模式
+
+只上传 `emoskata.py`。在容器环境设置以上变量，再运行：
+
+```sh
+HTTP_ENABLED=0 python3 emoskata.py
+```
+
+不需要公网域名、网页 OAuth 回调或 webhook；TG 用 long polling。
+
+### Docker Compose
+
+把配置写进部署环境或 `.env`，再运行：
+
+```sh
+docker compose up -d --build
+```
+
+默认管理页只映射到宿主机 `127.0.0.1:8080`，不是公开管理服务。未指定 `PANEL_PASSWORD` 时首次启动随机生成并在日志显示一次。没有 `changeme` 固定默认密码。
+
+管理页仅配置 Bot、应用 ID、默认时区与签到参数，并只读展示运行状态。账号登录、关联和签到走 TG，不从网页导入任意 token。
+
+### 分文件
+
+```sh
 python3 app.py
 ```
 
-`app.py` 是入口，会自己拉起 `emos.py`（API 客户端）和 `bot.py`（TG Bot）。**只需要跑 app.py 一个进程**，另外两个是被导入的模块，不是独立服务。
+同目录保留 `app.py`、`bot.py`、`accounts.py`、`emos.py`。另外三个是导入模块，不用分别启动。
 
-### 首次启动
-
-会打印随机面板密码，**只显示一次**。也可以自己指定：
-
-```bash
-PANEL_PASSWORD=你的密码 python3 app.py
-```
-
-打开 http://localhost:8080
-
-## 环境变量
+### 环境变量
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `PORT` | `8080` | 监听端口 |
-| `PANEL_PASSWORD` | 随机生成 | 面板密码 |
-| `PUBLIC_BASE` | 自动推断 | 对外访问地址，OAuth 回调要用。反代后填 `https://你的域名` |
-| `DATA_DIR` | `./data` | 数据目录 |
+| `TG_BOT_TOKEN` | 从数据库读取 | 非空环境值优先于管理页配置 |
+| `EMOS_APP_USER_ID` | 从数据库读取 | 官方授权的应用创建者 ID |
+| `EMOS_BASE_URL` | `https://emos.best` | API 基地址；自定义站不向公共站降级 |
+| `DATA_DIR` | 入口文件旁的 `data/` | 持久化 `data.db`；容器挂载 `/app/data` |
+| `HTTP_ENABLED` | `1` | `0` 关闭管理页，只运行 Bot 与调度 |
+| `HTTP_HOST` | `0.0.0.0` | 管理页监听地址；裸机可设 `127.0.0.1` |
+| `PORT` | `8080` | 管理页端口 |
+| `PANEL_PASSWORD` | 首次随机生成 | 至少 6 字符；非空时重启会应用该密码并使旧会话失效 |
+| `PUBLIC_BASE` | 从请求推断 | 可选反代 HTTPS 地址，仅影响管理页同源/Cookie，不用于官方登录 |
+| `SIGN_TIME` | `08:00` | 默认签到时间；个人账号可在 Bot 覆盖 |
+| `SIGN_TIMEZONE` | `Asia/Shanghai` | 调度日期与记录采用同一时区 |
 
-## 添加账号
+时间强制不早于 01:00。精简系统没有 tzdata 时支持 Asia/Shanghai 等固定偏移；其他时区需要安装系统 tzdata，不静默改用宿主时区。
 
-**方式一（推荐）**：面板点「用 emos 账号授权登录」，跳 emos 官方授权页，同意后自动添加。
+## 补签与故障处理
 
-> 需要面板能被公网访问（或已配好反代），否则 emos 的回调打不回来。本地测试用 `PUBLIC_BASE` 指定可访问地址。
+- 到点后若容器重启、错过分钟，仍处理当天未完成账号，不要求恰好撞到某一分钟。
+- 网络、网关阻挡、限流、服务错误均保存退避状态。首次失败后的重试间隔是 5、15、45 分钟；当天达到上限停止，不形成接口轮询。
+- 成功账号当天不再自动重复签到。多个来源指向同一目标时同批去重。
+- 401 或明确失效的鉴权响应停用账号；CF 403 HTML 不误判成密钥失效。重新官方登录会恢复有效账号。
+- 200 必须有有效 JSON 和签到成功字段，HTML/空壳响应不写假成功；普通 429 按限流处理，不直接当已签。
+- 仅两个官方域互为备用。自定义地址不追加官方站；接口重定向不携带密钥跟随。
+- 发请求前复查当前账号/关联授权，排队通知发送前再次检查接收权限。
 
-**方式二**：从 emos 主站「欢迎」弹窗复制密钥（形如 `11_AkJO2UdOKinqmKOU`），粘贴到面板。
+## 从旧版升级
 
-**方式三**：TG Bot 里发 `/add 11_你的密钥 备注名`
+沿用原 `data/` 挂载，启动时增量迁移，不清空旧账号或历史日志。旧未归属账号不会按 ID 被 TG 用户认领；通过官方登录验证与旧 token 匹配后才登记归属。
 
-## Telegram Bot
+旧版网页 OAuth、`/add token` 和全局 `/del` 不再作为账号入口。生成的单文件保留模块独立命名空间，不再靠同名函数互相覆盖。
 
-1. 找 [@BotFather](https://t.me/BotFather) 建 bot，拿 token
-2. 面板「通知设置」里填 token，保存
-3. TG 里给你的 bot 发 `/id`，把返回的 chat_id 填进面板
-4. 之后 `/sign` 就能直接签到
+## 测试和重新生成
 
-Bot 会自动启停：改了 token 保存后 15 秒内生效，不用重启容器。
-
-## 接口契约
-
-签到走 emos 官方开放 API：
-
-```
-GET  /api/sign/check          → {"is_sign": bool}
-PUT  /api/user/sign?content=  → {"earn_point", "continuous_days", "sign_index"}
-GET  /api/user                → 用户信息，401 表示 token 失效
-PUT  /api/user/resetToken     → 换新密钥
-```
-
-**关键行为**：
-
-- `/api/sign/check` 在**无 token 时也返回 200**（`{"is_sign":false,"user_id":null}`），所以不能拿它当 token 有效性的唯一判据 —— 必须配合 `/api/user` 看 401。
-- `409` / `429` = 今天已经签过，视为成功跳过。
-- `400` = 留言不合规，换一句重试。
-- 官方要求：**禁止接口轮询**，**禁止选 0 点签到**。本项目的定时器强制最小 01:00。
-
-## 自测
-
-```bash
-python3 selftest.py
+```sh
+python3 -B selftest.py
+python3 -B build_single.py
+python3 -B -m unittest -v test_deploy
 ```
 
-覆盖时间钳制、附言池、域名降级顺序、无效 token 分支。
-
-## 改代码
-
-改 `emos.py` / `bot.py` / `app.py` 后重新生成单文件版：
-
-```bash
-python3 build_single.py
-```
+标准库 unittest 覆盖账号归属、一次性码竞争、官方回调、异步权限、撤销、补签/退避、HTTP 与单文件完整流程。测试只使用临时数据库、本地服务和假 Telegram；**它们不是生产 TG/emos 实机授权验收**。
 
 ## 许可
 
-MIT
+MIT，见 LICENSE。

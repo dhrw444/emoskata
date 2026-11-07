@@ -1,20 +1,11 @@
-"""emos 签到面板 —— 纯 Python 标准库，零第三方依赖。
+"""emoskata runtime: Telegram-owned accounts, one-hop grants and bounded daily signing.
 
-    python3 app.py            # 默认端口 8080
-    PORT=9000 python3 app.py
-
-首次运行自动生成 data.db。面板密码：
-    环境变量 PANEL_PASSWORD  > 自动生成（只打印一次）
-
-设计参考 MakkaPakka518/TG-Persona 的工程结构：
-    - scrypt 哈希存密码，明文不落盘
-    - session token 存库 + cookie，带 TTL
-    - 登录失败限流
-    - 通知分类开关
-    - 失败退避重试，重启不误记成功
+Run: python3 app.py or generated emoskata.py; Python 3.10+ standard library.
+The optional HTTP page only configures the service. Account actions live in TG.
 """
 
 import hashlib
+import html
 import hmac
 import json
 import os
@@ -26,10 +17,14 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import queue
+import signal
 
-from emos import EmosClient, EmosError, clamp_sign_time
+from emos import EmosClient, EmosError, clamp_sign_time, valid_base
+from accounts import AccountService, DomainError
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("DATA_DIR") or os.path.join(BASE_DIR, "data")
@@ -62,68 +57,61 @@ DEFAULTS = {
     "notify_fail": "1",
     "notify_already": "0",
     "notify_summary": "1",
-    "oauth_app_name": "emoskata",
+    'oauth_app_name': 'emoskata',
+    'emos_app_user_id': '',
 }
 
-_write_lock = threading.Lock()
+_write_lock = threading.RLock()
 _run_lock = threading.Lock()
+_shutdown = threading.Event()
+_notifications = queue.Queue(maxsize=256)
+_notification_drops = 0
 
 
-# ================================================================== DB
+class _Connection(sqlite3.Connection):
+    def __exit__(self, *args):
+        try:
+            return super().__exit__(*args)
+        finally:
+            self.close()
+
 
 def db():
-    conn = sqlite3.connect(DB_PATH, timeout=20)
+    conn = sqlite3.connect(DB_PATH, timeout=20, factory=_Connection)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute('PRAGMA foreign_keys=ON')
+    conn.execute('PRAGMA busy_timeout=20000')
     return conn
 
 
+@contextmanager
+def write_db():
+    with _write_lock:
+        with db() as conn:
+            conn.execute('BEGIN IMMEDIATE')
+            yield conn
+
+
 def init_db():
-    with _write_lock, db() as conn:
-        conn.executescript("""
-        CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
-
-        CREATE TABLE IF NOT EXISTS sessions (
-            token TEXT PRIMARY KEY, created INTEGER, last_seen INTEGER,
-            ip TEXT, ua TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS login_fail (
-            ip TEXT PRIMARY KEY, count INTEGER DEFAULT 0, until INTEGER DEFAULT 0
-        );
-
-        CREATE TABLE IF NOT EXISTS accounts (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            name        TEXT NOT NULL,
-            token       TEXT NOT NULL,
-            enabled     INTEGER NOT NULL DEFAULT 1,
-            last_status TEXT DEFAULT '',
-            last_msg    TEXT DEFAULT '',
-            last_carrot INTEGER,
-            last_run    TEXT DEFAULT '',
-            last_day    TEXT DEFAULT '',
-            retry_count INTEGER DEFAULT 0,
-            next_run_at INTEGER DEFAULT 0,
-            created     TEXT DEFAULT ''
-        );
-
-        CREATE TABLE IF NOT EXISTS logs (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            account_id INTEGER NOT NULL,
-            name       TEXT DEFAULT '',
-            ts         TEXT NOT NULL,
-            status     TEXT NOT NULL,
-            message    TEXT DEFAULT '',
-            carrot     INTEGER
-        );
-        CREATE INDEX IF NOT EXISTS idx_logs_id ON logs(id DESC);
-        """)
-        # 迁移：老库补列
-        cols = {r["name"] for r in conn.execute("PRAGMA table_info(accounts)")}
-        for col, ddl in (("retry_count", "INTEGER DEFAULT 0"),
-                         ("next_run_at", "INTEGER DEFAULT 0")):
-            if col not in cols:
-                conn.execute("ALTER TABLE accounts ADD COLUMN %s %s" % (col, ddl))
+    with write_db() as conn:
+        for statement in (
+            'CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value TEXT)',
+            'CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY,created INTEGER,'
+            'last_seen INTEGER,ip TEXT,ua TEXT)',
+            'CREATE TABLE IF NOT EXISTS login_fail (ip TEXT PRIMARY KEY,count INTEGER '
+            'DEFAULT 0,until INTEGER DEFAULT 0)',
+        ):
+            conn.execute(statement)
+        AccountService.init_schema(conn)
+        columns = {row['name'] for row in conn.execute('PRAGMA table_info(accounts)')}
+        if 'retry_day' not in columns:
+            conn.execute("ALTER TABLE accounts ADD COLUMN retry_day TEXT DEFAULT ''")
+        conn.execute("DELETE FROM settings WHERE key LIKE 'oauth_state_%' OR key LIKE 'oauth_back_%'")
+    try:
+        os.chmod(DATA_DIR, 0o700)
+        os.chmod(DB_PATH, 0o600)
+    except OSError:
+        pass
 
 
 def get_setting(key, default=None):
@@ -144,55 +132,40 @@ def cfg_all():
     cfg = dict(DEFAULTS)
     with db() as conn:
         for r in conn.execute("SELECT key,value FROM settings"):
-            cfg[r["key"]] = r["value"]
+            cfg[r['key']] = r['value']
+    for env, key in (('TG_BOT_TOKEN', 'tg_bot_token'), ('EMOS_BASE_URL', 'base_url'),
+                     ('SIGN_TIME', 'sign_time'), ('SIGN_TIMEZONE', 'timezone'),
+                     ('EMOS_APP_USER_ID', 'emos_app_user_id')):
+        value = os.environ.get(env)
+        if value is not None and value.strip():
+            cfg[key] = value.strip()
     return cfg
 
 
 class Store:
-    """给 bot.py 用的适配层，与面板共用同一个 data.db。"""
+    def __init__(self):
+        self.accounts = AccountService(db, write_db, cfg_all)
 
     def db(self):
         return db()
 
     def write(self):
-        class _W:
-            def __enter__(_s):
-                _write_lock.acquire()
-                _s.c = db()
-                return _s.c
-
-            def __exit__(_s, *a):
-                try:
-                    _s.c.commit()
-                finally:
-                    _s.c.close()
-                    _write_lock.release()
-                return False
-        return _W()
+        return write_db()
 
     def cfg_all(self):
         return cfg_all()
 
-    def set_setting(self, k, v):
-        set_setting(k, v)
+    def get_setting(self, key, default=None):
+        return get_setting(key, default)
 
-    def run_all(self, cfg, trigger="manual", only_id=None):
+    def set_setting(self, key, value):
+        set_setting(key, value)
+
+    def run_all(self, cfg, trigger='manual', only_id=None):
         return run_all(cfg, trigger, only_id)
 
-
-def add_log(account_id, name, status, message, carrot=None):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with _write_lock, db() as conn:
-        conn.execute(
-            "INSERT INTO logs(account_id,name,ts,status,message,carrot) "
-            "VALUES(?,?,?,?,?,?)", (account_id, name, ts, status, message, carrot))
-        conn.execute(
-            "UPDATE accounts SET last_status=?,last_msg=?,last_carrot=?,last_run=? "
-            "WHERE id=?", (status, message, carrot, ts, account_id))
-        # 密钥失效的账号自动停用：token 不会自己好起来，留着它每天
-        # 白撞一次接口、发一次失败通知没有任何意义。用户在面板重新启用即可。
-        if status == "invalid":
-            conn.execute("UPDATE accounts SET enabled=0 WHERE id=?", (account_id,))
+    def run_user(self, tg_id, include_links=True, expected_root=None):
+        return run_user(tg_id, include_links, expected_root)
 
 
 # ================================================================== 密码
@@ -216,15 +189,20 @@ def verify_password(pw):
 
 
 def init_password():
-    if get_setting("panel_pw_hash"):
+    stored = get_setting('panel_pw_hash')
+    src = os.environ.get('PANEL_PASSWORD') or ''
+    if src and len(src) < 6:
+        raise ValueError('PANEL_PASSWORD 至少 6 个字符。')
+    if src:
+        if not verify_password(src):
+            set_setting('panel_pw_hash', hash_password(src))
+            drop_all_sessions()
         return None
-    src = os.environ.get("PANEL_PASSWORD") or ""
-    generated = False
-    if len(src) < 6:
-        src = secrets.token_urlsafe(9)
-        generated = True
-    set_setting("panel_pw_hash", hash_password(src))
-    return src if generated else None
+    if stored:
+        return None
+    src = secrets.token_urlsafe(18)
+    set_setting('panel_pw_hash', hash_password(src))
+    return src
 
 
 # ================================================================== session
@@ -314,254 +292,289 @@ def public_base(handler=None):
 
 
 def _esc(s):
-    return (str(s or "")).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return html.escape(str(s if s is not None else ''))
 
 
-def notify(cfg, title, text=""):
-    """TG Bot + Bark，任一配置即可。"""
-    errors = []
-    token = (cfg.get("tg_bot_token") or "").strip()
-    chat = (cfg.get("tg_chat_id") or "").strip()
-    if token and chat:
-        body = json.dumps({
-            "chat_id": chat,
-            "text": ("<b>%s</b>\n%s" % (_esc(title), text)) if text else ("<b>%s</b>" % _esc(title)),
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }).encode()
-        req = urllib.request.Request(
-            "https://api.telegram.org/bot%s/sendMessage" % token,
-            data=body, method="POST")
-        req.add_header("Content-Type", "application/json")
-        try:
-            with urllib.request.urlopen(req, timeout=20) as r:
-                r.read()
-        except Exception as e:
-            errors.append("TG: %s" % e)
+def now_local(cfg):
+    name = cfg.get('timezone') or 'Asia/Shanghai'
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(name))
+    except (ImportError, KeyError):
+        offset = TZ_FALLBACK.get(name)
+        if offset is None:
+            raise ValueError('时区不可用：请安装 tzdata 或选择 Asia/Shanghai / UTC。') from None
+        return datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=offset)))
 
-    bark = (cfg.get("bark_key") or "").strip()
-    if bark:
-        base = bark if "://" in bark else "https://api.day.app/" + bark
-        url = base.rstrip("/") + "/" + urllib.parse.quote(title)
-        if text:
-            url += "/" + urllib.parse.quote(text[:400])
-        try:
-            urllib.request.urlopen(url, timeout=12).read()
-        except Exception as e:
-            errors.append("Bark: %s" % e)
 
-    return (not errors), "; ".join(errors)
+def notify(cfg, title, text=''):
+    from bot import TG
+    token = str(cfg.get('tg_bot_token') or '').strip()
+    chat = cfg.get('tg_chat_id')
+    if not token or not chat:
+        return False, '尚未配置 TG 通知目标。'
+    try:
+        TG(token, Store()).send(chat, '<b>%s</b>\n%s' % (_esc(title), text))
+        return True, ''
+    except Exception:
+        return False, 'TG 通知发送失败，请检查 Bot 配置和网络。'
 
 
 def build_report(rows, started, ended):
-    total = len(rows)
-    ok = sum(1 for r in rows if r["status"] == "signed")
-    skip = sum(1 for r in rows if r["status"] == "already")
-    bad = total - ok - skip
-    net = sum(1 for r in rows if r["status"] == "network")
-    gained = sum(r["carrot"] or 0 for r in rows if r["status"] == "signed")
-
-    head = "成功 %d · 已签 %d · 失败 %d" % (ok, skip, bad)
-    if net:
-        head += " · 网络 %d" % net
-    lines = [head]
-    if gained:
-        lines.append("本次进账 <b>+%d</b> 萝卜" % gained)
-    lines.append("耗时 %.1fs" % max(0.0, ended - started))
-    lines.append("")
-    for r in rows:
-        icon = {"signed": "✅", "already": "⚪", "network": "📡"}.get(r["status"], "❌")
-        tail = ""
-        if r["status"] == "signed" and r["carrot"] is not None:
-            tail = " +%d" % r["carrot"]
-        elif r["status"] not in ("signed", "already"):
-            tail = " " + _esc((r["message"] or "")[:70])
-        lines.append("%s %s%s" % (icon, _esc(r["name"]), tail))
-    return "\n".join(lines)
+    icons = {'signed': '✅', 'already': '⚪', 'network': '📡', 'blocked': '🚧',
+             'rate': '⏳', 'invalid': '🔑', 'failed': '❌', 'revoked': '🔒'}
+    lines = ['<b>🥕 签到结果</b>']
+    for row in rows:
+        label = row.get('emos_id') or row['name']
+        suffix = ' +%s 萝卜' % row['carrot'] if row.get('carrot') is not None else ''
+        lines.append('%s %s%s\n  %s' % (icons.get(row['status'], '❌'), _esc(label),
+                                      suffix, _esc(row['message'][:120])))
+    lines.append('耗时 %.1f 秒' % max(0, ended - started))
+    return '\n'.join(lines)
 
 
-# ================================================================== 签到
+def _queue_result(row, cfg):
+    global _notification_drops
+    service = Store().accounts
+    for user in service.watchers(row['id']):
+        status = row['status']
+        want = ('notify_success' if status == 'signed' else
+                'notify_already' if status == 'already' else 'notify_fail')
+        if not int(user.get(want) or 0):
+            continue
+        task = (row['id'], user['tg_id'], want, dict(row))
+        try:
+            _notifications.put_nowait(task)
+        except queue.Full:
+            _notification_drops += 1
+            print('[notify] 队列已满，发送失败次数 %d' % _notification_drops)
+
+
+def _deliver_notification(task):
+    from bot import TG
+    account_id, tg_id, preference, row = task
+    current = next((user for user in Store().accounts.watchers(account_id) if user['tg_id'] == tg_id), None)
+    if current is None or not int(current.get(preference) or 0):
+        return False
+    cfg = cfg_all()
+    token = str(cfg.get('tg_bot_token') or '')
+    if not token:
+        return False
+    TG(token, Store()).send(current['chat_id'], build_report([row], 0, 0))
+    return True
+
+
+def notification_loop():
+    while not _shutdown.is_set():
+        try:
+            task = _notifications.get(timeout=1)
+        except queue.Empty:
+            continue
+        try:
+            _deliver_notification(task)
+        except Exception:
+            print('[notify] 发送失败，详细签到结果已保存在账号日志。')
+        finally:
+            _notifications.task_done()
+
+
+def _account_record(account_id):
+    with db() as conn:
+        row = conn.execute('SELECT * FROM accounts WHERE id=?', (account_id,)).fetchone()
+    return dict(row) if row else None
+
 
 def _next_retry(count):
-    if count <= 0 or count > len(RETRY_DELAYS):
-        return 0
-    return int(time.time()) + RETRY_DELAYS[count - 1]
+    if 1 <= count <= len(RETRY_DELAYS):
+        return int(time.time()) + RETRY_DELAYS[count - 1]
+    return 0
 
 
-def run_all(cfg, trigger="manual", only_id=None):
-    """串行跑签到。trigger: manual / auto / retry。返回结果列表，占用中返回 None。"""
+def _store_result(account, result, cfg, trigger):
+    now = now_local(cfg)
+    today, stamp = now.strftime('%Y-%m-%d'), now.strftime('%Y-%m-%d %H:%M:%S')
+    status = result['status']
+    with write_db() as conn:
+        current = conn.execute('SELECT * FROM accounts WHERE id=?', (account['id'],)).fetchone()
+        if not current or current['token'] != account['token'] or current['emos_id'] != account['emos_id']:
+            return None
+        safe_name = str(current['name'] or '').replace(current['token'], '[凭证已隐藏]')
+        result = dict(result)
+        result['message'] = str(result.get('message') or '').replace(current['token'], '[凭证已隐藏]')
+        retries = current['retry_count'] if current['retry_day'] == today else 0
+        next_at = 0
+        if status in ('network', 'blocked', 'rate', 'failed'):
+            retries += 1
+            next_at = _next_retry(retries)
+            requested = int(result.get('retry_after') or 0)
+            if next_at and requested:
+                next_at = max(next_at, int(time.time()) + min(requested, 86400))
+        done_day = today if status in ('signed', 'already') else current['last_day']
+        enabled = 0 if status == 'invalid' else current['enabled']
+        conn.execute('INSERT INTO logs(account_id,name,ts,status,message,carrot) VALUES(?,?,?,?,?,?)',
+                     (account['id'], safe_name, stamp, status, result['message'], result.get('point')))
+        conn.execute('UPDATE accounts SET last_status=?,last_msg=?,last_carrot=?,last_run=?,last_day=?,'
+                     'retry_count=?,next_run_at=?,retry_day=?,enabled=? WHERE id=?',
+                     (status, result['message'], result.get('point'), stamp, done_day,
+                      retries, next_at, today, enabled, account['id']))
+    row = {'id': account['id'], 'emos_id': account['emos_id'], 'name': safe_name,
+           'status': status, 'message': result['message'], 'carrot': result.get('point')}
+    if trigger != 'user' or status == 'invalid':
+        _queue_result(row, cfg)
+    return row
+
+
+def _auto_permission(owner, source_id, target_id, cfg):
+    now = now_local(cfg)
+    with db() as conn:
+        source = conn.execute('SELECT * FROM accounts WHERE id=?', (source_id,)).fetchone()
+        target = conn.execute('SELECT * FROM accounts WHERE id=?', (target_id,)).fetchone()
+        if not source or not target or source['owner_tg_id'] != owner:
+            return False
+        if not source['enabled'] or source['last_status'] == 'invalid' or not source['auto_sign']:
+            return False
+        if now.strftime('%H:%M') < clamp_sign_time(source['sign_time'] or cfg.get('sign_time')):
+            return False
+        if not target['enabled'] or target['last_status'] == 'invalid':
+            return False
+        if owner is not None and (not source['emos_id'] or not target['emos_id'] or target['owner_tg_id'] is None):
+            return False
+        if source_id == target_id:
+            return True
+        if owner is None:
+            return False
+        return conn.execute('SELECT 1 FROM account_links WHERE source_id=? AND target_id=? AND enabled=1',
+                            (source_id, target_id)).fetchone() is not None
+
+
+def _run_ids(cfg, account_ids, trigger='manual', actor=None, root_id=None, scopes=None):
     if not _run_lock.acquire(blocking=False):
         return None
-    started = time.time()
-    rows = []
+    rows, unavailable = [], set()
     try:
-        with db() as conn:
-            if only_id:
-                accs = conn.execute("SELECT * FROM accounts WHERE id=?", (only_id,)).fetchall()
-            elif trigger == "retry":
-                accs = conn.execute(
-                    "SELECT * FROM accounts WHERE enabled=1 AND retry_count>0 "
-                    "AND next_run_at>0 AND next_run_at<=? ORDER BY id",
-                    (int(time.time()),)).fetchall()
-            else:
-                accs = conn.execute(
-                    "SELECT * FROM accounts WHERE enabled=1 ORDER BY id").fetchall()
-
-        if not accs:
-            return rows
-
-        gap = max(2, int(cfg.get("gap_seconds") or 8))
-        content = cfg.get("content") or ""
-        net_down = False
-
-        for idx, a in enumerate(accs):
-            # 网络已确认断掉时不再逐个撞墙：8 个账号各等 20 秒超时等于白耗
-            # 两分半，而且会把每号的退避配额一起烧掉。
-            if net_down:
-                row = {"id": a["id"], "name": a["name"], "status": "network",
-                       "message": "网络不可用，本次跳过", "carrot": None}
-                add_log(a["id"], a["name"], row["status"], row["message"], None)
-                rows.append(row)
+        gap = min(300, max(2, int(cfg.get('gap_seconds') or 8)))
+        service = Store().accounts
+        for account_id in dict.fromkeys(account_ids):
+            if _shutdown.is_set():
+                break
+            if rows and _shutdown.wait(gap):
+                break
+            account = _account_record(account_id)
+            if not account or not account['enabled']:
                 continue
-            if idx:
-                time.sleep(gap)
-            client = EmosClient(a["token"], cfg.get("base_url"))
-            try:
-                res = client.sign_once(content)
-            except EmosError as e:
-                res = {"status": "network" if e.network else "failed",
-                       "message": e.message, "point": None}
-            except Exception as e:
-                res = {"status": "failed", "message": "异常: %s" % e, "point": None}
-
-            if res.get("status") == "network":
-                net_down = True
-
-            row = {"id": a["id"], "name": a["name"],
-                   "status": res.get("status", "failed"),
-                   "message": res.get("message", ""),
-                   "carrot": res.get("point")}
-            add_log(a["id"], a["name"], row["status"], row["message"], row["carrot"])
-
-            # 退避重试登记
-            with _write_lock, db() as conn:
-                if row["status"] == "network":
-                    # 网络问题不算账号失败，不消耗重试配额
-                    conn.execute("UPDATE accounts SET retry_count=0 WHERE id=?",
-                                 (a["id"],))
-                elif row["status"] == "failed":
-                    cnt = (a["retry_count"] or 0) + 1
-                    conn.execute(
-                        "UPDATE accounts SET retry_count=?, next_run_at=? WHERE id=?",
-                        (cnt, _next_retry(cnt), a["id"]))
-                else:
-                    conn.execute(
-                        "UPDATE accounts SET retry_count=0, next_run_at=0, last_day=? WHERE id=?",
-                        (datetime.now().strftime("%Y-%m-%d"), a["id"]))
-
-            rows.append(row)
-
-        ended = time.time()
-        _maybe_notify(cfg, rows, started, ended, trigger)
+            def allowed(account=account, account_id=account_id):
+                if _shutdown.is_set():
+                    return False
+                current = _account_record(account_id)
+                if not current or not current['enabled'] or current['token'] != account['token']:
+                    return False
+                if current['emos_id'] != account['emos_id']:
+                    return False
+                if actor is not None:
+                    return service.can_run(actor, root_id, account_id)
+                if scopes is not None:
+                    return _eligible(current, now_local(cfg), cfg, False) and any(
+                        _auto_permission(owner, source, account_id, cfg)
+                        for owner, source in scopes.get(account_id, []))
+                return True
+            if not allowed():
+                continue
+            endpoint = account.get('base_url') or cfg.get('base_url') or 'https://emos.best'
+            if endpoint in unavailable:
+                result = {'status': 'network', 'message': '同一接口暂不可达，已安排退避重试。', 'point': None}
+            else:
+                try:
+                    client = EmosClient(account['token'], endpoint)
+                    client.before_request = allowed
+                    client.expected_user_id = account['emos_id']
+                    result = client.sign_once(cfg.get('content') or '')
+                except EmosError as error:
+                    result = {'status': error.kind, 'message': error.message, 'point': None}
+                except Exception:
+                    result = {'status': 'failed', 'message': '签到处理失败，已记录并安排重试。', 'point': None}
+                if result['status'] == 'network':
+                    unavailable.add(endpoint)
+            if result['status'] == 'revoked':
+                continue
+            row = _store_result(account, result, cfg, trigger)
+            if row:
+                rows.append(row)
         return rows
     finally:
         _run_lock.release()
 
 
-def _maybe_notify(cfg, rows, started, ended, trigger):
-    if not rows:
-        return
-    ok = any(r["status"] == "signed" for r in rows)
-    bad = any(r["status"] in ("failed", "invalid") for r in rows)
-    skip = any(r["status"] == "already" for r in rows)
-    # 纯网络问题不发失败通知：那是我这边连不上，不是账号出问题，
-    # 半夜推一条「签到失败」只会让人白爬起来看。
-    if not ok and not bad and not skip and all(r["status"] == "network" for r in rows):
-        return
-
-    want = ((ok and cfg.get("notify_success") == "1")
-            or (bad and cfg.get("notify_fail") == "1")
-            or (skip and not ok and not bad and cfg.get("notify_already") == "1"))
-    if not want:
-        return
-
-    title = "🥕 emos 签到 · %s" % datetime.now().strftime("%m-%d %H:%M")
-    if not (cfg.get("notify_summary") == "1"):
-        title = "🥕 emos 签到结果"
-    threading.Thread(
-        target=notify, args=(cfg, title, build_report(rows, started, ended)),
-        daemon=True).start()
+def run_user(tg_id, include_links=True, expected_root=None):
+    cfg = cfg_all()
+    scope = Store().accounts.run_scope(tg_id, include_links)
+    if expected_root is not None and scope['root_id'] != expected_root:
+        raise DomainError('当前账号已切换，本次签到未执行。')
+    return _run_ids(cfg, scope['account_ids'], 'user', tg_id, scope['root_id'])
 
 
-# ================================================================== 调度
+def run_all(cfg, trigger='manual', only_id=None):
+    if trigger in ('auto', 'retry'):
+        return scheduler_tick(cfg)
+    with db() as conn:
+        rows = conn.execute('SELECT id FROM accounts WHERE enabled=1 ' +
+                            ('AND id=? ' if only_id is not None else '') + 'ORDER BY id',
+                            (only_id,) if only_id is not None else ()).fetchall()
+    return _run_ids(cfg, [row['id'] for row in rows], trigger)
 
-def now_local(cfg):
-    """当前时间（按配置时区）。
 
-    精简容器里没有 tzdata 时 ZoneInfo 会抛 ZoneInfoNotFoundError，
-    这时退回固定偏移表 —— 宁可偏移正确也不要静默用 UTC 错 8 小时。
-    """
-    tz = cfg.get("timezone") or "Asia/Shanghai"
-    try:
-        from zoneinfo import ZoneInfo
-        return datetime.now(ZoneInfo(tz))
-    except Exception:
-        pass
+def _eligible(account, now, cfg, automatic):
+    today = now.strftime('%Y-%m-%d')
+    if not account['enabled'] or account['last_day'] == today:
+        return False
+    if automatic:
+        if not account['auto_sign']:
+            return False
+        moment = clamp_sign_time(account['sign_time'] or cfg.get('sign_time'))
+        if now.strftime('%H:%M') < moment:
+            return False
+    if account['retry_day'] == today:
+        if account['retry_count'] > len(RETRY_DELAYS):
+            return False
+        if account['next_run_at'] and account['next_run_at'] > int(time.time()):
+            return False
+    return True
 
-    # 固定偏移兜底（不处理夏令时；中国/香港/新加坡/台湾本身就没有夏令时）
-    off = TZ_FALLBACK.get(tz)
-    if off is not None:
-        return datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=off)))
-    return datetime.now()
+
+def scheduler_tick(cfg=None):
+    cfg = cfg or cfg_all()
+    now = now_local(cfg)
+    scopes = {}
+    with db() as conn:
+        all_accounts = [dict(row) for row in conn.execute('SELECT * FROM accounts WHERE enabled=1 ORDER BY id')]
+        grants = [dict(row) for row in conn.execute('SELECT source_id,target_id FROM account_links WHERE enabled=1')]
+    by_id = {account['id']: account for account in all_accounts}
+    for source in all_accounts:
+        if (not source['auto_sign'] or source['last_status'] == 'invalid'
+                or now.strftime('%H:%M') < clamp_sign_time(source['sign_time'] or cfg.get('sign_time'))):
+            continue
+        identity = (source['owner_tg_id'], source['id'])
+        if _eligible(source, now, cfg, False):
+            scopes.setdefault(source['id'], []).append(identity)
+        if source['owner_tg_id'] is None:
+            continue
+        for grant in grants:
+            target = by_id.get(grant['target_id'])
+            if (grant['source_id'] == source['id'] and target and target['owner_tg_id'] is not None
+                    and _eligible(target, now, cfg, False)):
+                scopes.setdefault(target['id'], []).append(identity)
+    return _run_ids(cfg, list(scopes), 'auto', scopes=scopes) if scopes else []
 
 
 def scheduler_loop():
-    """每分钟检查一次。到点跑一次，同一天不重复；失败的按退避重试。"""
-    while True:
+    while not _shutdown.is_set():
         try:
-            cfg = cfg_all()
-            now = now_local(cfg)
-            today = now.strftime("%Y-%m-%d")
-            hh, mm = [int(x) for x in clamp_sign_time(cfg.get("sign_time")).split(":")]
-
-            # 到点执行
-            if now.hour == hh and now.minute == mm:
-                with db() as conn:
-                    pending = conn.execute(
-                        "SELECT COUNT(*) c FROM accounts WHERE enabled=1 AND last_day!=?",
-                        (today,)).fetchone()["c"]
-                if pending:
-                    run_all(cfg, trigger="auto")
-
-            # 退避重试（任何时候都可触发，条件写在 SQL 里）
-            run_all(cfg, trigger="retry")
-
+            scheduler_tick()
         except Exception:
-            traceback.print_exc()
-        time.sleep(30)
+            print('[scheduler] 调度失败，下次检查自动重试。')
+        _shutdown.wait(30)
 
 
 # ================================================================== 页面
-
-OAUTH_DONE_PAGE = """<!doctype html><html lang="zh-CN"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>授权完成 · emoskata</title><style>
-*{box-sizing:border-box}
-body{margin:0;background:#0f1115;color:#e6e9ef;display:grid;place-items:center;
-min-height:100vh;font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-padding:24px}
-.box{max-width:420px;width:100%;background:#171a21;border:1px solid #252a34;
-border-radius:14px;padding:28px;text-align:center}
-.ok{font-size:40px;margin-bottom:8px}
-h1{font-size:17px;margin:0 0 14px;font-weight:600}
-p{margin:0 0 20px;color:#9aa4b2;font-size:14px;word-break:break-all}
-a{display:inline-block;background:#3b82f6;color:#fff;text-decoration:none;
-padding:10px 22px;border-radius:9px;font-size:14px}
-a:hover{background:#2563eb}
-</style></head><body><div class="box">
-<div class="ok">✅</div><h1>授权完成</h1>
-<p>%s</p><a href="%s">返回面板</a>
-</div></body></html>"""
 
 LOGIN_PAGE = r"""<!doctype html><html lang="zh-CN"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -599,193 +612,44 @@ async function go(ev){
 </script></body></html>"""
 
 
-PAGE = r"""<!doctype html><html lang="zh-CN"><head>
+PAGE = r'''<!doctype html><html lang="zh-CN"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>emos 签到面板</title><style>
-:root{--bg:#0f1115;--card:#181c23;--line:#272d38;--fg:#e6e9ef;--dim:#8b95a6;
---ok:#3fb950;--bad:#f85149;--acc:#4c8dff}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);
-font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif}
-.wrap{max-width:960px;margin:0 auto;padding:18px 16px 70px}
-.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
-h1{font-size:18px;margin:0}
-.sub{color:var(--dim);font-size:12px;margin-top:3px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;
-padding:14px;margin-bottom:14px}
-.card h2{font-size:12px;margin:0 0 12px;color:var(--dim);font-weight:600;
-letter-spacing:.06em;text-transform:uppercase}
-input,select{background:#0d1015;border:1px solid var(--line);color:var(--fg);
-border-radius:8px;padding:8px 10px;font-size:13px;width:100%;font-family:inherit}
-input:focus{outline:none;border-color:var(--acc)}
-button{background:var(--acc);color:#fff;border:0;border-radius:8px;
-padding:9px 15px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit}
-button:hover{filter:brightness(1.12)}
-button.ghost{background:transparent;border:1px solid var(--line);color:var(--fg)}
-button.danger{background:transparent;border:1px solid #4a2528;color:var(--bad)}
-button.sm{padding:5px 10px;font-size:12px}
-.row{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px}
-.row>div{flex:1;min-width:130px}
-.row .fix{flex:0 0 auto;min-width:0}
-label{display:block;color:var(--dim);font-size:11px;margin-bottom:4px}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th{text-align:left;color:var(--dim);font-weight:500;font-size:11px;
-padding:0 8px 8px;text-transform:uppercase;letter-spacing:.04em}
-td{padding:9px 8px;border-top:1px solid var(--line);vertical-align:middle}
-.tag{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:600}
-.t-ok{background:rgba(63,185,80,.14);color:var(--ok)}
-.t-skip{background:rgba(139,149,166,.14);color:var(--dim)}
-.t-bad{background:rgba(248,81,73,.14);color:var(--bad)}
-.t-none{background:rgba(139,149,166,.1);color:var(--dim)}
-.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
-.dim{color:var(--dim)}
-.logs{max-height:330px;overflow:auto}
-.logs div{padding:6px 0;border-top:1px solid var(--line);font-size:12px}
-.toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);
-background:#22283a;border:1px solid var(--line);color:var(--fg);
-padding:10px 18px;border-radius:10px;font-size:13px;opacity:0;
-transition:opacity .25s;pointer-events:none;z-index:9;max-width:80vw}
-.toast.on{opacity:1}
-.chk{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--dim)}
-.chk input{width:auto}
-</style></head><body><div class="wrap">
-<div class="top"><div><h1>🥕 emos 签到面板</h1>
-<div class="sub" id="status">加载中…</div></div>
-<button class="ghost sm" onclick="logout()">退出</button></div>
-
-<div class="card"><h2>签到设置</h2>
-<div class="row">
-<div><label>签到时间</label><input id="c-time" placeholder="08:00"></div>
-<div><label>时区</label><input id="c-tz" placeholder="Asia/Shanghai"></div>
-<div><label>接口地址</label><input id="c-base" placeholder="https://emos.best"></div>
-</div>
-<div class="row">
-<div><label>签到附言（随机多给萝卜）</label><input id="c-content" placeholder="留空也可以"></div>
-<div class="fix"><label>号间隔(秒)</label><input id="c-gap" style="width:88px"></div>
-</div>
-<div class="row"><div class="fix"><button onclick="saveCfg()">保存</button></div></div>
-</div>
-
-<div class="card"><h2>通知</h2>
-<div class="row">
-<div><label>TG Bot Token</label><input id="c-tg" placeholder="123456:ABC..."></div>
-<div><label>TG Chat ID</label><input id="c-chat" placeholder="8129903593"></div>
-</div>
-<div class="row">
-<div><label>Bark Key（可选）</label><input id="c-bark" placeholder="留空不用"></div>
-</div>
-<div class="row" style="gap:18px">
-<label class="chk"><input type="checkbox" id="n-ok"> 签到成功通知</label>
-<label class="chk"><input type="checkbox" id="n-bad"> 失败通知</label>
-<label class="chk"><input type="checkbox" id="n-skip"> 仅已签时也通知</label>
-<label class="chk"><input type="checkbox" id="n-sum"> 合并成一条汇总</label>
-</div>
-<div class="row"><div class="fix"><button onclick="saveCfg()">保存</button></div>
-<div class="fix"><button class="ghost" onclick="testTg()">测试通知</button></div></div>
-</div>
-
-<div class="card"><h2>添加账号</h2>
-<div class="row">
-<div class="fix" style="flex:0 0 130px"><input id="a-name" placeholder="备注名"></div>
-<div><input id="a-token" placeholder="密钥 xx_xxx"></div>
-<div class="fix"><button onclick="addAcc()">添加</button></div>
-</div>
-<div class="row" style="margin-top:10px">
-<div><button class="ghost" style="width:100%" onclick="oauthLogin()">🔗 用 emos 账号授权登录（推荐）</button></div>
-</div>
-<div class="dim" style="font-size:12px;margin-top:8px;line-height:1.6">
-跳转到 emos 官方授权页，同意后自动把密钥写进来，不用手动复制。
-需要能公网访问本面板（或已配好反代），否则 emos 回调打不回来。
-</div></div>
-
-<div class="card"><h2>账号列表</h2>
-<div style="overflow:auto"><table id="tbl">
-<thead><tr><th>名称</th><th>状态</th><th>萝卜</th><th>最近</th><th></th></tr></thead>
-<tbody></tbody></table></div></div>
-
-<div class="card"><h2>最近日志</h2>
-<div class="logs" id="logs"><div class="dim">—</div></div></div>
-</div><div class="toast" id="toast"></div>
-<script>
-function api(p,o){o=o||{};o.headers=Object.assign({'Content-Type':'application/json'},o.headers||{});
-o.credentials='same-origin';return fetch(p,o).then(r=>{if(r.status===401){location.href='/login';throw 0;}return r.json();});}
-function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('on');
-setTimeout(()=>t.classList.remove('on'),1900);}
-function tag(s){if(s==='signed')return '<span class="tag t-ok">已签到</span>';
-if(s==='already')return '<span class="tag t-skip">今日已签</span>';
-if(s==='invalid')return '<span class="tag t-bad">密钥失效</span>';
-if(s==='network')return '<span class="tag t-skip">网络问题</span>';
-if(s==='failed')return '<span class="tag t-bad">失败</span>';
-return '<span class="tag t-none">未运行</span>';}
-function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
-
-function loadCfg(){api('/api/config').then(c=>{
-document.getElementById('c-time').value=c.sign_time||'';
-document.getElementById('c-tz').value=c.timezone||'';
-document.getElementById('c-base').value=c.base_url||'';
-document.getElementById('c-content').value=c.content||'';
-document.getElementById('c-gap').value=c.gap_seconds||8;
-document.getElementById('c-tg').value=c.tg_bot_token||'';
-document.getElementById('c-chat').value=c.tg_chat_id||'';
-document.getElementById('c-bark').value=c.bark_key||'';
-document.getElementById('n-ok').checked=c.notify_success==='1';
-document.getElementById('n-bad').checked=c.notify_fail==='1';
-document.getElementById('n-skip').checked=c.notify_already==='1';
-document.getElementById('n-sum').checked=c.notify_summary==='1';
-document.getElementById('status').textContent='签到时间 '+c.sign_time+' ('+c.timezone+') · '+c.base_url;
-});}
-
-function saveCfg(){
-const b={sign_time:v('c-time'),timezone:v('c-tz'),base_url:v('c-base'),content:v('c-content'),
-gap_seconds:parseInt(v('c-gap'))||8,tg_bot_token:v('c-tg'),tg_chat_id:v('c-chat'),bark_key:v('c-bark'),
-notify_success:document.getElementById('n-ok').checked?'1':'0',
-notify_fail:document.getElementById('n-bad').checked?'1':'0',
-notify_already:document.getElementById('n-skip').checked?'1':'0',
-notify_summary:document.getElementById('n-sum').checked?'1':'0'};
-api('/api/config',{method:'POST',body:JSON.stringify(b)})
-.then(r=>{toast(r.ok?'已保存':'失败: '+(r.error||''));loadCfg();});}
-function v(id){return document.getElementById(id).value.trim();}
-
-function testTg(){api('/api/notify-test',{method:'POST'})
-.then(r=>toast(r.ok?'通知已发送':'发送失败: '+(r.error||'')));}
-
-function oauthLogin(){location.href='/oauth/start';}
-function addAcc(){const token=v('a-token');if(!token){toast('填密钥');return;}
-api('/api/accounts',{method:'POST',body:JSON.stringify({name:v('a-name')||'未命名',token})})
-.then(r=>{if(r.ok){document.getElementById('a-name').value='';
-document.getElementById('a-token').value='';toast('已添加');load();}
-else toast('失败: '+(r.error||''));});}
-
-function delAcc(id){if(!confirm('删除这个账号？'))return;
-api('/api/accounts?id='+id,{method:'DELETE'}).then(()=>{toast('已删除');load();});}
-function toggleAcc(id,en){api('/api/accounts',{method:'PATCH',
-body:JSON.stringify({id,enabled:en?0:1})}).then(()=>load());}
-function runOne(id){toast('运行中…');api('/api/run',{method:'POST',
-body:JSON.stringify({id})}).then(r=>{toast(r.ok?'完成':'失败');setTimeout(load,1200);});}
-function runAll(){toast('全部运行中…');api('/api/run',{method:'POST',
-body:JSON.stringify({})}).then(r=>{toast(r.ok?'完成':'失败');setTimeout(load,2500);});}
-function logout(){api('/api/logout',{method:'POST'}).then(()=>location.href='/login');}
-
-function load(){api('/api/accounts').then(list=>{
-document.querySelector('#tbl tbody').innerHTML=list.map(a=>`<tr>
-<td><b>${esc(a.name)}</b><div class="dim mono" style="font-size:11px">${esc((a.token||'').slice(0,6))}…</div></td>
-<td>${tag(a.last_status)}<div class="dim" style="font-size:11px">${esc((a.last_msg||'').slice(0,42))}</div></td>
-<td class="mono">${a.last_carrot==null?'—':a.last_carrot}</td>
-<td class="dim" style="font-size:11px">${esc(a.last_run||'—')}</td>
-<td style="white-space:nowrap">
-<button class="sm ghost" onclick="runOne(${a.id})">签到</button>
-<button class="sm ghost" onclick="toggleAcc(${a.id},${a.enabled})">${a.enabled?'停用':'启用'}</button>
-<button class="sm danger" onclick="delAcc(${a.id})">删</button></td></tr>`).join('')
-||'<tr><td colspan="5" class="dim">还没有账号</td></tr>';});
-api('/api/logs').then(list=>{
-document.getElementById('logs').innerHTML=list.map(l=>{
-const c=l.status==='signed'?'var(--ok)':(l.status==='failed'||l.status==='invalid')?'var(--bad)':'var(--dim)';
-return `<div><span class="dim mono">${esc(l.ts)}</span> <b style="color:${c}">${esc(l.name)}</b>
-<span class="dim">${esc(l.message||'')}</span>${l.carrot?` <span style="color:var(--ok)">+${l.carrot}</span>`:''}</div>`;
-}).join('')||'<div class="dim">—</div>';});}
-
-loadCfg();load();setInterval(load,15000);
-</script></body></html>"""
+<title>emoskata · Bot 管理</title><style>
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#0f1115;color:#e6e9ef;font:14px/1.6 system-ui,sans-serif}
+main{max-width:900px;margin:auto;padding:24px 16px}h1{font-size:22px}h2{font-size:16px;margin-top:0}
+section{background:#181c23;border:1px solid #272d38;border-radius:12px;padding:18px;margin:18px 0}
+label{display:block;color:#9da6b6;margin-top:12px}input{width:100%;background:#0d1015;color:#fff;border:1px solid #303949;border-radius:7px;padding:10px;font:inherit}
+button{border:0;border-radius:7px;background:#4c8dff;color:white;padding:9px 16px;margin:14px 8px 0 0;font:inherit;cursor:pointer}.muted{color:#9da6b6}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:9px;border-bottom:1px solid #303949}#message{white-space:pre-wrap;color:#83c69a}.scroll{overflow:auto}.top{display:flex;justify-content:space-between;align-items:center}
+</style></head><body><main>
+<div class="top"><h1>🥕 emoskata · Bot 管理</h1><button id="logout">退出</button></div>
+<p class="muted">这里配置运行环境。账号通过 Telegram Bot 登录；关联、签到、撤销和个人通知全部在 Bot 菜单内操作。</p>
+<section><h2>Bot 与官方授权</h2>
+<label>Bot Token（留空保留现值，不会回显）<input id="token" type="password" autocomplete="off" placeholder="BotFather 签发的 Token"></label>
+<p id="configured" class="muted"></p>
+<label>应用创建者的 emos 用户 ID<input id="app-id" placeholder="eXXXXXXXXs"></label>
+<p class="muted">用于官方授权链接的应用身份，不是 Telegram 数字 ID。可在 emos 主站「欢迎」里复制。</p>
+<label>emos API 地址<input id="base" placeholder="https://emos.best"></label>
+<label>默认时区<input id="zone" placeholder="Asia/Shanghai"></label>
+<label>默认签到时间<input id="sign-time" placeholder="08:00"></label>
+<label>账号间隔（2–300 秒）<input id="gap" type="number" min="2" max="300"></label>
+<label>签到附言（留空随机，最多 10 字）<input id="content" maxlength="10"></label>
+<button id="save">保存配置</button></section>
+<section><h2>管理密码</h2><label>新密码（至少 6 字符）<input id="password" type="password" autocomplete="new-password"></label>
+<button id="change-password">更改密码并退出所有会话</button>
+<p class="muted">环境变量 PANEL_PASSWORD 非空时启动会应用该密码；更改后同步修改部署环境，避免重启时覆盖。</p></section>
+<div id="message" role="status"></div>
+<section><h2>账号运行状态（只读）</h2><div class="scroll"><table><thead><tr><th>账号</th><th>官方 ID</th><th>状态</th><th>最近签到</th></tr></thead><tbody id="rows"></tbody></table></div>
+<p class="muted">旧版账号原样保留。未完成官方登录归属的账号不会被任何 TG 用户看见或按 ID 接管。</p></section>
+</main><script>
+const $=id=>document.getElementById(id),v=id=>$(id).value.trim();
+async function api(path,body){const r=await fetch(path,{credentials:'same-origin',method:body===undefined?'GET':'POST',headers:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)});if(r.status===401){location.href='/login';throw Error('未登录');}const j=await r.json();if(!r.ok)throw Error(j.error||'请求失败');return j;}
+const report=e=>{$('message').textContent=e.message||String(e);};
+async function load(){try{const c=await api('/api/config');$('app-id').value=c.emos_app_user_id||'';$('base').value=c.base_url||'';$('zone').value=c.timezone||'';$('sign-time').value=c.sign_time||'';$('gap').value=c.gap_seconds||8;$('content').value=c.content||'';$('configured').textContent=c.tg_bot_configured?'Bot Token 已配置。留空保存不会清除。':'Bot Token 尚未配置。';const rows=await api('/api/accounts');$('rows').replaceChildren();for(const row of rows){const tr=document.createElement('tr');for(const text of [row.name,row.emos_id||'旧版未归属',row.last_status||'未运行',row.last_run||'—']){const td=document.createElement('td');td.textContent=text;tr.appendChild(td);}$('rows').appendChild(tr);}}catch(e){report(e);}}
+$('save').onclick=async()=>{try{const b={emos_app_user_id:v('app-id'),base_url:v('base'),timezone:v('zone'),sign_time:v('sign-time'),gap_seconds:Number(v('gap')),content:v('content')};if(v('token'))b.tg_bot_token=v('token');await api('/api/config',b);$('token').value='';$('message').textContent='已保存。环境变量非空时优先于网页配置。';await load();}catch(e){report(e);}};
+$('change-password').onclick=async()=>{try{if(v('password').length<6)throw Error('密码至少 6 个字符。');await api('/api/config',{new_password:v('password')});location.href='/login';}catch(e){report(e);}};
+$('logout').onclick=async()=>{try{await api('/api/logout',{});location.href='/login';}catch(e){report(e);}};
+load();setInterval(load,30000);
+</script></body></html>'''
 
 
 # ================================================================== HTTP
@@ -797,6 +661,49 @@ def _cookie_sid(handler):
         if k == "sid":
             return val
     return ""
+
+
+def _update_config(body):
+    cfg = cfg_all()
+    updates = {}
+    for key in ('base_url', 'timezone', 'content', 'emos_app_user_id', 'tg_chat_id'):
+        if key in body:
+            updates[key] = str(body[key] or '').strip()
+    if 'base_url' in updates:
+        updates['base_url'] = valid_base(updates['base_url'])
+    if 'timezone' in updates:
+        now_local(dict(cfg, timezone=updates['timezone']))
+    if len(updates.get('content', '')) > 10:
+        raise ValueError('签到附言最多 10 个字。')
+    app_id = updates.get('emos_app_user_id')
+    if app_id and (len(app_id) > 48 or not all(c.isascii() and (c.isalnum() or c == '_') for c in app_id)):
+        raise ValueError('应用账号 ID 必须使用 emos 官方用户 ID。')
+    if 'sign_time' in body:
+        updates['sign_time'] = clamp_sign_time(body['sign_time'])
+    if 'gap_seconds' in body:
+        gap = int(body['gap_seconds'])
+        if not 2 <= gap <= 300:
+            raise ValueError('账号间隔必须为 2–300 秒。')
+        updates['gap_seconds'] = str(gap)
+    token = str(body.get('tg_bot_token') or '').strip()
+    if token:
+        if len(token) > 256 or ':' not in token or any(c.isspace() for c in token):
+            raise ValueError('Bot Token 格式错误。')
+        updates['tg_bot_token'] = token
+    if body.get('clear_tg_token') is True:
+        updates['tg_bot_token'] = ''
+    password = str(body.get('new_password') or '')
+    if password and len(password) < 6:
+        raise ValueError('管理密码至少 6 个字符。')
+    with write_db() as conn:
+        for key, value in updates.items():
+            conn.execute('INSERT INTO settings(key,value) VALUES(?,?) '
+                         'ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, value))
+        if password:
+            conn.execute('INSERT INTO settings(key,value) VALUES(?,?) '
+                         'ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                         ('panel_pw_hash', hash_password(password)))
+            conn.execute('DELETE FROM sessions')
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -828,15 +735,31 @@ class Handler(BaseHTTPRequestHandler):
 
     def _body(self):
         try:
-            n = int(self.headers.get("Content-Length") or 0)
-        except Exception:
-            n = 0
+            n = int(self.headers.get('Content-Length') or 0)
+        except ValueError:
+            raise ValueError('请求长度无效。') from None
+        if n < 0 or n > 65536:
+            raise ValueError('请求体最多 64KB。')
         if not n:
             return {}
         try:
-            return json.loads(self.rfile.read(n).decode("utf-8"))
-        except Exception:
-            return {}
+            body = json.loads(self.rfile.read(n).decode('utf-8'))
+        except (ValueError, UnicodeError):
+            raise ValueError('请求体必须是 JSON 对象。') from None
+        if not isinstance(body, dict):
+            raise ValueError('请求体必须是 JSON 对象。')
+        return body
+
+    def _same_origin(self):
+        site = self.headers.get('Sec-Fetch-Site')
+        if site in ('cross-site', 'same-site'):
+            return False
+        origin = self.headers.get('Origin')
+        if not origin:
+            return True
+        wanted = urllib.parse.urlsplit(public_base(self))
+        actual = urllib.parse.urlsplit(origin)
+        return (actual.scheme, actual.netloc) == (wanted.scheme, wanted.netloc)
 
     def _ip(self):
         return (self.client_address[0] if self.client_address else "") or "?"
@@ -860,67 +783,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/login":
             return self._send(200, LOGIN_PAGE, "text/html; charset=utf-8")
 
-        # ---------- emos 官方 OAuth ----------
-        if path == "/oauth/start":
-            # 跳 emos 官方授权页；回调回到本站 /oauth/callback
-            state = secrets.token_urlsafe(18)
-            set_setting("oauth_state_" + state, str(int(time.time())))
-            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            back = (q.get("back") or "/")[0]
-            set_setting("oauth_back_" + state, back[:200])
-            cfg = cfg_all()
-            pub = public_base(self)
-            app_name = cfg.get("oauth_app_name") or "emoskata"
-            target = "%s/link?uuid=%s&name=%s&url=%s" % (
-                (cfg.get("base_url") or "https://emos.best").rstrip("/"),
-                urllib.parse.quote(state),
-                urllib.parse.quote(app_name),
-                urllib.parse.quote(pub + "/oauth/callback"),
-            )
-            return self._send(302, "", "text/plain", location=target)
-
-        if path == "/oauth/callback":
-            q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            state = (q.get("uuid") or q.get("state") or [""])[0]
-            token = (q.get("token") or [""])[0].strip()
-            user = (q.get("username") or [""])[0]
-            uid = (q.get("user_id") or [""])[0]
-
-            if not state or not get_setting("oauth_state_" + state):
-                return self._send(400, "授权状态无效，请重新发起登录。",
-                                  "text/html; charset=utf-8")
-            set_setting("oauth_state_" + state, "")   # 一次性
-
-            if not token:
-                return self._send(400, "授权被拒绝或未返回密钥。",
-                                  "text/html; charset=utf-8")
-
-            # 验证密钥真实有效
-            try:
-                prof = EmosClient(token, cfg_all().get("base_url")).profile()
-                disp = prof.get("_display") or user or uid or "emos 账号"
-            except EmosError as e:
-                return self._send(400, "密钥验证失败：%s" % e.message,
-                                  "text/html; charset=utf-8")
-
-            with _write_lock, db() as conn:
-                dup = conn.execute("SELECT id FROM accounts WHERE token=?",
-                                   (token,)).fetchone()
-                if dup:
-                    acc_id, created = dup["id"], False
-                else:
-                    cur = conn.execute(
-                        "INSERT INTO accounts(name,token,created) VALUES(?,?,?)",
-                        (disp[:40], token,
-                         datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-                    acc_id, created = cur.lastrowid, True
-
-            back = get_setting("oauth_back_" + state) or "/"
-            set_setting("oauth_back_" + state, "")
-            msg = ("已添加账号 <b>%s</b>，正在返回…" % _esc(disp) if created
-                   else "该账号已存在（#%d），正在返回…" % acc_id)
-            return self._send(200, OAUTH_DONE_PAGE % (msg, back),
-                              "text/html; charset=utf-8")
+        if path in ('/oauth/start', '/oauth/callback'):
+            return self._send(410, {'ok': False, 'error': '网页登录已停用，请在 Telegram Bot 使用官方授权登录。'})
 
         if path == "/api/health":
             return self._send(200, {"ok": True, "time": datetime.now().isoformat()})
@@ -928,10 +792,11 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authed():
             return self._deny()
 
-        if path == "/api/accounts":
+        if path == '/api/accounts':
             with db() as conn:
                 rows = [dict(r) for r in conn.execute(
-                    "SELECT * FROM accounts ORDER BY id").fetchall()]
+                    'SELECT id,name,emos_id,enabled,auto_sign,sign_time,last_status,last_msg,'
+                    'last_carrot,last_run,last_day,created FROM accounts ORDER BY id').fetchall()]
             return self._send(200, rows)
 
         if path == "/api/logs":
@@ -940,10 +805,12 @@ class Handler(BaseHTTPRequestHandler):
                     "SELECT * FROM logs ORDER BY id DESC LIMIT 120").fetchall()]
             return self._send(200, rows)
 
-        if path == "/api/config":
+        if path == '/api/config':
             cfg = cfg_all()
-            cfg.pop("panel_pw_hash", None)
-            return self._send(200, cfg)
+            safe = {key: cfg.get(key) for key in DEFAULTS if key not in ('tg_bot_token', 'bark_key')}
+            safe['tg_bot_configured'] = bool(cfg.get('tg_bot_token'))
+            safe['bark_configured'] = bool(cfg.get('bark_key'))
+            return self._send(200, safe)
 
         return self._send(404, {"ok": False, "error": "not found"})
 
@@ -951,7 +818,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
-        body = self._body()
+        if not self._same_origin():
+            return self._send(403, {'ok': False, 'error': '禁止跨站操作。'})
+        try:
+            body = self._body()
+        except ValueError as error:
+            return self._send(400, {'ok': False, 'error': str(error)})
 
         if path == "/api/login":
             ip = self._ip()
@@ -959,14 +831,15 @@ class Handler(BaseHTTPRequestHandler):
             if left:
                 return self._send(429, {"ok": False,
                                         "error": "尝试过多，%d 秒后再试" % left})
-            if not verify_password(body.get("password") or ""):
+            if not verify_password(str(body.get('password') or '')):
                 cnt = rl_fail(ip)
                 rest = max(0, LOGIN_MAX_FAIL - cnt)
                 return self._send(401, {"ok": False,
                                         "error": "密码错误" + ("，还剩 %d 次" % rest if rest else "，已锁定")})
             rl_ok(ip)
             tok = create_session(ip, self.headers.get("User-Agent"))
-            cookie = "sid=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=%d" % (tok, SESSION_TTL)
+            secure = '; Secure' if public_base(self).startswith('https://') else ''
+            cookie = 'sid=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=%d%s' % (tok, SESSION_TTL, secure)
             return self._send(200, {"ok": True}, cookie=cookie)
 
         if path == "/api/logout":
@@ -976,47 +849,18 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authed():
             return self._deny()
 
-        if path == "/api/accounts":
-            token = (body.get("token") or "").strip()
-            if not token:
-                return self._send(400, {"ok": False, "error": "缺少密钥"})
-            name = (body.get("name") or "未命名").strip()[:40]
-            with _write_lock, db() as conn:
-                conn.execute(
-                    "INSERT INTO accounts(name,token,created) VALUES(?,?,?)",
-                    (name, token, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-            return self._send(200, {"ok": True})
+        if path == '/api/accounts':
+            return self._send(410, {'ok': False, 'error': '请在 TG Bot 通过官方 Bot 登录添加账号。'})
 
-        if path == "/api/run":
-            cfg = cfg_all()
-            only = body.get("id")
-            if _run_lock.locked():
-                return self._send(409, {"ok": False, "error": "正在运行中，稍等"})
-            threading.Thread(target=run_all, args=(cfg, "manual", only),
-                             daemon=True).start()
-            return self._send(200, {"ok": True})
+        if path == '/api/run':
+            return self._send(410, {'ok': False, 'error': '请在 TG Bot 对本人及已授权关联账号签到。'})
 
-        if path == "/api/config":
-            for k in ("base_url", "timezone", "tg_bot_token", "tg_chat_id",
-                      "bark_key", "content"):
-                if k in body:
-                    set_setting(k, str(body[k]).strip())
-            if "sign_time" in body:
-                set_setting("sign_time", clamp_sign_time(body["sign_time"]))
-            if "gap_seconds" in body:
-                try:
-                    set_setting("gap_seconds", max(2, int(body["gap_seconds"])))
-                except Exception:
-                    pass
-            for k in ("notify_success", "notify_fail", "notify_already", "notify_summary"):
-                if k in body:
-                    set_setting(k, "1" if str(body[k]) == "1" else "0")
-            if body.get("new_password"):
-                pw = str(body["new_password"])
-                if len(pw) >= 6:
-                    set_setting("panel_pw_hash", hash_password(pw))
-                    drop_all_sessions()
-            return self._send(200, {"ok": True})
+        if path == '/api/config':
+            try:
+                _update_config(body)
+            except (ValueError, EmosError) as error:
+                return self._send(400, {'ok': False, 'error': str(error)})
+            return self._send(200, {'ok': True})
 
         if path == "/api/notify-test":
             ok, err = notify(cfg_all(), "🥕 emos 签到面板",
@@ -1030,75 +874,90 @@ class Handler(BaseHTTPRequestHandler):
     def do_PATCH(self):
         if not self._authed():
             return self._deny()
-        body = self._body()
-        if urllib.parse.urlparse(self.path).path == "/api/accounts":
-            with _write_lock, db() as conn:
-                conn.execute("UPDATE accounts SET enabled=? WHERE id=?",
-                             (1 if body.get("enabled") else 0, body.get("id")))
-            return self._send(200, {"ok": True})
-        return self._send(404, {"ok": False, "error": "not found"})
+        if not self._same_origin():
+            return self._send(403, {'ok': False, 'error': '禁止跨站操作。'})
+        return self._send(410, {'ok': False, 'error': '请在 Bot 内设置自己的账号。'})
 
     def do_DELETE(self):
         if not self._authed():
             return self._deny()
-        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-        if urllib.parse.urlparse(self.path).path == "/api/accounts":
-            try:
-                aid = int(q.get("id", [0])[0])
-            except Exception:
-                aid = 0
-            with _write_lock, db() as conn:
-                conn.execute("DELETE FROM accounts WHERE id=?", (aid,))
-            return self._send(200, {"ok": True})
-        return self._send(404, {"ok": False, "error": "not found"})
+        if not self._same_origin():
+            return self._send(403, {'ok': False, 'error': '禁止跨站操作。'})
+        return self._send(410, {'ok': False, 'error': '账号关联由双方在 Bot 内撤销。'})
 
 
 def bot_supervisor():
-    """监听 tg_bot_token 变化，自动启停 Bot（改 token 不用重启容器）。"""
     from bot import Bot
-    cur_token, cur_bot = None, None
-    while True:
-        try:
-            token = (cfg_all().get("tg_bot_token") or "").strip()
-            if token != cur_token:
-                if cur_bot:
-                    cur_bot.stop()
-                cur_token, cur_bot = token, None
-                if token:
-                    cur_bot = Bot(token, Store())
-                    threading.Thread(target=cur_bot.run, daemon=True).start()
-                    print("[bot] 已启动（token 已配置）")
-                else:
-                    print("[bot] 未配置 token，等待中")
-        except Exception:
-            traceback.print_exc()
-        time.sleep(15)
+    token, current, worker = None, None, None
+    try:
+        while not _shutdown.is_set():
+            try:
+                wanted = str(cfg_all().get('tg_bot_token') or '').strip()
+                dead = worker is not None and not worker.is_alive()
+                if wanted != token or (wanted and dead):
+                    if current:
+                        current.stop(wait=True, timeout=50)
+                    if worker and worker.is_alive():
+                        _shutdown.wait(5)
+                        continue
+                    token, current, worker = wanted, None, None
+                    if wanted:
+                        current = Bot(wanted, Store())
+                        worker = threading.Thread(target=current.run, name='emos-bot-poll', daemon=True)
+                        worker.start()
+                        print('[bot] 已启动，官方账号登录与关联在 TG 菜单内配置。')
+                    else:
+                        print('[bot] 尚未配置 TG_BOT_TOKEN，可通过管理页设置。')
+            except Exception:
+                print('[bot] 启动检查失败，下次自动重试。')
+            _shutdown.wait(15)
+    finally:
+        if current:
+            current.stop(wait=True, timeout=50)
 
 
 def main():
     init_db()
-    generated = init_password()
     cfg = cfg_all()
-
-    port = int(os.environ.get("PORT") or 8080)
-    threading.Thread(target=scheduler_loop, daemon=True).start()
-    threading.Thread(target=bot_supervisor, daemon=True).start()
-
-    srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
-    print("=" * 60)
-    print(" emos 签到面板  →  http://0.0.0.0:%d/" % port)
-    if generated:
-        print(" 面板密码（只显示这一次，请立刻记下）：")
-        print("   %s" % generated)
-    else:
-        print(" 面板密码：已设置（改密码用面板或 PANEL_PASSWORD 环境变量）")
-    print(" 签到时间：%s (%s)" % (cfg.get("sign_time"), cfg.get("timezone")))
-    print(" TG Bot   ：%s" % ("已配置" if (cfg.get("tg_bot_token") or "").strip() else "未配置"))
-    print("=" * 60)
+    valid_base(cfg.get('base_url'))
+    now_local(cfg)
+    enabled_http = str(os.environ.get('HTTP_ENABLED', '1')).lower() not in ('0', 'false', 'off')
+    generated = init_password() if enabled_http else None
+    server = None
+    if enabled_http:
+        host = os.environ.get('HTTP_HOST', '0.0.0.0')
+        port = int(os.environ.get('PORT') or 8080)
+        server = ThreadingHTTPServer((host, port), Handler)
+        server.daemon_threads = True
+        server.timeout = 1
+        print('管理入口：http://%s:%d/（账号操作在 Telegram Bot）' % (host, port))
+        if generated:
+            print('首次管理密码（仅显示一次）：%s' % generated)
+    elif not cfg.get('tg_bot_token'):
+        raise ValueError('纯 Bot 模式必须设置 TG_BOT_TOKEN。')
+    _shutdown.clear()
+    def stopping(*_):
+        _shutdown.set()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, stopping)
+    workers = [threading.Thread(target=task, daemon=True, name=name) for task, name in
+               ((scheduler_loop, 'emos-scheduler'), (bot_supervisor, 'emos-bot-supervisor'),
+                (notification_loop, 'emos-notifications'))]
+    for worker in workers:
+        worker.start()
     try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
-        print("\n已停止")
+        while not _shutdown.is_set():
+            if server:
+                server.handle_request()
+            else:
+                _shutdown.wait(1)
+    finally:
+        _shutdown.set()
+        if server:
+            server.server_close()
+        for worker in workers:
+            worker.join(timeout=55)
+        print('emoskata 已停止。')
 
 
 if __name__ == "__main__":

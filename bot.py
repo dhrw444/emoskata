@@ -1,436 +1,1069 @@
-"""emos 签到 · Telegram Bot —— 纯标准库 long polling。
+"""Telegram-first emoskata entry point; Python 3.10+, standard library only.
 
-与 web 面板共用同一个 data.db，两边改动实时同步。
-
-命令：
-    /start          主菜单（inline 按钮）
-    /status         各号状态
-    /sign           全部签到
-    /sign 3         单独签第 3 个号
-    /add token [名] 添加账号
-    /del 3          删除账号
-    /logs           最近日志
-    /notify         通知开关
-    /id             显示当前 chat_id（用于填到面板里）
+Run: python3 app.py (Store.accounts and Store.run_user are supplied by app).
+Test: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest -v test_bot
+Updates are checkpointed BEFORE dispatch: a crash can lose an action, not replay it.
 """
 
+import base64
+from collections import OrderedDict, deque
 import html
 import json
+import re
 import threading
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 
+from accounts import DomainError
 from emos import EmosClient, EmosError
 
 POLL_TIMEOUT = 30
-_lock = threading.Lock()
+PAGE_SIZE = 8
+HTML_LIMIT = 3500
+_SECRET = re.compile(
+    r"https?://api\.telegram\.org/bot[^\s<>&]+|emosLinkAgree-[^\s<>&]+|"
+    r"\bBearer\s+[^\s<>&]+|\b(?:token|authorization)\s*[:=]\s*[^\s<>&]+|"
+    r"\b\d+_[A-Za-z0-9_-]{6,}", re.I)
 
 
-# ------------------------------------------------------------------ TG 基础
+def _safe(value, limit=600):
+    return _SECRET.sub("［密钥已隐藏］", str(value if value is not None else ""))[:limit]
+
+
+def _esc(value, limit=600):
+    return html.escape(_safe(value, limit), quote=True)
+
+
+def _flag(value):
+    return value is True or value == 1 or value == "1"
+
+
+def _positive(value):
+    return isinstance(value, int) and not isinstance(value, bool) and 0 < value < 2**63
+
+
+def _number(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9]{1,19}", value):
+        raise DomainError("按钮参数无效，请刷新菜单。")
+    number = int(value)
+    if not _positive(number):
+        raise DomainError("按钮参数无效，请刷新菜单。")
+    return number
+
+
+def _page(value):
+    if not re.fullmatch(r"[0-9]{1,6}", str(value)):
+        raise DomainError("页码无效，请刷新菜单。")
+    return int(value)
+
+
+def _html_pages(text, limit=HTML_LIMIT):
+    """Keep tags/entities and UTF-16 characters intact; reserve closing tags."""
+    stack, parts, pages = [], [], []
+    size = 0
+    for match in re.finditer(r"</?(?:b|i|code|pre|u|s)>|&(?:#\d+|#x[0-9a-fA-F]+|[A-Za-z]+);|.",
+                             str(text), re.S):
+        token = match.group()
+        tag = re.fullmatch(r"<(/?)(b|i|code|pre|u|s)>", token)
+        next_stack = list(stack)
+        if tag:
+            if tag[1]:
+                if not stack or stack[-1] != tag[2]:
+                    continue
+                next_stack.pop()
+            else:
+                next_stack.append(tag[2])
+        cost = len(token.encode("utf-16-le")) // 2
+        closing = sum(len(name) + 3 for name in next_stack)
+        if size + cost + closing > limit and parts:
+            pages.append("".join(parts) + "".join("</%s>" % t for t in reversed(stack)))
+            parts = ["<%s>" % t for t in stack]
+            size = sum(map(len, parts))
+        parts.append(token)
+        size += cost
+        stack = next_stack
+    if parts:
+        pages.append("".join(parts) + "".join("</%s>" % t for t in reversed(stack)))
+    return pages or ["—"]
+
+
+class TgError(Exception):
+    """Public text never contains a request URL, token, or Telegram response body."""
+    def __init__(self, message="Telegram 请求失败，请稍后再试。", code=None,
+                 retry_after=0, not_modified=False):
+        super().__init__(message)
+        self.code = code
+        self.retry_after = retry_after
+        self.not_modified = not_modified
+
 
 class TG:
+    METHODS = {"getMe", "getUpdates", "sendMessage", "editMessageText",
+               "answerCallbackQuery", "deleteMessage", "setMyCommands"}
+
     def __init__(self, token, store):
         self.token = (token or "").strip()
-        self.store = store          # 提供 get_setting / set_setting / db / run_all / cfg_all
+        self.store = store
 
     def enabled(self):
         return bool(self.token)
 
     def _api(self, method, payload=None, timeout=POLL_TIMEOUT + 15):
-        if not self.token:
-            raise RuntimeError("未配置 tg_bot_token")
-        url = "https://api.telegram.org/bot%s/%s" % (self.token, method)
-        data = json.dumps(payload).encode() if payload is not None else None
-        req = urllib.request.Request(url, data=data,
-                                     method="POST" if data else "GET")
-        if data:
+        if not self.token or method not in self.METHODS:
+            raise TgError("Telegram 未配置或请求方法无效。")
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+        req = urllib.request.Request(
+            "https://api.telegram.org/bot%s/%s" % (self.token, method), data=data,
+            method="POST" if data is not None else "GET")
+        if data is not None:
             req.add_header("Content-Type", "application/json")
+        status = None
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                return json.loads(r.read().decode("utf-8", "replace"))
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", "replace")
             try:
-                return json.loads(body)
-            except Exception:
-                return {"ok": False, "description": body[:200]}
+                with urllib.request.urlopen(req, timeout=timeout) as response:
+                    raw = response.read(1024 * 1024 + 1)
+            except urllib.error.HTTPError as error:
+                status = error.code
+                try:
+                    raw = error.read(1024 * 1024 + 1)
+                finally:
+                    error.close()
+            if len(raw) > 1024 * 1024:
+                raise ValueError("oversize")
+            result = json.loads(raw.decode("utf-8"))
+        except Exception:
+            raise TgError("Telegram 网络或响应异常，请稍后再试。", code=status) from None
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            result = result if isinstance(result, dict) else {}
+            code = result.get("error_code", status)
+            code = code if isinstance(code, int) and not isinstance(code, bool) else status
+            params = result.get("parameters")
+            retry = params.get("retry_after", 0) if isinstance(params, dict) else 0
+            retry = min(60, max(0, retry)) if isinstance(retry, int) else 0
+            unchanged = result.get("description") == "Bad Request: message is not modified"
+            raise TgError(code=code, retry_after=retry, not_modified=unchanged) from None
+        return result
 
     def send(self, chat_id, text, keyboard=None):
-        payload = {"chat_id": chat_id, "text": text,
-                   "parse_mode": "HTML", "disable_web_page_preview": True}
-        if keyboard:
-            payload["reply_markup"] = {"inline_keyboard": keyboard}
-        return self._api("sendMessage", payload)
+        pages = _html_pages(text)
+        result = None
+        for index, page in enumerate(pages):
+            payload = {"chat_id": chat_id, "text": page, "parse_mode": "HTML",
+                       "disable_web_page_preview": True}
+            if keyboard is not None and index == len(pages) - 1:
+                payload["reply_markup"] = {"inline_keyboard": keyboard}
+            result = self._api("sendMessage", payload, timeout=12)
+        return result
 
     def edit(self, chat_id, msg_id, text, keyboard=None):
-        payload = {"chat_id": chat_id, "message_id": msg_id, "text": text,
-                   "parse_mode": "HTML", "disable_web_page_preview": True}
-        if keyboard is not None:
-            payload["reply_markup"] = {"inline_keyboard": keyboard}
-        return self._api("editMessageText", payload)
+        pages = _html_pages(text)
+        payload = {"chat_id": chat_id, "message_id": msg_id, "text": pages[0],
+                   "parse_mode": "HTML", "disable_web_page_preview": True,
+                   "reply_markup": {"inline_keyboard": keyboard or [] if len(pages) == 1 else []}}
+        try:
+            result = self._api("editMessageText", payload, timeout=12)
+        except TgError as error:
+            if not error.not_modified:
+                raise
+            result = {"ok": True, "result": None}
+        if len(pages) > 1:
+            result = self.send(chat_id, "\n".join(pages[1:]), keyboard)
+        return result
 
     def answer(self, cb_id, text=""):
-        return self._api("answerCallbackQuery",
-                         {"callback_query_id": cb_id, "text": text[:200]})
+        return self._api("answerCallbackQuery", {"callback_query_id": cb_id,
+                         "text": _safe(text, 100)}, timeout=5)
 
     def get_me(self):
-        r = self._api("getMe", timeout=15)
-        return r.get("result", {}) if r.get("ok") else None
+        result = self._api("getMe", timeout=15).get("result")
+        if not isinstance(result, dict) or result.get("is_bot") is not True:
+            raise TgError("Telegram 机器人身份验证失败。")
+        return result
+
+    def delete(self, chat_id, msg_id):
+        return self._api("deleteMessage", {"chat_id": chat_id, "message_id": msg_id}, timeout=5)
 
 
-def _esc(s):
-    return html.escape(str(s if s is not None else ""))
+class _Jobs:
+    """Fixed daemon workers, bounded running+queued work, optional keyed dedup."""
+    def __init__(self, workers, capacity, synchronous=False):
+        self.workers = max(1, int(workers))
+        self.capacity = max(self.workers, int(capacity))
+        self.synchronous = synchronous
+        self.condition = threading.Condition()
+        self.queue = deque()
+        self.keys = set()
+        self.threads = []
+        self.closed = False
 
+    def submit(self, key, function, priority=False):
+        key = object() if key is None else key
+        with self.condition:
+            if self.closed or key in self.keys or len(self.keys) >= self.capacity:
+                return False
+            self.keys.add(key)
+            if not self.synchronous:
+                (self.queue.appendleft if priority else self.queue.append)((key, function))
+                if not self.threads:
+                    for index in range(self.workers):
+                        thread = threading.Thread(target=self._worker, name="emos-bot-job-%d" % index,
+                                                  daemon=True)
+                        self.threads.append(thread)
+                        thread.start()
+                self.condition.notify()
+                return True
+        self._execute(key, function)
+        return True
 
-def _mask(token):
-    t = str(token or "")
-    return t[:4] + "…" + t[-3:] if len(t) > 8 else t
+    def _execute(self, key, function):
+        try:
+            function()
+        except Exception:
+            print("[bot] 后台任务失败；敏感异常详情不记录。")
+        finally:
+            with self.condition:
+                self.keys.discard(key)
+                self.condition.notify_all()
 
-
-# ------------------------------------------------------------------ 视图
-
-def menu_kb():
-    return [
-        [{"text": "📋 账号状态", "callback_data": "status"},
-         {"text": "✅ 全部签到", "callback_data": "signall"}],
-        [{"text": "📜 最近日志", "callback_data": "logs"},
-         {"text": "🔔 通知开关", "callback_data": "notify"}],
-        [{"text": "❓ 帮助", "callback_data": "help"}],
-    ]
-
-
-def view_status(store):
-    with store.db() as conn:
-        accs = [dict(r) for r in conn.execute(
-            "SELECT * FROM accounts ORDER BY id").fetchall()]
-    if not accs:
-        return "还没有账号。\n\n用 <code>/add 密钥 [备注名]</code> 添加。", menu_kb()
-
-    lines = ["<b>📋 账号状态</b>", ""]
-    ok = skip = bad = 0
-    for a in accs:
-        st = a["last_status"]
-        if st == "signed":
-            icon, ok = "✅", ok + 1
-        elif st == "already":
-            icon, skip = "⚪", skip + 1
-        elif st in ("failed", "invalid"):
-            icon, bad = "❌", bad + 1
-        else:
-            icon = "·"
-        name = _esc(a["name"]) if a["name"] else _mask(a["token"])
-        tail = ""
-        if st == "signed" and a["last_carrot"] is not None:
-            tail = " +%s" % a["last_carrot"]
-        elif st in ("failed", "invalid"):
-            tail = " " + _esc((a["last_msg"] or "")[:28])
-        flag = "" if a["enabled"] else " <i>(停用)</i>"
-        lines.append("%s <b>%d</b>. %s%s%s" % (icon, a["id"], name, tail, flag))
-
-    lines.append("")
-    lines.append("成功 %d · 已签 %d · 失败 %d" % (ok, skip, bad))
-    if accs:
-        lines.append("<i>最近：%s</i>" % _esc(accs[0]["last_run"] or "—"))
-    return "\n".join(lines), menu_kb()
-
-
-def view_logs(store, limit=15):
-    with store.db() as conn:
-        rows = [dict(r) for r in conn.execute(
-            "SELECT * FROM logs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()]
-    if not rows:
-        return "还没有日志。", menu_kb()
-    lines = ["<b>📜 最近 %d 条</b>" % len(rows), ""]
-    for r in rows:
-        icon = {"signed": "✅", "already": "⚪"}.get(r["status"], "❌")
-        tail = " +%s" % r["carrot"] if r.get("carrot") else ""
-        lines.append("%s <code>%s</code> %s%s" %
-                     (icon, _esc(r["ts"][5:16]), _esc(r["name"]), tail))
-    return "\n".join(lines), menu_kb()
-
-
-def view_notify(store):
-    cfg = store.cfg_all()
-    def mark(k):
-        return "开" if cfg.get(k) == "1" else "关"
-    text = ("<b>🔔 通知设置</b>\n\n"
-            "签到成功：%s\n失败：%s\n仅已签时也通知：%s\n汇总成一条：%s\n\n"
-            "推送目标 chat_id：<code>%s</code>"
-            % (mark("notify_success"), mark("notify_fail"),
-               mark("notify_already"), mark("notify_summary"),
-               _esc(cfg.get("tg_chat_id") or "未设置")))
-    kb = [
-        [{"text": "成功 %s" % mark("notify_success"), "callback_data": "tg_notify_success"},
-         {"text": "失败 %s" % mark("notify_fail"), "callback_data": "tg_notify_fail"}],
-        [{"text": "已签也通知 %s" % mark("notify_already"), "callback_data": "tg_notify_already"},
-         {"text": "汇总 %s" % mark("notify_summary"), "callback_data": "tg_notify_summary"}],
-        [{"text": "⬅️ 返回", "callback_data": "menu"}],
-    ]
-    return text, kb
-
-
-HELP = """<b>❓ emos 签到 Bot</b>
-
-<b>账号</b>
-<code>/add 密钥 [备注名]</code> — 添加账号
-<code>/del 编号</code> — 删除账号
-<code>/accounts</code> — 列表（含密钥前缀）
-
-<b>签到</b>
-<code>/sign</code> — 全部签到
-<code>/sign 3</code> — 只签第 3 个
-<code>/status</code> — 状态总览
-<code>/logs</code> — 最近日志
-
-<b>其他</b>
-<code>/notify</code> — 通知开关
-<code>/id</code> — 查看 chat_id
-<code>/menu</code> — 主菜单
-
-<i>密钥在 emos.best 点左上角「欢迎」获取，形如 11_xxxxxxxx</i>"""
-
-
-# ------------------------------------------------------------------ Bot 主体
-
-class Bot:
-    def __init__(self, token, store):
-        self.tg = TG(token, store)
-        self.store = store
-        self.me = None
-        self.running = True
+    def _worker(self):
+        while True:
+            with self.condition:
+                while not self.queue and not self.closed:
+                    self.condition.wait()
+                if not self.queue:
+                    return
+                key, function = self.queue.popleft()
+            self._execute(key, function)
 
     def stop(self):
-        self.running = False
+        with self.condition:
+            self.closed = True
+            while self.queue:
+                key, _ = self.queue.popleft()
+                self.keys.discard(key)
+            self.condition.notify_all()
 
-    def _allowed(self, chat_id):
-        """只允许配置里的 chat_id 操作；未配置则首次调用者自动绑定。"""
-        cfg = self.store.cfg_all()
-        want = (cfg.get("tg_chat_id") or "").strip()
-        cid = str(chat_id)
-        if not want:
-            self.store.set_setting("tg_chat_id", cid)
-            return True, "（已自动绑定为通知接收方）"
-        if cid == want:
-            return True, ""
-        # 群组：chat_id 可能是负数，配置里存的是用户 id
-        return False, ""
+    def join(self, timeout=None):
+        deadline = None if timeout is None else time.monotonic() + max(0, timeout)
+        with self.condition:
+            while self.keys:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return False
+                self.condition.wait(remaining)
+        return True
+
+
+def menu_kb(account=None):
+    root = account["id"] if account else 0
+    sign = "sign:%s" % root if account else "login:0"
+    return [[{"text": "✅ 签到", "callback_data": sign},
+             {"text": "👤 我的账号", "callback_data": "accounts:%d:0" % root}],
+            [{"text": "🔗 关联账号", "callback_data": "links:%d:0" % root},
+             {"text": "⚙️ 签到设置", "callback_data": "settings:%d" % root}],
+            [{"text": "📜 签到记录", "callback_data": "logs:%d:0" % root},
+             {"text": "🔐 登录或切换账号", "callback_data": "login:%d" % root}],
+            [{"text": "❓ 帮助", "callback_data": "help"}]]
+
+
+HELP = """<b>🥕 emoskata · 每个人自己的签到 Bot</b>
+
+/login — 通过 @emospg_bot 官方授权，10 分钟有效
+/menu — 主菜单
+/sign — 当前账号 + 已启用的直接关联（不反向、不递归）
+/account 或 /accounts — 我的账号与切换
+/links — 当前账号的关联管理
+/code — 为当前账号生成一次性授权码与关联链接
+<code>/link 目标官方ID 一次性码</code> — 添加直接关联
+/settings — 自动签到、时间及个人通知
+<code>/time HH:MM</code> — 签到时间，不早于 01:00
+/logs — 当前账号与直接关联的记录
+/cancel — 取消授权或待填写输入
+
+目标账号必须先登录本 Bot。ID 只用于定位，一次性码才是代签授权。
+授权码最多 10 分钟、仅能使用一次。来源可暂停/启用；双方均可撤销。
+不接收明文密钥，不提供全局账号管理。"""
+
+
+class Bot:
+    REQUIRED_METHODS = ("ensure_user", "user", "begin_login", "login_pending", "cancel_login",
+                        "finish_login", "owned", "active", "switch", "set_account",
+                        "set_preferences", "issue_code", "redeem", "links", "toggle_link",
+                        "unlink", "visible", "logs", "set_input", "input_state", "clear_input")
+
+    def __init__(self, token, store, *, tg=None, client_factory=None, workers=4,
+                 max_jobs=32, synchronous=False, retry_base=1, retry_cap=30):
+        self.store = store
+        self.accounts = store.accounts
+        missing = [name for name in self.REQUIRED_METHODS
+                   if not callable(getattr(self.accounts, name, None))]
+        if missing:
+            raise TypeError("Store.accounts 缺少契约方法：" + ", ".join(missing))
+        if not callable(getattr(store, "run_user", None)):
+            raise TypeError("Store 缺少契约方法：run_user(tg_id, include_links=True)")
+        self.tg = tg if tg is not None else TG(token, store)
+        self.client_factory = client_factory if client_factory is not None else EmosClient
+        self.stop_event = threading.Event()
+        self._jobs = _Jobs(workers, max_jobs, synchronous)
+        self._control = _Jobs(2, max(8, max_jobs * 2), synchronous)
+        self._state_lock = threading.Lock()
+        self._run_lock = threading.Lock()
+        self._recent_callbacks = OrderedDict()
+        self._guided = {}
+        self.me = None
+        self._offset_key = "tg_update_offset"
+        self._offset = self._load_offset()
+        self._poll_thread = None
+        self.retry_base = max(0.001, float(retry_base))
+        self.retry_cap = max(self.retry_base, float(retry_cap))
+
+    @property
+    def running(self):
+        return not self.stop_event.is_set()
+
+    def stop(self, wait=False, timeout=None):
+        self.stop_event.set()
+        self._jobs.stop()
+        self._control.stop()
+        return self.join(timeout) if wait else None
+
+    def join_jobs(self, timeout=None):
+        deadline = None if timeout is None else time.monotonic() + max(0, timeout)
+        for pool in (self._jobs, self._control):
+            remaining = None if deadline is None else max(0, deadline - time.monotonic())
+            if not pool.join(remaining):
+                return False
+        return True
+
+    def join(self, timeout=None):
+        deadline = None if timeout is None else time.monotonic() + max(0, timeout)
+        if not self.join_jobs(timeout):
+            return False
+        thread = self._poll_thread
+        if thread and thread is not threading.current_thread():
+            remaining = None if deadline is None else max(0, deadline - time.monotonic())
+            thread.join(remaining)
+            return not thread.is_alive()
+        return True
+
+    def _load_offset(self):
+        value = self.store.cfg_all().get(self._offset_key, "0")
+        try:
+            return max(0, int(value))
+        except (ValueError, TypeError, OverflowError):
+            return 0
+
+    def _accept_me(self, profile):
+        if (not isinstance(profile, dict) or profile.get("is_bot") is not True
+                or not _positive(profile.get("id"))
+                or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", str(profile.get("username", "")))):
+            raise TgError("Telegram 机器人身份验证失败。")
+        with self._state_lock:
+            same_bot = self.me is not None and self.me.get('id') == profile['id']
+            self.me = {'id': profile['id'], 'is_bot': True, 'username': profile['username']}
+            self._offset_key = 'tg_update_offset_%d' % profile['id']
+            stored_offset = self._load_offset()
+            self._offset = max(self._offset, stored_offset) if same_bot else stored_offset
+
+    def _identity(self):
+        if not self.me:
+            self._accept_me(self.tg.get_me())
+        return self.me["username"]
 
     def run(self):
-        if not self.tg.enabled():
+        if not self.tg.enabled() or not self._run_lock.acquire(blocking=False):
             return
-        self.me = self.tg.get_me()
-        if not self.me:
-            print("[bot] token 无效，Bot 未启动")
-            return
-        print("[bot] @%s 已上线" % self.me.get("username", "?"))
-        offset = 0
-        while self.running:
-            try:
-                r = self.tg._api("getUpdates", {
-                    "offset": offset, "timeout": POLL_TIMEOUT,
-                    "allowed_updates": ["message", "callback_query"],
-                }, timeout=POLL_TIMEOUT + 20)
-                if not r.get("ok"):
-                    time.sleep(5)
-                    continue
-                for upd in r.get("result", []):
-                    offset = upd["update_id"] + 1
-                    try:
-                        self._handle(upd)
-                    except Exception as e:
-                        print("[bot] 处理失败:", e)
-            except Exception as e:
-                print("[bot] 轮询异常:", e)
-                time.sleep(5)
-
-    # ---------------- 分发 ----------------
-
-    def _handle(self, upd):
-        if "callback_query" in upd:
-            return self._on_callback(upd["callback_query"])
-        msg = upd.get("message") or {}
-        text = (msg.get("text") or "").strip()
-        chat_id = msg.get("chat", {}).get("id")
-        if not text or chat_id is None:
-            return
-        if not text.startswith("/"):
-            return
-        self._on_command(chat_id, text)
-
-    def _on_command(self, chat_id, text):
-        ok, note = self._allowed(chat_id)
-        if not ok:
-            return
-        parts = text.split()
-        cmd = parts[0].split("@")[0].lower()
-        args = parts[1:]
-
-        if cmd in ("/start", "/menu"):
-            self.tg.send(chat_id,
-                         "<b>🥕 emos 签到</b>%s\n\n选一个操作：" % (("\n" + note) if note else ""),
-                         menu_kb())
-
-        elif cmd == "/help":
-            self.tg.send(chat_id, HELP, menu_kb())
-
-        elif cmd == "/id":
-            self.tg.send(chat_id, "chat_id: <code>%s</code>" % chat_id)
-
-        elif cmd in ("/status", "/accounts"):
-            if cmd == "/accounts":
-                with self.store.db() as conn:
-                    rows = [dict(r) for r in conn.execute(
-                        "SELECT * FROM accounts ORDER BY id").fetchall()]
-                if not rows:
-                    self.tg.send(chat_id, "还没有账号。", menu_kb())
-                    return
-                lines = ["<b>🔑 账号列表</b>", ""]
-                for a in rows:
-                    lines.append("<b>%d</b>. %s <code>%s</code>%s" % (
-                        a["id"], _esc(a["name"] or "未命名"),
-                        _mask(a["token"]), "" if a["enabled"] else " (停用)"))
-                self.tg.send(chat_id, "\n".join(lines), menu_kb())
-            else:
-                t, kb = view_status(self.store)
-                self.tg.send(chat_id, t, kb)
-
-        elif cmd == "/logs":
-            t, kb = view_logs(self.store)
-            self.tg.send(chat_id, t, kb)
-
-        elif cmd == "/notify":
-            t, kb = view_notify(self.store)
-            self.tg.send(chat_id, t, kb)
-
-        elif cmd == "/add":
-            if not args:
-                self.tg.send(chat_id, "用法：<code>/add 密钥 [备注名]</code>")
-                return
-            token = args[0].strip()
-            name = " ".join(args[1:]).strip()[:40] or "未命名"
-            if "_" not in token:
-                self.tg.send(chat_id, "密钥格式不对，应该形如 <code>11_xxxxxxxx</code>")
-                return
-            # 先验证 token 有效再入库
-            self.tg.send(chat_id, "验证中…")
-            try:
-                prof = EmosClient(token).profile()
-                disp = prof.get("_display") or ""
-            except EmosError as e:
-                self.tg.send(chat_id, "❌ Token 无效：%s" % _esc(e.message))
-                return
-            final_name = name if (name and name != "未命名") else (disp or "未命名")
-            with self.store.write() as conn:
-                conn.execute(
-                    "INSERT INTO accounts(name,token,created) VALUES(?,?,?)",
-                    (final_name, token, time.strftime("%Y-%m-%d %H:%M:%S")))
-            self.tg.send(chat_id, "✅ 已添加：<b>%s</b>" % _esc(final_name), menu_kb())
-
-        elif cmd == "/del":
-            if not args or not args[0].isdigit():
-                self.tg.send(chat_id, "用法：<code>/del 编号</code>")
-                return
-            with self.store.write() as conn:
-                conn.execute("DELETE FROM accounts WHERE id=?", (int(args[0]),))
-            self.tg.send(chat_id, "🗑 已删除 #%s" % args[0], menu_kb())
-
-        elif cmd == "/sign":
-            only = None
-            if args and args[0].isdigit():
-                only = int(args[0])
-            self.tg.send(chat_id, "⏳ 开始签到…")
-            self._run_and_report(chat_id, only)
-
-    def _run_and_report(self, chat_id, only_id=None):
-        cfg = self.store.cfg_all()
-        rows = self.store.run_all(cfg, "manual", only_id)
-        if rows is None:
-            self.tg.send(chat_id, "⚠️ 已有任务在跑，稍等")
-            return
-        if not rows:
-            self.tg.send(chat_id, "没有可签到的账号。", menu_kb())
-            return
-        t, kb = view_status(self.store)
-        self.tg.send(chat_id, t, kb)
-
-    def _on_callback(self, cb):
-        cb_id = cb.get("id")
-        data = cb.get("data") or ""
-        msg = cb.get("message") or {}
-        chat_id = (msg.get("chat") or {}).get("id")
-        msg_id = msg.get("message_id")
-        if chat_id is None:
-            return
-
-        ok, note = self._allowed(chat_id)
-        if not ok:
-            self.tg.answer(cb_id, "无权操作")
-            return
-
+        self._poll_thread = threading.current_thread()
         try:
-            if data == "menu":
-                self.tg.answer(cb_id)
-                self.tg.edit(chat_id, msg_id,
-                             "<b>🥕 emos 签到</b>\n\n选一个操作：", menu_kb())
+            delay = self.retry_base
+            while not self.stop_event.is_set():
+                try:
+                    self._accept_me(self.tg.get_me())
+                    break
+                except Exception:
+                    print("[bot] Telegram 身份服务暂不可用，自动重试。")
+                    if self.stop_event.wait(delay):
+                        return
+                    delay = min(self.retry_cap, delay * 2)
+            if self.stop_event.is_set():
+                return
+            print("[bot] @%s 已上线" % self.me["username"])
+            try:
+                self.tg._api("setMyCommands", {"commands": [
+                    {"command": command, "description": description} for command, description in
+                    (("menu", "主菜单"), ("login", "官方登录或切换账号"), ("sign", "签到当前与直接关联"),
+                     ("accounts", "我的账号"), ("links", "关联管理"), ("code", "生成一次性授权码"),
+                     ("link", "用官方 ID 与一次性码关联"), ("settings", "签到与通知设置"),
+                     ("time", "设置签到时间"), ("logs", "可见签到记录"), ("cancel", "取消输入或授权"),
+                     ("help", "帮助"))]}, timeout=12)
+            except Exception:
+                pass
+            delay = self.retry_base
+            while not self.stop_event.is_set():
+                try:
+                    response = self.tg._api("getUpdates", {
+                        "offset": self._offset, "timeout": POLL_TIMEOUT,
+                        "allowed_updates": ["message", "callback_query"]}, timeout=POLL_TIMEOUT + 15)
+                    if not isinstance(response, dict) or response.get("ok") is not True:
+                        raise TgError()
+                    updates = response.get("result")
+                    if not isinstance(updates, list):
+                        raise TgError()
+                    for update in updates:
+                        if self.stop_event.is_set():
+                            break
+                        self._handle(update)
+                    delay = self.retry_base
+                    if not updates:
+                        self.stop_event.wait(0.1)
+                except Exception:
+                    print("[bot] 轮询或检查点暂时失败；未持久确认的动作不执行。")
+                    if self.stop_event.wait(delay):
+                        break
+                    delay = min(self.retry_cap, delay * 2)
+        finally:
+            self._run_lock.release()
 
-            elif data == "status":
-                self.tg.answer(cb_id, "刷新中")
-                t, kb = view_status(self.store)
-                self.tg.edit(chat_id, msg_id, t, kb)
+    def _control_call(self, function, priority=False):
+        def guarded():
+            try:
+                function()
+            except Exception:
+                pass
+        return self._control.submit(None, guarded, priority)
 
-            elif data == "logs":
-                self.tg.answer(cb_id)
-                t, kb = view_logs(self.store)
-                self.tg.edit(chat_id, msg_id, t, kb)
+    def _handle(self, update):
+        if self.stop_event.is_set() or not isinstance(update, dict):
+            return
+        uid = update.get("update_id")
+        if not isinstance(uid, int) or isinstance(uid, bool) or uid < 0:
+            return
+        with self._state_lock:
+            if uid < self._offset:
+                return
+            self.store.set_setting(self._offset_key, str(uid + 1))
+            self._offset = uid + 1
+        callback = update.get("callback_query")
+        callback = callback if isinstance(callback, dict) else None
+        message = callback.get("message", {}) if callback else update.get("message", {})
+        if not isinstance(message, dict):
+            message = {}
+        actor = (callback or message).get("from", {})
+        chat = message.get("chat", {})
+        actor = actor if isinstance(actor, dict) else {}
+        chat = chat if isinstance(chat, dict) else {}
+        tg_id, chat_id = actor.get("id"), chat.get("id")
+        text = message.get("text", "") if not callback else ""
+        text = text.strip() if isinstance(text, str) else ""
+        mid = message.get("message_id")
+        sensitive_text = ("emosLinkAgree-" in text or text.lower().startswith("/add ")
+                          or bool(re.match(r"/link(?:@[A-Za-z0-9_]+)?\s", text, re.I))
+                          or bool(re.match(r"/start(?:@[A-Za-z0-9_]+)?\s+associate_", text, re.I)))
+        if sensitive_text and isinstance(mid, int):
+            self._control_call(lambda: self.tg.delete(chat_id, mid), priority=True)
+        permitted = (_positive(tg_id) and chat.get("type") == "private" and chat_id == tg_id
+                     and actor.get("is_bot") is not True)
+        if callback:
+            cb_id = callback.get("id")
+            if not isinstance(cb_id, str) or not cb_id or len(cb_id) > 256:
+                return
+            duplicate = False
+            with self._state_lock:
+                duplicate = cb_id in self._recent_callbacks
+                self._recent_callbacks[cb_id] = None
+                while len(self._recent_callbacks) > 2048:
+                    self._recent_callbacks.popitem(last=False)
+            answer = ("仅限本人私聊操作。" if not permitted else
+                      "已处理，请刷新菜单。" if duplicate else "")
+            self._control_call(lambda: self.tg.answer(cb_id, answer), priority=True)
+            if not permitted or duplicate:
+                return
+        elif not permitted or not text:
+            return
+        data = callback.get("data", "") if callback else None
+        if callback and (not isinstance(data, str) or len(data.encode("utf-8")) > 64):
+            return
+        # Snapshot DB-only state at arrival, before a worker can wait behind another user.
+        user_at_arrival = self.accounts.user(tg_id) or {}
+        root_at_arrival = user_at_arrival.get("active_account_id") or 0
+        login_at_arrival = user_at_arrival.get("login_until", 0)
+        input_at_arrival = self._guided.get(tg_id)
+        guided_link = not text.startswith('/') and (
+            bool(input_at_arrival and input_at_arrival[0] == 'link')
+            or (user_at_arrival.get('input_kind') == 'link'
+                and user_at_arrival.get('input_until', 0) > int(time.time())))
+        if guided_link and not sensitive_text and isinstance(mid, int):
+            self._control_call(lambda: self.tg.delete(chat_id, mid), priority=True)
+        is_cancel = (callback and data == 'cancel') or (
+            not callback and bool(re.fullmatch(r'/cancel(?:@[A-Za-z0-9_]+)?', text, re.I)))
+        if is_cancel:
+            self.accounts.cancel_login(tg_id)
+            self._clear_input(tg_id)
+            self._control_call(lambda: self.tg.send(chat_id, '已取消待填写输入与登录授权。'))
+            return
+        def work():
+            if self.stop_event.is_set():
+                return
+            try:
+                self.accounts.ensure_user(tg_id, chat_id)
+                if callback:
+                    self._on_callback(tg_id, chat_id, mid, data, root_at_arrival)
+                else:
+                    self._on_command(tg_id, chat_id, text, root_at_arrival,
+                                     login_at_arrival, input_at_arrival)
+            except DomainError as error:
+                account = self._active(tg_id)
+                self._reply(chat_id, "❌ " + _esc(str(error)), menu_kb(account))
+                if not account:
+                    self._show_login(tg_id, chat_id)
+            except Exception:
+                print("[bot] 操作失败；原始输入、凭据及异常详情不记录。")
+                self._reply(chat_id, "操作暂时失败，请刷新菜单后重试。", menu_kb())
+        if not self._jobs.submit(tg_id, work):
+            self._control_call(lambda: self.tg.send(chat_id, "已有操作在处理或队列已满。本次未执行，请稍后重试。"))
 
-            elif data == "notify":
-                self.tg.answer(cb_id)
-                t, kb = view_notify(self.store)
-                self.tg.edit(chat_id, msg_id, t, kb)
+    def _reply(self, chat_id, text, keyboard=None, msg_id=None):
+        if self.stop_event.is_set():
+            return
+        try:
+            if msg_id is None:
+                return self.tg.send(chat_id, text, keyboard)
+            return self.tg.edit(chat_id, msg_id, text, keyboard)
+        except Exception:
+            print("[bot] 消息未送达；不重复执行原操作。")
 
-            elif data.startswith("tg_notify_"):
-                key = data[len("tg_notify_"):]
-                cur = self.store.cfg_all().get(key, "0")
-                self.store.set_setting(key, "0" if cur == "1" else "1")
-                self.tg.answer(cb_id, "已切换")
-                t, kb = view_notify(self.store)
-                self.tg.edit(chat_id, msg_id, t, kb)
+    def _active(self, tg_id):
+        try:
+            return self.accounts.active(tg_id, required=False)
+        except DomainError:
+            return None
 
-            elif data == "signall":
-                if _lock.locked():
-                    self.tg.answer(cb_id, "正在运行中")
-                    return
-                self.tg.answer(cb_id, "开始签到")
-                with _lock:
-                    self.tg.edit(chat_id, msg_id, "⏳ 正在签到，请稍候…")
-                    self._run_and_report(chat_id)
+    def _root(self, tg_id, expected=None):
+        account = self.accounts.active(tg_id)
+        if expected is not None and account["id"] != expected:
+            raise DomainError("当前账号已切换，请刷新菜单后重试。")
+        return account
 
-            elif data == "help":
-                self.tg.answer(cb_id)
-                self.tg.edit(chat_id, msg_id, HELP, menu_kb())
+    def _selection(self, tg_id, expected):
+        account = self._active(tg_id)
+        if (account["id"] if account else 0) != expected:
+            raise DomainError("当前账号已切换，旧按钮/输入已失效，请刷新菜单。")
+        return account
 
-            elif data.startswith("sign:"):
-                aid = int(data.split(":", 1)[1])
-                if _lock.locked():
-                    self.tg.answer(cb_id, "正在运行中")
-                    return
-                self.tg.answer(cb_id, "开始")
-                with _lock:
-                    self._run_and_report(chat_id, aid)
+    def _clear_input(self, tg_id):
+        self.accounts.clear_input(tg_id)
+        with self._state_lock:
+            self._guided.pop(tg_id, None)
 
+    def _show(self, chat_id, view, msg_id=None):
+        return self._reply(chat_id, view[0], view[1], msg_id)
+
+    def _show_login(self, tg_id, chat_id, msg_id=None, expected=None):
+        if expected is not None:
+            self._selection(tg_id, expected)
+        app_id = str(self.store.cfg_all().get("emos_app_user_id") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_]{1,48}", app_id):
+            self._reply(chat_id, "<b>官方登录尚未配置</b>\n运营者需配置应用创建者的 emos 官方账号 ID"
+                        "（emos_app_user_id / EMOS_APP_USER_ID），不是 Telegram 数字 ID。",
+                        menu_kb(self._active(tg_id)), msg_id)
+            return
+        username = self._identity()
+        if expected is not None:
+            self._selection(tg_id, expected)
+        payload = "link_%s-%s" % (app_id, username)
+        if len(payload) > 64:
+            raise DomainError("应用 ID 与 Bot 用户名组成的官方登录参数过长，请联系运营者。")
+        self.accounts.begin_login(tg_id)
+        self._clear_input(tg_id)
+        account = self._active(tg_id)
+        root = account["id"] if account else 0
+        url = "https://t.me/emospg_bot?start=" + payload
+        text = ("<b>🔐 官方登录</b>\n\n点击 @emospg_bot 授权后返回此 Bot。\n"
+                "仅接受本次私聊发起的授权，10 分钟有效。密钥回传消息会尝试删除，绝不展示。\n"
+                "已有账号保留，不会因登录新账号而被删除。")
+        keyboard = [[{"text": "通过官方 Bot 登录", "url": url}],
+                    [{"text": "选择已登录账号", "callback_data": "accounts:%d:0" % root}],
+                    [{"text": "取消授权", "callback_data": "cancel"},
+                     {"text": "主菜单", "callback_data": "menu"}]]
+        self._reply(chat_id, text, keyboard, msg_id)
+
+    def _show_menu(self, tg_id, chat_id, msg_id=None):
+        account = self._active(tg_id)
+        if not account:
+            return self._show_login(tg_id, chat_id, msg_id)
+        self._reply(chat_id, "<b>🥕 emoskata</b>\n\n当前：<b>%s</b>\n官方 ID：<code>%s</code>\n"
+                    "签到仅包含当前账号及已启用的直接关联。" %
+                    (_esc(account.get("name") or "未命名"), _esc(account.get("emos_id"))),
+                    menu_kb(account), msg_id)
+
+    def _pagination(self, rows, page, prefix):
+        last = max(0, (len(rows) - 1) // PAGE_SIZE)
+        page = min(page, last)
+        nav = []
+        if page:
+            nav.append({"text": "⬅️ 上页", "callback_data": "%s:%d" % (prefix, page - 1)})
+        if page < last:
+            nav.append({"text": "下页 ➡️", "callback_data": "%s:%d" % (prefix, page + 1)})
+        return rows[page * PAGE_SIZE:(page + 1) * PAGE_SIZE], page, last, nav
+
+    def _view_accounts(self, tg_id, page=0):
+        rows = self.accounts.owned(tg_id)
+        active = self._active(tg_id)
+        root = active["id"] if active else 0
+        items, page, last, nav = self._pagination(rows, page, "accounts:%d" % root)
+        lines = ["<b>👤 我的账号</b> · %d/%d 页" % (page + 1, last + 1), ""]
+        keyboard = []
+        if not rows:
+            lines.append("尚未登录账号，请通过官方 Bot 登录。")
+        for account in items:
+            selected = active and account["id"] == active["id"]
+            name = account.get("name") or "未命名"
+            lines.append("%s <b>%s</b> · ID <code>%s</code>\n%s · 自动签到%s · %s" % (
+                "▶️" if selected else "👤", _esc(name), _esc(account.get("emos_id")),
+                "有效" if _flag(account.get("enabled")) else "失效，请重新授权",
+                "开" if _flag(account.get("auto_sign")) else "关",
+                _esc(account.get("sign_time") or "默认时间")))
+            keyboard.append([{"text": ("✓ " if selected else "切换至 ") + _safe(name, 30),
+                              "callback_data": "switch:%d:%d" % (root, account["id"])}])
+        if nav:
+            keyboard.append(nav)
+        keyboard.extend([[{"text": "登录另一个账号", "callback_data": "login:%d" % root}],
+                         [{"text": "主菜单", "callback_data": "menu"}]])
+        return "\n".join(lines), keyboard
+
+    def _view_links(self, tg_id, page=0):
+        account = self._root(tg_id)
+        links = self.accounts.links(tg_id)
+        rows = [("outgoing", link) for link in links.get("outgoing", [])]
+        rows += [("incoming", link) for link in links.get("incoming", [])]
+        items, page, last, nav = self._pagination(rows, page, "links:%d" % account["id"])
+        lines = ["<b>🔗 关联账号</b> · %d/%d 页" % (page + 1, last + 1),
+                 "当前：<b>%s</b> · ID <code>%s</code>" %
+                 (_esc(account.get("name")), _esc(account.get("emos_id"))),
+                 "来源 → 目标，只授予直接签到权限；双方均能撤销。", ""]
+        keyboard = [[{"text": "添加目标 · ID + 一次性码",
+                      "callback_data": "guide:link:%d" % account["id"]}],
+                    [{"text": "为当前账号生成码/链接", "callback_data": "code:%d" % account["id"]}]]
+        if not rows:
+            lines.append("暂无关联。目标先登录，再由目标生成一次性码。")
+        for direction, link in items:
+            source, target = link["source_id"], link["target_id"]
+            enabled = _flag(link.get("enabled"))
+            lines.append("%s %s <code>%s</code> → %s <code>%s</code> · %s" % (
+                "➡️ 我代签" if direction == "outgoing" else "⬅️ 代签我",
+                _esc(link.get("source_name")), _esc(link.get("source_emos_id")),
+                _esc(link.get("target_name")), _esc(link.get("target_emos_id")),
+                "启用" if enabled else "暂停"))
+            row = []
+            if direction == "outgoing":
+                row.append({"text": ("暂停 " if enabled else "启用 ") + _safe(link.get("target_name"), 20),
+                            "callback_data": "toggle:%d:%d" % (source, target)})
+            row.append({"text": "撤销 " + _safe(link.get("target_name") if direction == "outgoing"
+                                              else link.get("source_name"), 20),
+                        "callback_data": "unlink:%d:%d:%d" % (account["id"], source, target)})
+            keyboard.append(row)
+        if nav:
+            keyboard.append(nav)
+        keyboard.append([{"text": "主菜单", "callback_data": "menu"}])
+        return "\n".join(lines), keyboard
+
+    def _view_settings(self, tg_id):
+        account = self._root(tg_id)
+        user = self.accounts.user(tg_id) or {}
+        def mark(value):
+            return "开" if _flag(value) else "关"
+        text = ("<b>⚙️ 签到设置</b>\n\n当前：<b>%s</b> · ID <code>%s</code>\n"
+                "账号状态：%s\n自动签到：%s\n签到时间：%s（不早于 01:00）\n\n"
+                "<b>我的通知</b>\n成功：%s · 失败：%s · 已签：%s\n"
+                "自动签到开关不会恢复失效密钥；失效时请重新官方登录。" % (
+                    _esc(account.get("name")), _esc(account.get("emos_id")),
+                    "有效" if _flag(account.get("enabled")) else "失效",
+                    mark(account.get("auto_sign")), _esc(account.get("sign_time") or "默认时间"),
+                    mark(user.get("notify_success")), mark(user.get("notify_fail")),
+                    mark(user.get("notify_already"))))
+        keyboard = [[{"text": "自动签到 " + mark(account.get("auto_sign")),
+                      "callback_data": "auto:%d" % account["id"]},
+                     {"text": "修改签到时间", "callback_data": "guide:time:%d" % account["id"]}],
+                    [{"text": "成功通知 " + mark(user.get("notify_success")),
+                      "callback_data": "pref:notify_success"},
+                     {"text": "失败通知 " + mark(user.get("notify_fail")),
+                      "callback_data": "pref:notify_fail"}],
+                    [{"text": "已签通知 " + mark(user.get("notify_already")),
+                      "callback_data": "pref:notify_already"}],
+                    [{"text": "主菜单", "callback_data": "menu"}]]
+        return text, keyboard
+
+    def _view_logs(self, tg_id, page=0):
+        account = self._root(tg_id)
+        rows = self.accounts.logs(tg_id, limit=40)
+        items, page, last, nav = self._pagination(rows, page, "logs:%d" % account["id"])
+        lines = ["<b>📜 签到记录</b> · %d/%d 页" % (page + 1, last + 1),
+                 "只显示当前账号和当前直接授权目标；撤销后立即不可见。", ""]
+        if not rows:
+            lines.append("暂无可见记录。")
+        for row in items:
+            icon = {"signed": "✅", "already": "⚪", "network": "🌐"}.get(row.get("status"), "❌")
+            carrot = " +%s" % _esc(row["carrot"], 40) if row.get("carrot") is not None else ""
+            lines.append("%s <code>%s</code> <b>%s</b>%s\n%s" % (
+                icon, _esc(row.get("ts") or row.get("last_run") or "—", 40),
+                _esc(row.get("name") or row.get("emos_id") or "未命名", 100), carrot,
+                _esc(row.get("message") or "—", 200)))
+        keyboard = [nav] if nav else []
+        keyboard.append([{"text": "刷新", "callback_data": "logs:%d:%d" % (account["id"], page)},
+                         {"text": "主菜单", "callback_data": "menu"}])
+        return "\n".join(lines), keyboard
+
+    @staticmethod
+    def _link_args(target, code):
+        if (isinstance(target, bool) or not isinstance(target, (str, int))
+                or not str(target) or len(str(target)) > 256
+                or any(character.isspace() or ord(character) < 32 or ord(character) == 127
+                       for character in str(target))
+                or not isinstance(code, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,256}", code)):
+            raise DomainError("请输入目标官方 ID 和正确的一次性码。")
+        return str(target), code
+
+    @staticmethod
+    def _association_payload(target, code):
+        """Compact v1 payload, no Emos tokens; long IDs fall back to /link text."""
+        target, code = Bot._link_args(target, code)
+        packed = base64.urlsafe_b64encode(target.encode("utf-8")).decode("ascii").rstrip("=")
+        # First '-' separates encoded ID from the URL-safe one-use secret.
+        payload = "associate_%s-%s" % (packed, code) if "-" not in packed else ""
+        return payload if payload and len(payload) <= 64 else ""
+
+    @staticmethod
+    def _association_args(payload):
+        if not isinstance(payload, str) or len(payload) > 64 or not payload.startswith("associate_"):
+            raise DomainError("关联链接无效，请使用 ID 与一次性码。")
+        packed, separator, code = payload[len("associate_"):].partition("-")
+        if not separator or not re.fullmatch(r"[A-Za-z0-9_]+", packed):
+            raise DomainError("关联链接无效，请使用 ID 与一次性码。")
+        try:
+            target = base64.b64decode(packed + "=" * (-len(packed) % 4), altchars=b"-_", validate=True).decode("utf-8")
+        except Exception:
+            raise DomainError("关联链接无效，请使用 ID 与一次性码。") from None
+        return Bot._link_args(target, code)
+
+    def _show_code(self, tg_id, chat_id, expected):
+        self._root(tg_id, expected)
+        username = self._identity()
+        self._root(tg_id, expected)
+        issued = self.accounts.issue_code(tg_id)
+        target, code = self._link_args(issued["target_emos_id"], issued["code"])
+        expires = int(issued["expires_at"])
+        ttl = min(600, max(0, expires - int(time.time())))
+        payload = self._association_payload(target, code)
+        # Authorization code is intentionally visible ONLY to its private issuer.
+        text = ("<b>🔑 当前账号的一次性代签授权</b>\n\n目标官方 ID：<code>%s</code>\n"
+                "一次性码：<code>%s</code>\n剩余最多 %d 秒（不超过 10 分钟），只能使用一次。\n"
+                "重新生成会替换旧码。仅把本条交给你同意的代签方。\n\n"
+                "代签方先登录并选择来源，再输入：\n<code>/link %s %s</code>" %
+                (html.escape(target), html.escape(code), ttl, html.escape(target), html.escape(code)))
+        keyboard = []
+        if payload:
+            keyboard.append([{"text": "使用一次性关联链接", "url": "https://t.me/%s?start=%s" % (username, payload)}])
+        else:
+            text += "\n官方 ID 较长，使用上面的命令关联。"
+        keyboard.append([{"text": "返回关联管理", "callback_data": "links:%d:0" % expected},
+                         {"text": "隐藏本条授权码", "callback_data": "hide"}])
+        self._reply(chat_id, text, keyboard)
+
+    def _redeem(self, tg_id, chat_id, expected, target, code):
+        self._root(tg_id, expected)
+        target, code = self._link_args(target, code)
+        linked = self.accounts.redeem(tg_id, target, code)
+        self._clear_input(tg_id)
+        self._reply(chat_id, "✅ 已关联目标 <b>%s</b> · 官方 ID <code>%s</code>\n"
+                    "仅当前来源可以直接代签，不创建反向或递归权限。" %
+                    (_esc(linked.get("name")), _esc(linked.get("emos_id"))), menu_kb(self._root(tg_id, expected)))
+
+    def _guide(self, tg_id, chat_id, kind, expected, msg_id=None):
+        self._root(tg_id, expected)
+        self.accounts.set_input(tg_id, kind, ttl=600)
+        user = self.accounts.user(tg_id)
+        with self._state_lock:
+            self._guided[tg_id] = (kind, expected, user["input_until"])
+        text = ("请发送：<code>目标官方ID 一次性码</code>\n目标必须已登录本 Bot；不接收账号密钥。"
+                if kind == "link" else "请发送 <code>HH:MM</code>（00:xx 调整为 01:xx）。")
+        self._reply(chat_id, text + "\n输入 10 分钟有效，切换账号后失效。/cancel 取消。",
+                    [[{"text": "取消输入", "callback_data": "cancel"}]], msg_id)
+
+    def _time(self, tg_id, chat_id, expected, value):
+        self._root(tg_id, expected)
+        if not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", str(value)):
+            raise DomainError("时间格式必须为 HH:MM，范围 00:00–23:59。")
+        value = "01" + value[2:] if value.startswith("00:") else value
+        self.accounts.set_account(tg_id, sign_time=value)
+        self._clear_input(tg_id)
+        self._reply(chat_id, "✅ 签到时间已设为 <code>%s</code>。" % value)
+        self._show(chat_id, self._view_settings(tg_id))
+
+    def _guided_text(self, tg_id, chat_id, text, expected, state):
+        kind = self.accounts.input_state(tg_id)
+        user = self.accounts.user(tg_id) or {}
+        if (not kind or not state or state != self._guided.get(tg_id)
+                or state[0] != kind or state[2] != user.get("input_until")
+                or state[2] <= int(time.time())):
+            self._clear_input(tg_id)
+            raise DomainError("输入会话已过期或重启后失效，请重新点击填写按钮。")
+        self._root(tg_id, expected)
+        self._root(tg_id, state[1])
+        if kind == "link":
+            args = text.split()
+            if len(args) != 2:
+                raise DomainError("请发送：目标官方ID 一次性码；/cancel 取消。")
+            return self._redeem(tg_id, chat_id, expected, args[0], args[1])
+        return self._time(tg_id, chat_id, expected, text)
+
+    def _finish_login(self, tg_id, chat_id, token, expected, login_until):
+        self._selection(tg_id, expected)
+        user = self.accounts.user(tg_id) or {}
+        if (not login_until or user.get("login_until") != login_until
+                or not self.accounts.login_pending(tg_id)):
+            raise DomainError("授权请求未发起或已过期，请重新 /login。")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,512}", token):
+            raise DomainError("官方回传格式无效，请重新授权。")
+        base = self.store.cfg_all().get("base_url") or ""
+        self._reply(chat_id, "⏳ 正在验证官方账号…")
+        try:
+            profile = self.client_factory(token, base).profile()
+        except EmosError:
+            raise DomainError("官方账号验证失败，请重新授权或稍后再试。") from None
+        except Exception:
+            raise DomainError("官方账号验证暂不可用，请稍后再试。") from None
+        if not isinstance(profile, dict):
+            raise DomainError("官方资料无效，请重新授权。")
+        official = profile.get("user_id")
+        if official is None or (isinstance(official, str) and not official.strip()):
+            official = profile.get("_user_id")
+        if official is None or isinstance(official, bool) or not str(official).strip():
+            raise DomainError("官方资料缺少账号 ID，授权未保存。")
+        if "telegram_user_id" in profile:
+            linked_tg = profile["telegram_user_id"]
+            if isinstance(linked_tg, str) and re.fullmatch(r"[0-9]{1,19}", linked_tg):
+                linked_tg = int(linked_tg)
+            if not _positive(linked_tg) or linked_tg != tg_id:
+                raise DomainError("官方授权与当前 Telegram 用户不匹配。")
+        self._selection(tg_id, expected)
+        if (self.stop_event.is_set() or (self.accounts.user(tg_id) or {}).get("login_until") != login_until
+                or not self.accounts.login_pending(tg_id)):
+            raise DomainError("本次授权已取消或过期，请重新登录。")
+        # Domain service atomically consumes pending authorization and verifies ownership.
+        account = self.accounts.finish_login(tg_id, token, profile, base_url=base)
+        self._clear_input(tg_id)
+        self._reply(chat_id, "✅ 已登录 <b>%s</b> · 官方 ID <code>%s</code>。" %
+                    (_esc(account.get("name")), _esc(account.get("emos_id"))), menu_kb(account))
+
+    def _run_and_report(self, tg_id, chat_id, expected):
+        root = self._root(tg_id, expected)
+        if not _flag(root.get("enabled")) or root.get("last_status") == "invalid":
+            raise DomainError("当前账号已失效，请重新官方登录。")
+        if self.stop_event.is_set():
+            return
+        self._reply(chat_id, "⏳ 正在签到当前账号与已启用的直接关联…")
+        # Recheck AFTER message HTTP: never silently sign a newly selected root.
+        self._root(tg_id, expected)
+        if self.stop_event.is_set():
+            return
+        result = self.store.run_user(tg_id, include_links=True, expected_root=expected)
+        if result is None:
+            self._reply(chat_id, "已有签到任务在运行。本次未执行，请稍后重试。", menu_kb(root))
+            return
+        rows = result
+        if isinstance(result, dict):
+            if result.get("root_id", expected) != expected:
+                raise DomainError("签到时当前账号发生变化，请刷新记录。")
+            rows = result.get("rows")
+        if not isinstance(rows, list):
+            raise TypeError("Store.run_user 返回必须为结果行列表或 None")
+        if self.stop_event.is_set():
+            return
+        self._root(tg_id, expected)
+        # A grant revoked mid-flight must no longer expose the former target's result.
+        visible = {account["id"] for account in self.accounts.visible(tg_id)}
+        rows = [row for row in rows if isinstance(row, dict) and row.get("id") in visible]
+        if not rows:
+            self._reply(chat_id, "没有可报告的签到结果。授权撤销的目标不会继续展示。", menu_kb(root))
+            return
+        lines = ["<b>🥕 本次签到</b>", "当前：<b>%s</b> · ID <code>%s</code>" %
+                 (_esc(root.get("name")), _esc(root.get("emos_id"))), ""]
+        for row in rows:
+            icon = {"signed": "✅", "already": "⚪", "network": "🌐"}.get(row.get("status"), "❌")
+            carrot = " +%s" % _esc(row["carrot"], 40) if row.get("carrot") is not None else ""
+            lines.append("%s <b>%s</b> · <code>%s</code>%s\n%s" % (
+                icon, _esc(row.get("name") or "未命名", 120), _esc(row.get("emos_id"), 128), carrot,
+                _esc(row.get("message") or "—", 400)))
+        self._reply(chat_id, "\n".join(lines), menu_kb(root))
+
+    def _on_command(self, tg_id, chat_id, text, expected, login_until=0, input_state=None):
+        if not text.startswith("/"):
+            return self._guided_text(tg_id, chat_id, text, expected, input_state)
+        parts = text.split()
+        command = parts[0].split("@", 1)
+        if len(command) == 2 and (not self.me or command[1].lower() != self.me["username"].lower()):
+            return
+        cmd, args = command[0].lower(), parts[1:]
+        if cmd == "/start" and args:
+            payload = args[0]
+            if len(args) != 1:
+                raise DomainError("授权或关联回传格式无效，请重新操作。")
+            if payload.startswith("emosLinkAgree-"):
+                return self._finish_login(tg_id, chat_id, payload[len("emosLinkAgree-"):], expected, login_until)
+            if payload.startswith("emosLinkRefuse-"):
+                refused = _number(payload[len("emosLinkRefuse-"):])
+                if refused != tg_id:
+                    raise DomainError("拒绝回传的 Telegram ID 与本人不匹配。")
+                if (not login_until or not self.accounts.login_pending(tg_id)
+                        or (self.accounts.user(tg_id) or {}).get("login_until") != login_until):
+                    raise DomainError("本次登录请求已过期或未发起。")
+                self.accounts.cancel_login(tg_id)
+                self._reply(chat_id, "已取消本次官方授权。", menu_kb(self._active(tg_id)))
+                return
+            if payload.startswith("associate_"):
+                target, code = self._association_args(payload)
+                return self._redeem(tg_id, chat_id, expected, target, code)
+            raise DomainError("未知的启动参数，请使用菜单。")
+        if cmd == "/help":
+            return self._reply(chat_id, HELP, menu_kb(self._active(tg_id)))
+        if cmd == "/cancel":
+            self.accounts.cancel_login(tg_id)
+            self._clear_input(tg_id)
+            return self._reply(chat_id, "已取消待填写输入与登录授权。", menu_kb(self._active(tg_id)))
+        if cmd not in {"/start", "/login", "/menu", "/sign", "/account", "/accounts", "/links",
+                       "/code", "/link", "/settings", "/time", "/logs"}:
+            return self._reply(chat_id, "不支持此命令。请通过 /login 官方授权，使用 /help 查看命令。", menu_kb(self._active(tg_id)))
+        self._selection(tg_id, expected)
+        if cmd in ("/start", "/menu"):
+            if args:
+                raise DomainError("请直接使用 /menu。")
+            return self._show_menu(tg_id, chat_id)
+        if cmd == "/login":
+            if args:
+                raise DomainError("请直接使用 /login 官方授权。")
+            return self._show_login(tg_id, chat_id, expected=expected)
+        if cmd in ("/account", "/accounts"):
+            return self._show(chat_id, self._view_accounts(tg_id))
+        self._root(tg_id, expected)
+        if cmd == "/sign":
+            if args:
+                raise DomainError("/sign 只签到当前账号和直接关联。请先从我的账号切换。")
+            return self._run_and_report(tg_id, chat_id, expected)
+        if cmd == "/links":
+            return self._show(chat_id, self._view_links(tg_id))
+        if cmd == "/code":
+            if args:
+                raise DomainError("生成码请直接使用 /code。")
+            return self._show_code(tg_id, chat_id, expected)
+        if cmd == "/link":
+            if not args:
+                return self._guide(tg_id, chat_id, "link", expected)
+            if len(args) != 2:
+                raise DomainError("用法：/link 目标官方ID 一次性码。仅有 ID 无法授权。")
+            return self._redeem(tg_id, chat_id, expected, args[0], args[1])
+        if cmd == "/settings":
+            return self._show(chat_id, self._view_settings(tg_id))
+        if cmd == "/time":
+            if not args:
+                return self._guide(tg_id, chat_id, "time", expected)
+            if len(args) != 1:
+                raise DomainError("用法：/time HH:MM。")
+            return self._time(tg_id, chat_id, expected, args[0])
+        if cmd == "/logs":
+            return self._show(chat_id, self._view_logs(tg_id))
+
+    def _on_callback(self, tg_id, chat_id, msg_id, data, arrival_root):
+        parts = data.split(":")
+        action = parts[0]
+        if data == "help":
+            return self._reply(chat_id, HELP, menu_kb(self._active(tg_id)), msg_id)
+        if data == "cancel":
+            self.accounts.cancel_login(tg_id)
+            self._clear_input(tg_id)
+            return self._reply(chat_id, "已取消输入和登录授权。", menu_kb(self._active(tg_id)), msg_id)
+        if data == "hide":
+            self._control_call(lambda: self.tg.delete(chat_id, msg_id), priority=True)
+            return
+        if data == "menu":
+            return self._show_menu(tg_id, chat_id, msg_id)
+        if action == "pref" and len(parts) == 2:
+            key = parts[1]
+            if key not in {"notify_success", "notify_fail", "notify_already"}:
+                raise DomainError("通知设置字段无效。")
+            user = self.accounts.user(tg_id) or {}
+            self.accounts.set_preferences(tg_id, **{key: not _flag(user.get(key))})
+            return self._show(chat_id, self._view_settings(tg_id), msg_id)
+        if action in {"login", "sign", "code", "settings", "auto"} and len(parts) == 2:
+            expected = _page(parts[1]) if parts[1] == "0" else _number(parts[1])
+            self._selection(tg_id, expected)
+            self._selection(tg_id, arrival_root)
+            if action == "login":
+                return self._show_login(tg_id, chat_id, msg_id, expected)
+            account = self._root(tg_id, expected)
+            if action == "sign":
+                return self._run_and_report(tg_id, chat_id, expected)
+            if action == "code":
+                return self._show_code(tg_id, chat_id, expected)
+            if action == "auto":
+                self.accounts.set_account(tg_id, auto_sign=not _flag(account.get("auto_sign")))
+            return self._show(chat_id, self._view_settings(tg_id), msg_id)
+        if action in {"accounts", "links", "logs"} and len(parts) == 3:
+            expected = 0 if parts[1] == "0" else _number(parts[1])
+            self._selection(tg_id, expected)
+            self._selection(tg_id, arrival_root)
+            page = _page(parts[2])
+            if action == "accounts":
+                view = self._view_accounts(tg_id, page)
+            elif action == "links":
+                view = self._view_links(tg_id, page)
             else:
-                self.tg.answer(cb_id)
-        except Exception as e:
-            print("[bot] callback 失败:", e)
-            self.tg.answer(cb_id, "操作失败")
+                view = self._view_logs(tg_id, page)
+            return self._show(chat_id, view, msg_id)
+        if action == "switch" and len(parts) == 3:
+            expected = 0 if parts[1] == "0" else _number(parts[1])
+            self._selection(tg_id, expected)
+            self._selection(tg_id, arrival_root)
+            target = _number(parts[2])
+            if target not in {account["id"] for account in self.accounts.owned(tg_id)}:
+                raise DomainError("只能选择本人已登录的账号。")
+            self.accounts.switch(tg_id, target)
+            self._clear_input(tg_id)
+            self.accounts.cancel_login(tg_id)
+            return self._show_menu(tg_id, chat_id, msg_id)
+        if action == "guide" and len(parts) == 3 and parts[1] in {"link", "time"}:
+            expected = _number(parts[2])
+            self._root(tg_id, expected)
+            self._root(tg_id, arrival_root)
+            return self._guide(tg_id, chat_id, parts[1], expected, msg_id)
+        if action == "toggle" and len(parts) == 3:
+            source, target = _number(parts[1]), _number(parts[2])
+            self._root(tg_id, source)
+            self._root(tg_id, arrival_root)
+            links = self.accounts.links(tg_id)["outgoing"]
+            if not any(link["source_id"] == source and link["target_id"] == target for link in links):
+                raise DomainError("该直接关联已不存在，请刷新菜单。")
+            self.accounts.toggle_link(tg_id, source, target)
+            return self._show(chat_id, self._view_links(tg_id), msg_id)
+        if action == "unlink" and len(parts) == 4:
+            expected, source, target = map(_number, parts[1:])
+            self._root(tg_id, expected)
+            self._root(tg_id, arrival_root)
+            links = self.accounts.links(tg_id)
+            visible = links["outgoing"] + links["incoming"]
+            if not any(link["source_id"] == source and link["target_id"] == target for link in visible):
+                raise DomainError("该关联已不存在或不属于当前账号，请刷新菜单。")
+            self.accounts.unlink(tg_id, source, target)
+            return self._show(chat_id, self._view_links(tg_id), msg_id)
+        raise DomainError("按钮已失效或参数无效，请刷新 /menu。")
 
 
-def start(token, store):
-    """在后台线程启动 Bot。"""
+def start(token, store, **options):
+    """Start production polling thread; returned Bot supports stop()/join()."""
     if not (token or "").strip():
         return None
-    b = Bot(token, store)
-    threading.Thread(target=b.run, daemon=True).start()
-    return b
+    bot = Bot(token, store, **options)
+    thread = threading.Thread(target=bot.run, name="emos-bot-poll", daemon=True)
+    bot._poll_thread = thread
+    thread.start()
+    return bot

@@ -3,3 +3,8 @@ data.db
 *.pyc
 __pycache__/
 config.json
+.env
+.env.*
+*.db
+*.db-wal
+*.db-shm
