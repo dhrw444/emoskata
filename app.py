@@ -26,7 +26,7 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from emos import EmosClient, EmosError, clamp_sign_time
@@ -35,6 +35,14 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("DATA_DIR") or os.path.join(BASE_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "data.db")
+
+# 时区兜底表（容器没装 tzdata 时用；只收无夏令时的常用区）
+TZ_FALLBACK = {
+    "Asia/Shanghai": 8, "Asia/Hong_Kong": 8, "Asia/Macau": 8,
+    "Asia/Singapore": 8, "Asia/Taipei": 8, "Asia/Tokyo": 9,
+    "Asia/Seoul": 9, "Asia/Bangkok": 7, "Asia/Kolkata": 5.5,
+    "UTC": 0, "Etc/UTC": 0,
+}
 
 SESSION_TTL = 7 * 86400          # cookie 有效期 7 天
 LOGIN_MAX_FAIL = 5               # 连续失败次数
@@ -457,11 +465,23 @@ def _maybe_notify(cfg, rows, started, ended, trigger):
 # ================================================================== 调度
 
 def now_local(cfg):
+    """当前时间（按配置时区）。
+
+    精简容器里没有 tzdata 时 ZoneInfo 会抛 ZoneInfoNotFoundError，
+    这时退回固定偏移表 —— 宁可偏移正确也不要静默用 UTC 错 8 小时。
+    """
+    tz = cfg.get("timezone") or "Asia/Shanghai"
     try:
         from zoneinfo import ZoneInfo
-        return datetime.now(ZoneInfo(cfg.get("timezone") or "Asia/Shanghai"))
+        return datetime.now(ZoneInfo(tz))
     except Exception:
-        return datetime.now()
+        pass
+
+    # 固定偏移兜底（不处理夏令时；中国/香港/新加坡/台湾本身就没有夏令时）
+    off = TZ_FALLBACK.get(tz)
+    if off is not None:
+        return datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=off)))
+    return datetime.now()
 
 
 def scheduler_loop():
