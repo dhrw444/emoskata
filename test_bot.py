@@ -216,16 +216,17 @@ class FakeAccounts:
                 result["incoming"].append(link)
         return result
 
-    def toggle_link(self, tg_id, source_id, target_id, expected_root=None):
+    def toggle_link(self, tg_id, source_id, target_id, expected_root=None, enabled=None):
         if expected_root is not None:
             selected = self.active(tg_id, required=False)
             if (selected['id'] if selected else 0) != expected_root:
                 raise DomainError('当前账号已切换')
         if self.owners.get(source_id) != tg_id or (source_id, target_id) not in self.grants:
             raise DomainError("仅来源所有者可启停关联")
-        self.grants[source_id, target_id] = not self.grants[source_id, target_id]
+        state = (not self.grants[source_id, target_id]) if enabled is None else bool(enabled)
+        self.grants[source_id, target_id] = state
         self.calls.append(("toggle_link", tg_id, source_id, target_id))
-        return self.grants[source_id, target_id]
+        return state
 
     def unlink(self, tg_id, source_id, target_id, expected_root=None):
         if expected_root is not None:
@@ -646,6 +647,40 @@ class BotTests(unittest.TestCase):
         self.assertEqual(self.store.accounts.active(101)["sign_time"], "08:00")
         self.message("/time 00:30")
         self.assertEqual(self.store.accounts.active(101)["sign_time"], "01:30")
+
+    def test_bot_fake_matches_production_signatures(self):
+        # test_bot 的 FakeAccounts 复刻了 27 个 AccountService 方法。复刻一旦和生产
+        # 签名漂移，test_bot 就会对着假逻辑通过（曾出现：删掉生产 sign_mode 校验，
+        # test_bot/test_accounts 全绿）。这里把签名对齐变成显式约束。
+        import ast, pathlib
+        def signatures(filename, marker):
+            tree = ast.parse(pathlib.Path(filename).read_text(encoding='utf-8'))
+            found = {}
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef) and marker in node.name:
+                    for fn in node.body:
+                        if isinstance(fn, ast.FunctionDef):
+                            args = fn.args
+                            found[fn.name] = (tuple(a.arg for a in args.args),
+                                              args.vararg.arg if args.vararg else None,
+                                              tuple(a.arg for a in args.kwonlyargs),
+                                              args.kwarg.arg if args.kwarg else None)
+            return found
+        prod = signatures('accounts.py', 'Service')
+        fake = signatures('test_bot.py', 'Fake')
+        # __init__ 不参与：替身是无参夹具，生产要 db/write/cfg，这是有意的隔离。
+        shared = sorted(set(prod) & set(fake) - {'__init__'})
+        self.assertGreater(len(shared), 20, '替身与生产服务几乎没有重叠，检查是否改名')
+        for name in shared:
+            with self.subTest(method=name):
+                production, stand_in = prod[name], fake[name]
+                self.assertEqual(stand_in, production,
+                                 'test_bot 的替身 %s 与生产签名不一致，测试会假通过' % name)
+        # 反向也要守：生产新增了 Bot 会调用的公开方法而替身没有，一调用就 AttributeError。
+        # 私有实现细节（_now/_active 等）和 init_schema 不在替身职责内。
+        missing = sorted(name for name in set(prod) - set(fake)
+                         if not name.startswith('_') and name not in ('init_schema', 'watchers'))
+        self.assertEqual(missing, [], '这些生产方法在 test_bot 替身里缺失：%s' % missing)
 
     def test_sign_mode_toggle_persists_and_shows_mark(self):
         a = self.own()
