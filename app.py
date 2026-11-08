@@ -13,8 +13,6 @@ import secrets
 import sqlite3
 import threading
 import time
-import traceback
-import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import contextmanager
@@ -22,66 +20,120 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import queue
 import signal
+import sys
+from pathlib import Path
 
-from emos import EmosClient, EmosError, clamp_sign_time, valid_base
+from envconfig import ConfigStore, EnvConfigError, CFG_TO_ENV, config_path, FIXED_ZONE_OFFSETS
+from runtime_info import container_ip, snapshot as resource_snapshot
+from emos import EmosClient, EmosError, clamp_sign_time, pick_content
 from accounts import AccountService, DomainError
+from webui import WebService, render_page
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.environ.get("DATA_DIR") or os.path.join(BASE_DIR, "data")
-os.makedirs(DATA_DIR, exist_ok=True)
-DB_PATH = os.path.join(DATA_DIR, "data.db")
-
-# 时区兜底表（容器没装 tzdata 时用；只收无夏令时的常用区）
-TZ_FALLBACK = {
-    "Asia/Shanghai": 8, "Asia/Hong_Kong": 8, "Asia/Macau": 8,
-    "Asia/Singapore": 8, "Asia/Taipei": 8, "Asia/Tokyo": 9,
-    "Asia/Seoul": 9, "Asia/Bangkok": 7, "Asia/Kolkata": 5.5,
-    "UTC": 0, "Etc/UTC": 0,
-}
-
-SESSION_TTL = 7 * 86400          # cookie 有效期 7 天
-LOGIN_MAX_FAIL = 5               # 连续失败次数
-LOGIN_LOCK_SEC = 300             # 锁定时长
-RETRY_DELAYS = (300, 900, 2700)  # 失败重试：5 / 15 / 45 分钟
-
-DEFAULTS = {
-    "base_url": "https://emos.best",
-    "sign_time": "08:00",
-    "timezone": "Asia/Shanghai",
-    "content": "",
-    "gap_seconds": 8,
-    "tg_bot_token": "",
-    "tg_chat_id": "",
-    "bark_key": "",
-    "notify_success": "1",
-    "notify_fail": "1",
-    "notify_already": "0",
-    "notify_summary": "1",
-    'oauth_app_name': 'emoskata',
-    'emos_app_user_id': '',
-}
+CONFIG = ConfigStore(config_path(__file__), create=True)
+_RUNTIME_CONFIG = CONFIG.app_config()
+_data = Path(_RUNTIME_CONFIG['data_dir']).expanduser()
+DATA_DIR = str(_data if _data.is_absolute() else Path(BASE_DIR) / _data)
+os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
+DB_PATH = os.path.join(DATA_DIR, 'data.db')
+_EXISTING_DB = os.path.isfile(DB_PATH)
+TZ_FALLBACK = FIXED_ZONE_OFFSETS
+LOGIN_MAX_FAIL = 5
+LOGIN_LOCK_SEC = 300
 
 _write_lock = threading.RLock()
 _run_lock = threading.Lock()
 _shutdown = threading.Event()
+_draining = threading.Event()
+_restart_requested = threading.Event()
+_restart_status = 'running'
+_restart_error = ''
+_restart_lock = threading.Lock()
+_CONTAINER_IP = container_ip()
+_HTTP_SERVER = None
+_active_bot = None
+_active_bot_lock = threading.Lock()
 _notifications = queue.Queue(maxsize=256)
 _notification_drops = 0
 
 
-class _Connection(sqlite3.Connection):
+def request_restart():
+    global _restart_status, _restart_error, _restart_image
+    with _restart_lock:
+        if _restart_requested.is_set() or _shutdown.is_set():
+            return False
+        _restart_image = _prepare_core()
+        _restart_error = ''
+        _restart_status = 'draining'
+        _draining.set()
+        _restart_requested.set()
+        return True
+
+
+_db_pool_lock = threading.Lock()
+_db_pool = []
+_db_borrowed = 0
+_DB_IDLE_LIMIT = 3
+LOG_KEEP = 200
+
+
+class _Connection:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def __getattr__(self, name):
+        if self.connection is None:
+            raise sqlite3.ProgrammingError('数据库连接租约已关闭')
+        return getattr(self.connection, name)
+
+    def __enter__(self):
+        return self
+
     def __exit__(self, *args):
         try:
-            return super().__exit__(*args)
+            return self.connection.__exit__(*args)
         finally:
             self.close()
 
+    def close(self):
+        global _db_borrowed
+        connection, self.connection = self.connection, None
+        if connection is None:
+            return
+        try:
+            if connection.in_transaction:
+                connection.rollback()
+        except sqlite3.Error:
+            connection.close()
+            connection = None
+        with _db_pool_lock:
+            _db_borrowed -= 1
+            if connection is not None and len(_db_pool) < _DB_IDLE_LIMIT:
+                _db_pool.append(connection)
+                return
+        if connection is not None:
+            connection.close()
+
 
 def db():
-    conn = sqlite3.connect(DB_PATH, timeout=20, factory=_Connection)
-    conn.row_factory = sqlite3.Row
-    conn.execute('PRAGMA foreign_keys=ON')
-    conn.execute('PRAGMA busy_timeout=20000')
-    return conn
+    global _db_borrowed
+    with _db_pool_lock:
+        connection = _db_pool.pop() if _db_pool else None
+    if connection is None:
+        connection = sqlite3.connect(DB_PATH, timeout=20, check_same_thread=False)
+        connection.row_factory = sqlite3.Row
+        connection.execute('PRAGMA foreign_keys=ON')
+        connection.execute('PRAGMA cache_size=-256')
+    with _db_pool_lock:
+        _db_borrowed += 1
+    return _Connection(connection)
+
+
+def close_idle_db():
+    with _db_pool_lock:
+        connections, _db_pool[:] = list(_db_pool), []
+    for connection in connections:
+        connection.close()
 
 
 @contextmanager
@@ -103,6 +155,7 @@ def init_db():
         ):
             conn.execute(statement)
         AccountService.init_schema(conn)
+        WebService.init_schema(conn)
         columns = {row['name'] for row in conn.execute('PRAGMA table_info(accounts)')}
         if 'retry_day' not in columns:
             conn.execute("ALTER TABLE accounts ADD COLUMN retry_day TEXT DEFAULT ''")
@@ -129,22 +182,28 @@ def set_setting(key, value):
 
 
 def cfg_all():
-    cfg = dict(DEFAULTS)
-    with db() as conn:
-        for r in conn.execute("SELECT key,value FROM settings"):
-            cfg[r['key']] = r['value']
-    for env, key in (('TG_BOT_TOKEN', 'tg_bot_token'), ('EMOS_BASE_URL', 'base_url'),
-                     ('SIGN_TIME', 'sign_time'), ('SIGN_TIMEZONE', 'timezone'),
-                     ('EMOS_APP_USER_ID', 'emos_app_user_id')):
-        value = os.environ.get(env)
-        if value is not None and value.strip():
-            cfg[key] = value.strip()
-    return cfg
+    return CONFIG.app_config()
+
+
+_web_service = None
+_web_service_lock = threading.Lock()
+
+
+def personal_web():
+    global _web_service
+    with _web_service_lock:
+        if _web_service is None:
+            accounts = AccountService(db, write_db, cfg_all)
+            _web_service = WebService(db, write_db, cfg_all, accounts, run_user)
+        return _web_service
 
 
 class Store:
     def __init__(self):
         self.accounts = AccountService(db, write_db, cfg_all)
+
+    def web_login(self, tg_id):
+        return personal_web().issue_url(tg_id)
 
     def db(self):
         return db()
@@ -161,11 +220,8 @@ class Store:
     def set_setting(self, key, value):
         set_setting(key, value)
 
-    def run_all(self, cfg, trigger='manual', only_id=None):
-        return run_all(cfg, trigger, only_id)
-
-    def run_user(self, tg_id, include_links=True, expected_root=None):
-        return run_user(tg_id, include_links, expected_root)
+    def run_user(self, tg_id, include_links=True, expected_root=None, content=None):
+        return run_user(tg_id, include_links, expected_root, content)
 
 
 # ================================================================== 密码
@@ -189,28 +245,23 @@ def verify_password(pw):
 
 
 def init_password():
-    stored = get_setting('panel_pw_hash')
-    src = os.environ.get('PANEL_PASSWORD') or ''
-    if src and len(src) < 6:
-        raise ValueError('PANEL_PASSWORD 至少 6 个字符。')
-    if src:
-        if not verify_password(src):
-            set_setting('panel_pw_hash', hash_password(src))
-            drop_all_sessions()
-        return None
-    if stored:
-        return None
-    src = secrets.token_urlsafe(18)
-    set_setting('panel_pw_hash', hash_password(src))
-    return src
+    source = CONFIG.password()
+    if not verify_password(source):
+        with write_db() as conn:
+            conn.execute('INSERT INTO settings(key,value) VALUES(?,?) '
+                         'ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                         ('panel_pw_hash', hash_password(source)))
+            conn.execute('DELETE FROM sessions')
+    return source if CONFIG.created else None
 
 
 # ================================================================== session
 
 def purge_sessions():
     now = int(time.time())
-    with _write_lock, db() as conn:
-        conn.execute("DELETE FROM sessions WHERE created<=?", (now - SESSION_TTL,))
+    ttl = cfg_all()['admin_session_hours'] * 3600
+    with write_db() as conn:
+        conn.execute('DELETE FROM sessions WHERE created<=?', (now - ttl,))
 
 
 def create_session(ip, ua):
@@ -225,27 +276,19 @@ def create_session(ip, ua):
 
 
 def session_ok(tok):
-    if not tok or len(tok) > 256:
+    if not isinstance(tok, str) or not tok or len(tok) > 256:
         return False
     now = int(time.time())
+    ttl = cfg_all()['admin_session_hours'] * 3600
     with db() as conn:
-        r = conn.execute("SELECT created FROM sessions WHERE token=?", (tok,)).fetchone()
-    if not r or not (now - SESSION_TTL < r["created"] <= now):
-        return False
-    with _write_lock, db() as conn:
-        conn.execute("UPDATE sessions SET last_seen=? WHERE token=?", (now, tok))
-    return True
+        row = conn.execute('SELECT created FROM sessions WHERE token=?', (tok,)).fetchone()
+    return bool(row and now - ttl < row['created'] <= now)
 
 
 def drop_session(tok):
     if tok:
         with _write_lock, db() as conn:
             conn.execute("DELETE FROM sessions WHERE token=?", (tok,))
-
-
-def drop_all_sessions():
-    with _write_lock, db() as conn:
-        conn.execute("DELETE FROM sessions")
 
 
 # ================================================================== 限流
@@ -278,17 +321,15 @@ def rl_ok(ip):
 # ================================================================== 通知
 
 def public_base(handler=None):
-    """推断对外访问地址：环境变量 > 请求头 > 本地。"""
-    env = (os.environ.get("PUBLIC_BASE") or "").strip()
-    if env:
-        return env.rstrip("/")
+    cfg = cfg_all()
+    if cfg['public_base']:
+        return cfg['public_base'].rstrip('/')
     if handler is not None:
-        proto = (handler.headers.get("X-Forwarded-Proto") or "http").split(",")[0].strip()
-        host = (handler.headers.get("X-Forwarded-Host")
-                or handler.headers.get("Host") or "").split(",")[0].strip()
+        proto = (handler.headers.get('X-Forwarded-Proto') or 'http').split(',')[0].strip()
+        host = (handler.headers.get('X-Forwarded-Host') or handler.headers.get('Host') or '').split(',')[0].strip()
         if host:
-            return "%s://%s" % (proto, host)
-    return "http://127.0.0.1:%d" % int(os.environ.get("PORT") or 8080)
+            return '%s://%s' % (proto, host)
+    return 'http://127.0.0.1:%d' % _RUNTIME_CONFIG['port']
 
 
 def _esc(s):
@@ -305,19 +346,6 @@ def now_local(cfg):
         if offset is None:
             raise ValueError('时区不可用：请安装 tzdata 或选择 Asia/Shanghai / UTC。') from None
         return datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=offset)))
-
-
-def notify(cfg, title, text=''):
-    from bot import TG
-    token = str(cfg.get('tg_bot_token') or '').strip()
-    chat = cfg.get('tg_chat_id')
-    if not token or not chat:
-        return False, '尚未配置 TG 通知目标。'
-    try:
-        TG(token, Store()).send(chat, '<b>%s</b>\n%s' % (_esc(title), text))
-        return True, ''
-    except Exception:
-        return False, 'TG 通知发送失败，请检查 Bot 配置和网络。'
 
 
 def build_report(rows, started, ended):
@@ -385,9 +413,8 @@ def _account_record(account_id):
 
 
 def _next_retry(count):
-    if 1 <= count <= len(RETRY_DELAYS):
-        return int(time.time()) + RETRY_DELAYS[count - 1]
-    return 0
+    delays = cfg_all()['retry_delays']
+    return int(time.time()) + delays[count - 1] if 1 <= count <= len(delays) else 0
 
 
 def _store_result(account, result, cfg, trigger):
@@ -409,10 +436,16 @@ def _store_result(account, result, cfg, trigger):
             requested = int(result.get('retry_after') or 0)
             if next_at and requested:
                 next_at = max(next_at, int(time.time()) + min(requested, 86400))
+        if status in ('config', 'rejected'):
+            retries, next_at = len(cfg['retry_delays']) + 1, 0
         done_day = today if status in ('signed', 'already') else current['last_day']
         enabled = 0 if status == 'invalid' else current['enabled']
         conn.execute('INSERT INTO logs(account_id,name,ts,status,message,carrot) VALUES(?,?,?,?,?,?)',
                      (account['id'], safe_name, stamp, status, result['message'], result.get('point')))
+        # 每个账号只保留最近 LOG_KEEP 条：面板只显示 15 条，长期运行不能让日志表无限增长。
+        conn.execute('DELETE FROM logs WHERE account_id=? AND id <= '
+                     '(SELECT id FROM logs WHERE account_id=? ORDER BY id DESC LIMIT 1 OFFSET ?)',
+                     (account['id'], account['id'], LOG_KEEP))
         conn.execute('UPDATE accounts SET last_status=?,last_msg=?,last_carrot=?,last_run=?,last_day=?,'
                      'retry_count=?,next_run_at=?,retry_day=?,enabled=? WHERE id=?',
                      (status, result['message'], result.get('point'), stamp, done_day,
@@ -447,7 +480,7 @@ def _auto_permission(owner, source_id, target_id, cfg):
                             (source_id, target_id)).fetchone() is not None
 
 
-def _run_ids(cfg, account_ids, trigger='manual', actor=None, root_id=None, scopes=None):
+def _run_ids(cfg, account_ids, trigger='manual', actor=None, root_id=None, scopes=None, content=None):
     if not _run_lock.acquire(blocking=False):
         return None
     rows, unavailable = [], set()
@@ -484,10 +517,12 @@ def _run_ids(cfg, account_ids, trigger='manual', actor=None, root_id=None, scope
                 result = {'status': 'network', 'message': '同一接口暂不可达，已安排退避重试。', 'point': None}
             else:
                 try:
-                    client = EmosClient(account['token'], endpoint)
+                    client = EmosClient(account['token'], endpoint, timeout=cfg['emos_timeout'])
                     client.before_request = allowed
                     client.expected_user_id = account['emos_id']
-                    result = client.sign_once(cfg.get('content') or '')
+                    client.expected_telegram_id = account['owner_tg_id']
+                    override = content if actor is not None and account_id == root_id else None
+                    result = client.sign_once(override or '', mode=account['sign_mode'])
                 except EmosError as error:
                     result = {'status': error.kind, 'message': error.message, 'point': None}
                 except Exception:
@@ -504,22 +539,20 @@ def _run_ids(cfg, account_ids, trigger='manual', actor=None, root_id=None, scope
         _run_lock.release()
 
 
-def run_user(tg_id, include_links=True, expected_root=None):
+def run_user(tg_id, include_links=True, expected_root=None, content=None):
+    if _draining.is_set():
+        raise DomainError('应用核心正在重启，暂不接收新的签到任务。')
+    if content is not None:
+        try:
+            content = pick_content(content)
+        except EmosError as error:
+            raise DomainError(str(error)) from None
     cfg = cfg_all()
     scope = Store().accounts.run_scope(tg_id, include_links)
     if expected_root is not None and scope['root_id'] != expected_root:
         raise DomainError('当前账号已切换，本次签到未执行。')
-    return _run_ids(cfg, scope['account_ids'], 'user', tg_id, scope['root_id'])
+    return _run_ids(cfg, scope['account_ids'], 'user', tg_id, scope['root_id'], content=content)
 
-
-def run_all(cfg, trigger='manual', only_id=None):
-    if trigger in ('auto', 'retry'):
-        return scheduler_tick(cfg)
-    with db() as conn:
-        rows = conn.execute('SELECT id FROM accounts WHERE enabled=1 ' +
-                            ('AND id=? ' if only_id is not None else '') + 'ORDER BY id',
-                            (only_id,) if only_id is not None else ()).fetchall()
-    return _run_ids(cfg, [row['id'] for row in rows], trigger)
 
 
 def _eligible(account, now, cfg, automatic):
@@ -533,7 +566,7 @@ def _eligible(account, now, cfg, automatic):
         if now.strftime('%H:%M') < moment:
             return False
     if account['retry_day'] == today:
-        if account['retry_count'] > len(RETRY_DELAYS):
+        if account['retry_count'] > len(cfg['retry_delays']):
             return False
         if account['next_run_at'] and account['next_run_at'] > int(time.time()):
             return False
@@ -541,6 +574,8 @@ def _eligible(account, now, cfg, automatic):
 
 
 def scheduler_tick(cfg=None):
+    if _draining.is_set():
+        return []
     cfg = cfg or cfg_all()
     now = now_local(cfg)
     scopes = {}
@@ -548,18 +583,22 @@ def scheduler_tick(cfg=None):
         all_accounts = [dict(row) for row in conn.execute('SELECT * FROM accounts WHERE enabled=1 ORDER BY id')]
         grants = [dict(row) for row in conn.execute('SELECT source_id,target_id FROM account_links WHERE enabled=1')]
     by_id = {account['id']: account for account in all_accounts}
+    by_source = {}
+    for grant in grants:
+        by_source.setdefault(grant['source_id'], []).append(grant['target_id'])
+    moment = now.strftime('%H:%M')
     for source in all_accounts:
         if (not source['auto_sign'] or source['last_status'] == 'invalid'
-                or now.strftime('%H:%M') < clamp_sign_time(source['sign_time'] or cfg.get('sign_time'))):
+                or moment < clamp_sign_time(source['sign_time'] or cfg.get('sign_time'))):
             continue
         identity = (source['owner_tg_id'], source['id'])
         if _eligible(source, now, cfg, False):
             scopes.setdefault(source['id'], []).append(identity)
         if source['owner_tg_id'] is None:
             continue
-        for grant in grants:
-            target = by_id.get(grant['target_id'])
-            if (grant['source_id'] == source['id'] and target and target['owner_tg_id'] is not None
+        for target_id in by_source.get(source['id'], ()):
+            target = by_id.get(target_id)
+            if (target and target['owner_tg_id'] is not None
                     and _eligible(target, now, cfg, False)):
                 scopes.setdefault(target['id'], []).append(identity)
     return _run_ids(cfg, list(scopes), 'auto', scopes=scopes) if scopes else []
@@ -569,9 +608,11 @@ def scheduler_loop():
     while not _shutdown.is_set():
         try:
             scheduler_tick()
+            interval = cfg_all()['scheduler_interval']
         except Exception:
-            print('[scheduler] 调度失败，下次检查自动重试。')
-        _shutdown.wait(30)
+            print('[scheduler] 本地调度暂时失败，账号与授权未改变。')
+            interval = _RUNTIME_CONFIG['scheduler_interval']
+        _shutdown.wait(interval)
 
 
 # ================================================================== 页面
@@ -612,47 +653,19 @@ async function go(ev){
 </script></body></html>"""
 
 
-PAGE = r'''<!doctype html><html lang="zh-CN"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>emoskata · Bot 管理</title><style>
-:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#0f1115;color:#e6e9ef;font:14px/1.6 system-ui,sans-serif}
-main{max-width:900px;margin:auto;padding:24px 16px}h1{font-size:22px}h2{font-size:16px;margin-top:0}
-section{background:#181c23;border:1px solid #272d38;border-radius:12px;padding:18px;margin:18px 0}
-label{display:block;color:#9da6b6;margin-top:12px}input{width:100%;background:#0d1015;color:#fff;border:1px solid #303949;border-radius:7px;padding:10px;font:inherit}
-button{border:0;border-radius:7px;background:#4c8dff;color:white;padding:9px 16px;margin:14px 8px 0 0;font:inherit;cursor:pointer}.muted{color:#9da6b6}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:9px;border-bottom:1px solid #303949}#message{white-space:pre-wrap;color:#83c69a}.scroll{overflow:auto}.top{display:flex;justify-content:space-between;align-items:center}
-</style></head><body><main>
-<div class="top"><h1>🥕 emoskata · Bot 管理</h1><button id="logout">退出</button></div>
-<p class="muted">这里配置运行环境。账号通过 Telegram Bot 登录；关联、签到、撤销和个人通知全部在 Bot 菜单内操作。</p>
-<section><h2>Bot 与官方授权</h2>
-<label>Bot Token（留空保留现值，不会回显）<input id="token" type="password" autocomplete="off" placeholder="BotFather 签发的 Token"></label>
-<p id="configured" class="muted"></p>
-<label>应用创建者的 emos 用户 ID<input id="app-id" placeholder="eXXXXXXXXs"></label>
-<p class="muted">用于官方授权链接的应用身份，不是 Telegram 数字 ID。可在 emos 主站「欢迎」里复制。</p>
-<label>emos API 地址<input id="base" placeholder="https://emos.best"></label>
-<label>默认时区<input id="zone" placeholder="Asia/Shanghai"></label>
-<label>默认签到时间<input id="sign-time" placeholder="08:00"></label>
-<label>账号间隔（2–300 秒）<input id="gap" type="number" min="2" max="300"></label>
-<label>签到附言（留空随机，最多 10 字）<input id="content" maxlength="10"></label>
-<button id="save">保存配置</button></section>
-<section><h2>管理密码</h2><label>新密码（至少 6 字符）<input id="password" type="password" autocomplete="new-password"></label>
-<button id="change-password">更改密码并退出所有会话</button>
-<p class="muted">环境变量 PANEL_PASSWORD 非空时启动会应用该密码；更改后同步修改部署环境，避免重启时覆盖。</p></section>
-<div id="message" role="status"></div>
-<section><h2>账号运行状态（只读）</h2><div class="scroll"><table><thead><tr><th>账号</th><th>官方 ID</th><th>状态</th><th>最近签到</th></tr></thead><tbody id="rows"></tbody></table></div>
-<p class="muted">旧版账号原样保留。未完成官方登录归属的账号不会被任何 TG 用户看见或按 ID 接管。</p></section>
-</main><script>
-const $=id=>document.getElementById(id),v=id=>$(id).value.trim();
-async function api(path,body){const r=await fetch(path,{credentials:'same-origin',method:body===undefined?'GET':'POST',headers:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)});if(r.status===401){location.href='/login';throw Error('未登录');}const j=await r.json();if(!r.ok)throw Error(j.error||'请求失败');return j;}
-const report=e=>{$('message').textContent=e.message||String(e);};
-async function load(){try{const c=await api('/api/config');$('app-id').value=c.emos_app_user_id||'';$('base').value=c.base_url||'';$('zone').value=c.timezone||'';$('sign-time').value=c.sign_time||'';$('gap').value=c.gap_seconds||8;$('content').value=c.content||'';$('configured').textContent=c.tg_bot_configured?'Bot Token 已配置。留空保存不会清除。':'Bot Token 尚未配置。';const rows=await api('/api/accounts');$('rows').replaceChildren();for(const row of rows){const tr=document.createElement('tr');for(const text of [row.name,row.emos_id||'旧版未归属',row.last_status||'未运行',row.last_run||'—']){const td=document.createElement('td');td.textContent=text;tr.appendChild(td);}$('rows').appendChild(tr);}}catch(e){report(e);}}
-$('save').onclick=async()=>{try{const b={emos_app_user_id:v('app-id'),base_url:v('base'),timezone:v('zone'),sign_time:v('sign-time'),gap_seconds:Number(v('gap')),content:v('content')};if(v('token'))b.tg_bot_token=v('token');await api('/api/config',b);$('token').value='';$('message').textContent='已保存。环境变量非空时优先于网页配置。';await load();}catch(e){report(e);}};
-$('change-password').onclick=async()=>{try{if(v('password').length<6)throw Error('密码至少 6 个字符。');await api('/api/config',{new_password:v('password')});location.href='/login';}catch(e){report(e);}};
-$('logout').onclick=async()=>{try{await api('/api/logout',{});location.href='/login';}catch(e){report(e);}};
-load();setInterval(load,30000);
-</script></body></html>'''
+PAGE = '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>emoskata · 核心管理</title><style>\n:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#101318;color:#eef2f7;font:14px/1.6 system-ui,sans-serif}main{max-width:960px;margin:auto;padding:22px 16px 60px}h1{font-size:24px}h2{font-size:17px;margin-top:0}section{background:#191f28;border:1px solid #303a49;border-radius:12px;padding:20px;margin:16px 0}label{display:block;margin-top:12px}input,select{width:100%;padding:9px;background:#111722;color:inherit;border:1px solid #303a49;border-radius:8px;font:inherit}button{padding:9px 14px;margin:12px 8px 0 0;border:0;border-radius:8px;background:#76a7ff;color:#111722;font:600 14px system-ui;cursor:pointer}button.secondary{background:#2b3646;color:inherit}button.danger{background:#51323a;color:#ffc1c7}.muted,small{color:#9caabd}small{display:block}.check{display:flex;gap:8px;align-items:center}.check input{width:auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:12px}.grid label{margin:0;padding:10px;border-bottom:1px solid #303a49}#message{white-space:pre-wrap;color:#a7d8bc}#runtime{white-space:pre-wrap}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:8px;border-bottom:1px solid #303a49}.scroll{overflow:auto}.top{display:flex;align-items:center;justify-content:space-between}\n</style></head><body><main><div class="top"><h1>🥕 emoskata · 核心管理</h1><button id="logout" class="secondary">退出</button></div><p class="muted">系统参数只读写同一份 .env。个人账号、签到设置、通知和关联保存在 SQLite；管理员密码不能用于个人登录。</p>\n<section><h2>Bot 服务</h2><label>Telegram Bot Token<input id="token" type="password" autocomplete="off" placeholder="留空保留，不回显"></label><label class="check"><input id="clear-token" type="checkbox">明确清除 Bot Token</label><p id="configured" class="muted"></p><p class="muted">本人 emos 用户 ID 由各用户在自己的 Bot 登录流程填写，管理员不代填、不共享。官方授权后按账号 ID 与本人 TG 绑定核验。</p><label>个人网页公开地址<input id="web-base" placeholder="https://sign.example.com"></label><small>公网 HTTPS；仅填写域名和可选端口，不含路径。</small></section>\n<section><h2>全部系统参数</h2><p class="muted">带“重启生效”的参数保存后点击下面的核心重启。改变 DATA_DIR 会切换数据库位置，不会搬迁数据；仅更新程序时保持原目录。</p><div id="fields" class="grid"></div><button id="save">保存到 .env</button><button id="reload" class="secondary">重新读取配置</button></section><div id="message" role="status" aria-live="polite"></div>\n<section><h2>应用核心</h2><div id="runtime">正在读取…</div><button id="refresh-runtime" class="secondary">刷新运行信息</button><button id="restart" class="danger">重启应用核心</button><p class="muted">不重启宿主机，不需要 root。先删除旧 emoskata.py，再把新文件上传到同一路径，确认上传完成后点击重启。文件缺失或语法错误会拒绝重启并保留旧核心。</p></section>\n<section><h2>账号运行状态 · 只读</h2><div class="scroll"><table><thead><tr><th>账号</th><th>官方 ID</th><th>状态</th><th>最近签到</th></tr></thead><tbody id="rows"></tbody></table></div><p class="muted">账号授权、代签和个人配置请从本人 TG Bot 进入。旧版账号和记录不会因更新被清空。</p></section></main><script>\nconst $=id=>document.getElementById(id);let revision=\'\',controls=new Map();\nasync function api(path,body){const r=await fetch(\'/api/\'+path,{credentials:\'same-origin\',method:body===undefined?\'GET\':\'POST\',headers:{\'Content-Type\':\'application/json\'},body:body===undefined?undefined:JSON.stringify(body)});const j=await r.json();if(r.status===401){location.replace(\'/login\');throw Error(\'管理员会话已失效\');}if(!r.ok)throw Error(j.error||\'操作失败\');return j;}\nfunction say(text){$(\'message\').textContent=text||\'\';}\nasync function runtime(){const s=await api(\'runtime\');$(\'runtime\').textContent=\'核心 PID：\'+s.pid+\' · 线程：\'+s.threads+\'\\n当前内存：\'+(s.rss_bytes==null?\'不可读取\':(s.rss_bytes/1048576).toFixed(1)+\' MiB\')+\' · 峰值：\'+(s.max_rss_bytes==null?\'不可读取\':(s.max_rss_bytes/1048576).toFixed(1)+\' MiB\')+\'\\n监听：\'+s.bind_host+\':\'+s.port+\' · 容器 IP：\'+s.container_ip+\'\\n状态：\'+s.restart_status+\' · 网页待办：\'+s.pending_web_jobs+\' · 通知待办：\'+s.notification_queue+(s.restart_error?\'\\n\'+s.restart_error:\'\');}\nasync function load(){const c=await api(\'config\');revision=c.revision;controls=new Map([[\'TG_BOT_TOKEN\',$(\'token\')],[\'WEB_BASE_URL\',$(\'web-base\')]]);$(\'token\').value=\'\';$(\'clear-token\').checked=false;$(\'web-base\').value=c.web_base_url||\'\';$(\'configured\').textContent=c.tg_bot_configured?\'Token 已配置。留空保存保持不变。\':\'尚未配置 Token。\';$(\'fields\').replaceChildren();for(const f of c.fields){if(controls.has(f.key))continue;const label=document.createElement(\'label\');label.append(document.createTextNode(f.label+(f.restart?\' · 重启生效\':\'\')));const input=document.createElement(f.kind===\'bool\'?\'select\':\'input\');if(f.kind===\'bool\'){for(const [value,text] of [[\'1\',\'开启\'],[\'0\',\'关闭\']]){const option=document.createElement(\'option\');option.value=value;option.textContent=text;input.append(option);}}else{input.type=f.secret?\'password\':f.kind===\'int\'?\'number\':\'text\';if(f.kind===\'int\'){input.min=f.minimum;input.max=f.maximum;}if(f.secret){input.autocomplete=\'new-password\';input.placeholder=f.configured?\'已配置，留空保留\':\'留空保留\';}}input.value=f.value;input.dataset.key=f.key;label.append(input);const detail=document.createElement(\'small\');detail.textContent=f.description;label.append(detail);$(\'fields\').append(label);controls.set(f.key,input);}const rows=await api(\'accounts\');$(\'rows\').replaceChildren();for(const row of rows){const tr=document.createElement(\'tr\');for(const text of [row.name,row.emos_id||\'旧版未归属\',row.last_status||\'未运行\',row.last_run||\'—\']){const td=document.createElement(\'td\');td.textContent=text;tr.append(td);}$(\'rows\').append(tr);}await runtime();}\nasync function operation(fn){document.querySelectorAll(\'button\').forEach(b=>b.disabled=true);try{await fn();}catch(e){say(e.message||\'操作失败\');}finally{document.querySelectorAll(\'button\').forEach(b=>b.disabled=false);}}\n$(\'save\').onclick=()=>operation(async()=>{const changes={};for(const [key,control] of controls)changes[key]=control.value;const clear_secrets=$(\'clear-token\').checked?[\'TG_BOT_TOKEN\']:[];const result=await api(\'config\',{changes,revision,clear_secrets});say(\'已保存到唯一配置文件 .env。\'+(result.restart_required.length?\'\\n重启生效：\'+result.restart_required.join(\', \'):\'\'));if(result.changed.includes(\'PANEL_PASSWORD\'))location.replace(\'/login\');else await load();});\n$(\'reload\').onclick=()=>operation(load);$(\'refresh-runtime\').onclick=()=>operation(runtime);\n$(\'restart\').onclick=()=>operation(async()=>{if(!confirm(\'确认新 py 已上传完成？这只重启应用核心，账号和配置不删除。\'))return;const r=await api(\'restart\',{confirm:true});say(r.message+\'\\n网络任务收尾后重启，可稍后刷新运行信息。\');});\n$(\'logout\').onclick=()=>operation(async()=>{await api(\'logout\',{});location.replace(\'/login\');});load().catch(e=>say(e.message));\n</script></body></html>\n'
 
 
 # ================================================================== HTTP
+
+def _cookie_value(handler, name):
+    raw = handler.headers.get('Cookie') or ''
+    for part in raw.split(';'):
+        key, _, value = part.strip().partition('=')
+        if key == name:
+            return value
+    return ''
+
 
 def _cookie_sid(handler):
     raw = handler.headers.get("Cookie") or ""
@@ -664,49 +677,111 @@ def _cookie_sid(handler):
 
 
 def _update_config(body):
-    cfg = cfg_all()
-    updates = {}
-    for key in ('base_url', 'timezone', 'content', 'emos_app_user_id', 'tg_chat_id'):
-        if key in body:
-            updates[key] = str(body[key] or '').strip()
-    if 'base_url' in updates:
-        updates['base_url'] = valid_base(updates['base_url'])
-    if 'timezone' in updates:
-        now_local(dict(cfg, timezone=updates['timezone']))
-    if len(updates.get('content', '')) > 10:
-        raise ValueError('签到附言最多 10 个字。')
-    app_id = updates.get('emos_app_user_id')
-    if app_id and (len(app_id) > 48 or not all(c.isascii() and (c.isalnum() or c == '_') for c in app_id)):
-        raise ValueError('应用账号 ID 必须使用 emos 官方用户 ID。')
-    if 'sign_time' in body:
-        updates['sign_time'] = clamp_sign_time(body['sign_time'])
-    if 'gap_seconds' in body:
-        gap = int(body['gap_seconds'])
-        if not 2 <= gap <= 300:
-            raise ValueError('账号间隔必须为 2–300 秒。')
-        updates['gap_seconds'] = str(gap)
-    token = str(body.get('tg_bot_token') or '').strip()
-    if token:
-        if len(token) > 256 or ':' not in token or any(c.isspace() for c in token):
-            raise ValueError('Bot Token 格式错误。')
-        updates['tg_bot_token'] = token
+    allowed = set(CFG_TO_ENV) | {'changes', 'revision', 'clear_secrets', 'new_password', 'clear_tg_token'}
+    if not isinstance(body, dict) or set(body) - allowed:
+        raise EnvConfigError('管理员请求包含未知配置项。')
+    changes = dict(body.get('changes') or {})
+    if not isinstance(body.get('changes', {}), dict):
+        raise EnvConfigError('配置更改必须是对象。')
+    for name, key in CFG_TO_ENV.items():
+        if name in body:
+            changes[key] = body[name]
+    if body.get('new_password'):
+        changes['PANEL_PASSWORD'] = body['new_password']
+    clear = list(body.get('clear_secrets') or [])
     if body.get('clear_tg_token') is True:
-        updates['tg_bot_token'] = ''
-    password = str(body.get('new_password') or '')
-    if password and len(password) < 6:
-        raise ValueError('管理密码至少 6 个字符。')
-    with write_db() as conn:
-        for key, value in updates.items():
-            conn.execute('INSERT INTO settings(key,value) VALUES(?,?) '
-                         'ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, value))
-        if password:
-            conn.execute('INSERT INTO settings(key,value) VALUES(?,?) '
-                         'ON CONFLICT(key) DO UPDATE SET value=excluded.value',
-                         ('panel_pw_hash', hash_password(password)))
-            conn.execute('DELETE FROM sessions')
+        clear.append('TG_BOT_TOKEN')
+    outcome = CONFIG.update(changes, revision=body.get('revision'), clear_secrets=clear)
+    if 'PANEL_PASSWORD' in outcome['changed']:
+        init_password()
+    return outcome
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _web_page(self, kind):
+        nonce = secrets.token_urlsafe(18)
+        self._web_nonce = nonce
+        return self._send(200, render_page(kind, nonce), 'text/html; charset=utf-8')
+
+    def _web_cookie(self, sid='', clear=False):
+        base = cfg_all().get('web_base_url') or public_base(self)
+        secure = '; Secure' if str(base).startswith('https://') else ''
+        age = 0 if clear else cfg_all()['web_session_hours'] * 3600
+        return 'wsid=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=%d%s' % (sid, age, secure)
+
+    def _web_identity(self, mutating=False):
+        sid = _cookie_value(self, 'wsid')
+        session = personal_web().authenticate(sid)
+        if session is None:
+            self._send(401, {'ok': False, 'error': '请从本人 Bot 重新打开网页配置。'})
+            return None
+        if mutating:
+            try:
+                personal_web().authorize(sid, self.headers.get('X-CSRF-Token'), mutating=True)
+            except DomainError:
+                self._send(403, {'ok': False, 'error': '网页验证失败，请刷新页面。'})
+                return None
+        return session
+
+    def _web_get(self, path):
+        if path in ('/web/login', '/web/auth'):
+            return self._web_page('auth' if path.endswith('/auth') else 'login')
+        if path in ('/web', '/web/'):
+            if personal_web().authenticate(_cookie_value(self, 'wsid')) is None:
+                return self._send(302, '', 'text/plain', location='/web/login')
+            return self._web_page('dashboard')
+        session = self._web_identity()
+        if session is None:
+            return
+        actor = session['tg_id']
+        try:
+            if path == '/api/web/me':
+                result = personal_web().state(actor)
+                result.update(ok=True, csrf_token=session['csrf_token'], default_sign_time=cfg_all().get('sign_time'))
+                return self._send(200, result)
+            if path == '/api/web/logs':
+                return self._send(200, {'ok': True, 'rows': personal_web().logs(actor)})
+            if path == '/api/web/job':
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                job_id = (query.get('job_id') or [''])[0]
+                return self._send(200, personal_web().job(actor, job_id))
+            return self._send(404, {'ok': False, 'error': '网页接口不存在。'})
+        except DomainError as error:
+            return self._send(400, {'ok': False, 'error': str(error)})
+
+    def _web_post(self, path, body):
+        if path == '/api/web/login':
+            ip = 'web:' + self._ip()
+            if rl_blocked(ip):
+                return self._send(429, {'ok': False, 'error': '尝试过多，请稍后再试。'})
+            if set(body) != {'code'}:
+                rl_fail(ip)
+                return self._send(400, {'ok': False, 'error': '仅接受本人一次性网页入口。'})
+            try:
+                login = personal_web().exchange(body.get('code'))
+            except DomainError as error:
+                rl_fail(ip)
+                return self._send(400, {'ok': False, 'error': str(error)})
+            rl_ok(ip)
+            return self._send(200, {'ok': True}, cookie=self._web_cookie(login['sid']))
+        session = self._web_identity(mutating=True)
+        if session is None:
+            return
+        actor = session['tg_id']
+        try:
+            action = path.removeprefix('/api/web/')
+            if action == 'logout':
+                if body:
+                    raise DomainError('退出请求不接受额外字段。')
+                personal_web().logout(_cookie_value(self, 'wsid'))
+                return self._send(200, {'ok': True}, cookie=self._web_cookie(clear=True))
+            if action == 'sign':
+                return self._send(202, personal_web().start_sign(actor, body))
+            result = personal_web().action(actor, action, body)
+            return self._send(200, result)
+        except DomainError as error:
+            return self._send(400, {'ok': False, 'error': str(error)})
+
     server_version = "emos-panel/1.0"
 
     def log_message(self, fmt, *args):
@@ -722,7 +797,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(raw)))
         self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Referrer-Policy', 'no-referrer')
+        self.send_header('X-Frame-Options', 'DENY')
+        nonce = getattr(self, '_web_nonce', None)
+        if nonce:
+            self.send_header('Content-Security-Policy', "default-src 'none'; script-src 'nonce-%s'; "
+                             "style-src 'nonce-%s'; connect-src 'self'; form-action 'self'; "
+                             "base-uri 'none'; frame-ancestors 'none'" % (nonce, nonce))
         if location:
             self.send_header("Location", location)
         if cookie:
@@ -732,6 +814,8 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(raw)
         except BrokenPipeError:
             pass
+        finally:
+            self._web_nonce = None
 
     def _body(self):
         try:
@@ -757,7 +841,9 @@ class Handler(BaseHTTPRequestHandler):
         origin = self.headers.get('Origin')
         if not origin:
             return True
-        wanted = urllib.parse.urlsplit(public_base(self))
+        endpoint = urllib.parse.urlsplit(self.path).path
+        configured = cfg_all().get('web_base_url') if endpoint.startswith('/api/web/') else None
+        wanted = urllib.parse.urlsplit(configured or public_base(self))
         actual = urllib.parse.urlsplit(origin)
         return (actual.scheme, actual.netloc) == (wanted.scheme, wanted.netloc)
 
@@ -774,8 +860,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
+        if path in ('/web', '/web/', '/web/login', '/web/auth') or path.startswith('/api/web/'):
+            try:
+                return self._web_get(path)
+            except Exception:
+                return self._send(500, {'ok': False, 'error': '网页服务暂不可用，请稍后重试。'})
 
-        if path in ("/", "/index.html"):
+        if path in ("/", "/index.html", "/admin"):
             if not self._authed():
                 return self._send(302, "", "text/plain", location="/login")
             return self._send(200, PAGE, "text/html; charset=utf-8")
@@ -807,10 +898,19 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == '/api/config':
             cfg = cfg_all()
-            safe = {key: cfg.get(key) for key in DEFAULTS if key not in ('tg_bot_token', 'bark_key')}
-            safe['tg_bot_configured'] = bool(cfg.get('tg_bot_token'))
-            safe['bark_configured'] = bool(cfg.get('bark_key'))
+            safe = {key: value for key, value in cfg.items() if key not in ('tg_bot_token', 'panel_password')}
+            safe['tg_bot_configured'] = bool(cfg['tg_bot_token'])
+            safe.update(CONFIG.public_fields())
             return self._send(200, safe)
+
+        if path == '/api/runtime':
+            info = resource_snapshot()
+            info.update(restart_status=_restart_status, restart_error=_restart_error,
+                        accepting_tasks=not _draining.is_set(), container_ip=_CONTAINER_IP,
+                        bind_host=_RUNTIME_CONFIG['http_host'], port=_RUNTIME_CONFIG['port'],
+                        pending_web_jobs=len(_web_service.pending) if _web_service else 0,
+                        notification_queue=_notifications.qsize())
+            return self._send(200, info)
 
         return self._send(404, {"ok": False, "error": "not found"})
 
@@ -818,12 +918,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
+        if _draining.is_set():
+            return self._send(503, {'ok': False, 'error': '应用核心正在重启收尾，请稍后重试。'})
         if not self._same_origin():
             return self._send(403, {'ok': False, 'error': '禁止跨站操作。'})
         try:
             body = self._body()
         except ValueError as error:
             return self._send(400, {'ok': False, 'error': str(error)})
+        if path.startswith('/api/web/'):
+            try:
+                return self._web_post(path, body)
+            except Exception:
+                return self._send(500, {'ok': False, 'error': '网页服务暂不可用，请稍后重试。'})
 
         if path == "/api/login":
             ip = self._ip()
@@ -839,7 +946,7 @@ class Handler(BaseHTTPRequestHandler):
             rl_ok(ip)
             tok = create_session(ip, self.headers.get("User-Agent"))
             secure = '; Secure' if public_base(self).startswith('https://') else ''
-            cookie = 'sid=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=%d%s' % (tok, SESSION_TTL, secure)
+            cookie = 'sid=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=%d%s' % (tok, cfg_all()['admin_session_hours'] * 3600, secure)
             return self._send(200, {"ok": True}, cookie=cookie)
 
         if path == "/api/logout":
@@ -857,15 +964,28 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == '/api/config':
             try:
-                _update_config(body)
-            except (ValueError, EmosError) as error:
+                outcome = _update_config(body)
+            except (ValueError, EmosError, DomainError) as error:
                 return self._send(400, {'ok': False, 'error': str(error)})
-            return self._send(200, {'ok': True})
+            return self._send(200, dict(outcome, ok=True))
 
-        if path == "/api/notify-test":
-            ok, err = notify(cfg_all(), "🥕 emos 签到面板",
-                             "这是一条测试消息。\n配置正常。")
-            return self._send(200, {"ok": ok, "error": None if ok else err})
+        if path == '/api/restart':
+            if body != {'confirm': True}:
+                return self._send(400, {'ok': False, 'error': '需明确确认重启应用核心。'})
+            try:
+                CONFIG.snapshot(force=True)
+            except EnvConfigError as error:
+                return self._send(400, {'ok': False, 'error': str(error)})
+            try:
+                accepted = request_restart()
+            except EnvConfigError as error:
+                return self._send(400, {'ok': False, 'error': str(error)})
+            if not accepted:
+                return self._send(409, {'ok': False, 'error': '应用核心已在重启收尾。'})
+            return self._send(202, {'ok': True, 'message': '正在收尾任务并重启应用核心，不重启宿主机。'})
+
+        if path == '/api/notify-test':
+            return self._send(410, {'ok': False, 'error': '通知属于各用户本人，请在 Bot 或本人网页配置。管理员不设全局通知目标。'})
 
         return self._send(404, {"ok": False, "error": "not found"})
 
@@ -887,77 +1007,314 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def bot_supervisor():
+    global _active_bot
     from bot import Bot
-    token, current, worker = None, None, None
+    identity, current = None, None
     try:
         while not _shutdown.is_set():
             try:
-                wanted = str(cfg_all().get('tg_bot_token') or '').strip()
-                dead = worker is not None and not worker.is_alive()
-                if wanted != token or (wanted and dead):
+                cfg = cfg_all()
+                if _draining.is_set():
                     if current:
-                        current.stop(wait=True, timeout=50)
-                    if worker and worker.is_alive():
-                        _shutdown.wait(5)
-                        continue
-                    token, current, worker = wanted, None, None
-                    if wanted:
-                        current = Bot(wanted, Store())
-                        worker = threading.Thread(target=current.run, name='emos-bot-poll', daemon=True)
-                        worker.start()
-                        print('[bot] 已启动，官方账号登录与关联在 TG 菜单内配置。')
+                        current.begin_drain()
+                    _shutdown.wait(1)
+                    continue
+                wanted = (cfg['tg_bot_token'], cfg['tg_api_base_url'], cfg['tg_poll_timeout'],
+                          cfg['bot_workers'], cfg['bot_max_jobs'])
+                dead = current is not None and current._poll_thread is not None and not current._poll_thread.is_alive()
+                if wanted != identity or (wanted[0] and dead):
+                    if current:
+                        current.begin_drain()
+                        if not current.join_jobs(cfg['shutdown_timeout']):
+                            _shutdown.wait(5)
+                            continue
+                        current.stop(wait=True, timeout=cfg['tg_poll_timeout'] + 20)
+                        if current._poll_thread and current._poll_thread.is_alive():
+                            _shutdown.wait(5)
+                            continue
+                    identity, current = wanted, None
+                    if wanted[0]:
+                        current = Bot(wanted[0], Store(), workers=cfg['bot_workers'], max_jobs=cfg['bot_max_jobs'])
+                        thread = threading.Thread(target=current.run, name='emos-bot-poll', daemon=True)
+                        current._poll_thread = thread
+                        with _active_bot_lock:
+                            _active_bot = current
+                        thread.start()
+                        print('[bot] 官方登录、签到关联与本人网页入口已启用。')
                     else:
-                        print('[bot] 尚未配置 TG_BOT_TOKEN，可通过管理页设置。')
+                        print('[bot] 尚未配置 Token；管理员可在网页修改 .env。')
             except Exception:
-                print('[bot] 启动检查失败，下次自动重试。')
-            _shutdown.wait(15)
+                print('[bot] 当前配置或网络暂不可用，稍后重试。')
+            _shutdown.wait(5)
     finally:
         if current:
-            current.stop(wait=True, timeout=50)
+            current.begin_drain()
+            current.join_jobs(_RUNTIME_CONFIG['shutdown_timeout'])
+            current.stop(wait=True, timeout=_RUNTIME_CONFIG['shutdown_timeout'])
+        with _active_bot_lock:
+            _active_bot = None
+
+
+class _BoundedHTTPServer(ThreadingHTTPServer):
+    daemon_threads = False
+    block_on_close = True
+
+    def __init__(self, address, handler, maximum=8, request_timeout=15):
+        self.slots = threading.BoundedSemaphore(maximum)
+        self.request_timeout = request_timeout
+        self._requests_lock = threading.Lock()
+        self._active_requests = 0
+        self.request_idle = threading.Event()
+        self.request_idle.set()
+        super().__init__(address, handler)
+
+    @property
+    def active_requests(self):
+        with self._requests_lock:
+            return self._active_requests
+
+    def get_request(self):
+        request, address = super().get_request()
+        request.settimeout(self.request_timeout)
+        return request, address
+
+    def process_request(self, request, address):
+        if not self.slots.acquire(blocking=False):
+            try:
+                request.sendall(b'HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n')
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        with self._requests_lock:
+            self._active_requests += 1
+            self.request_idle.clear()
+        try:
+            super().process_request(request, address)
+        except BaseException:
+            with self._requests_lock:
+                self._active_requests -= 1
+                if not self._active_requests:
+                    self.request_idle.set()
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, address):
+        try:
+            super().process_request_thread(request, address)
+        finally:
+            with self._requests_lock:
+                self._active_requests -= 1
+                if not self._active_requests:
+                    self.request_idle.set()
+            self.slots.release()
+
+
+def _prepare_core():
+    import ast
+    import tempfile
+    entry = os.path.abspath(__file__)
+    try:
+        with open(entry, 'rb') as handle:
+            source = handle.read(2097153)
+        if not source or len(source) > 2097152:
+            raise EnvConfigError('更新文件为空或过大，请先上传完整 py。当前核心保留运行。')
+        tree = ast.parse(source, filename=entry)
+        embedded = next((node.value for node in tree.body if isinstance(node, ast.Assign)
+                         and any(isinstance(target, ast.Name) and target.id == '_SOURCES'
+                                 for target in node.targets)), None)
+        if embedded is not None:
+            modules = ast.literal_eval(embedded)
+            required = {'envconfig', 'runtime_info', 'emos', 'accounts', 'webui', 'bot', 'app'}
+            if not isinstance(modules, dict) or not required.issubset(modules):
+                raise EnvConfigError('单文件内嵌模块不完整，请重新生成 py。当前核心保留运行。')
+            for name, text in modules.items():
+                if not isinstance(name, str) or not isinstance(text, str):
+                    raise EnvConfigError('更新文件格式无效。当前核心保留运行。')
+                compile(text, entry + ':' + name, 'exec')
+        else:
+            for name in ('envconfig', 'runtime_info', 'emos', 'accounts', 'webui', 'bot'):
+                path = os.path.join(BASE_DIR, name + '.py')
+                with open(path, 'rb') as handle:
+                    compile(handle.read(2097152), path, 'exec')
+        CONFIG.snapshot(force=True)
+        image = tempfile.TemporaryFile()
+        image.write(source)
+        image.flush()
+        image.seek(0)
+        return image
+    except EnvConfigError:
+        raise
+    except (OSError, ValueError, TypeError, SyntaxError, RecursionError):
+        raise EnvConfigError('更新文件缺失、未上传完整或语法无效。当前核心保留运行，请重新上传 py。') from None
+
+
+def _exec_core(image=None):
+    # Keep validated bytes through exec: deletion/re-upload cannot race the interpreter.
+    image = image or _prepare_core()
+    os.environ['EMOS_ENV_FILE'] = str(CONFIG.path)
+    os.set_inheritable(image.fileno(), True)
+    bootstrap = ("import os,sys; p=sys.argv[1]; fd=int(sys.argv[2]); "
+                 "sys.argv=[p]; sys.path[0]=os.path.dirname(p); "
+                 "f=os.fdopen(fd,'rb'); s=f.read(); f.close(); "
+                 "exec(compile(s,p,'exec'), {'__name__':'__main__','__file__':p,"
+                 "'__package__':None,'__spec__':None})")
+    try:
+        os.execv(sys.executable, [sys.executable, '-u', '-c', bootstrap,
+                                 os.path.abspath(__file__), str(image.fileno())])
+    finally:
+        image.close()
+
+
+def _drain_core(timeout=0):
+    if _web_service is not None:
+        _web_service.begin_drain()
+        with _web_service.lock:
+            if _web_service.pending:
+                return False
+    if _run_lock.locked():
+        return False
+    with _db_pool_lock:
+        if _db_borrowed:
+            return False
+    with _active_bot_lock:
+        current = _active_bot
+    if current is not None:
+        current.begin_drain()
+        if not current.join_jobs(0):
+            return False
+        if current._poll_thread and current._poll_thread.is_alive():
+            return False
+    if _HTTP_SERVER is not None and _HTTP_SERVER.active_requests:
+        return False
+    with _notifications.all_tasks_done:
+        if _notifications.unfinished_tasks:
+            return False
+    return True
+
+
+def _start_core_threads():
+    tasks = (('emos-scheduler', scheduler_loop), ('emos-supervisor', bot_supervisor),
+             ('emos-notifications', notification_loop))
+    existing = {thread.name: thread for thread in _CORE_THREADS}
+    _CORE_THREADS[:] = []
+    for name, task in tasks:
+        thread = existing.get(name)
+        if thread is None or not thread.is_alive():
+            thread = threading.Thread(target=task, daemon=False, name=name)
+            thread.start()
+        _CORE_THREADS.append(thread)
+
+
+def _resume_core():
+    _shutdown.clear()
+    _draining.clear()
+    if _web_service is not None:
+        _web_service.resume()
+    with _active_bot_lock:
+        current = _active_bot
+    if current is not None and not current.stop_event.is_set():
+        current.resume()
+    _start_core_threads()
+
+
+def _stop_core(timeout):
+    deadline = time.monotonic() + max(0, timeout)
+    _shutdown.set()
+    for worker in _CORE_THREADS:
+        worker.join(max(0, deadline - time.monotonic()))
+    if _web_service is not None:
+        _web_service.stop(timeout=max(0, deadline - time.monotonic()))
+    threads = [thread for thread in threading.enumerate()
+               if thread is not threading.current_thread() and thread.name.startswith('emos-')]
+    for thread in threads:
+        thread.join(max(0, deadline - time.monotonic()))
+    ready = not any(thread.is_alive() for thread in threads)
+    with _db_pool_lock:
+        ready = ready and not _db_borrowed
+    if ready:
+        close_idle_db()
+    return ready
+
+
+def _cancel_restart(message, status='failed'):
+    global _restart_status, _restart_error, _restart_image
+    _restart_status, _restart_error = status, message
+    if _restart_image is not None:
+        _restart_image.close()
+        _restart_image = None
+    _restart_requested.clear()
+    _resume_core()
+
+
+_CORE_THREADS = []
+_restart_image = None
 
 
 def main():
-    init_db()
+    global _HTTP_SERVER, _restart_status, _restart_error
     cfg = cfg_all()
-    valid_base(cfg.get('base_url'))
-    now_local(cfg)
-    enabled_http = str(os.environ.get('HTTP_ENABLED', '1')).lower() not in ('0', 'false', 'off')
-    generated = init_password() if enabled_http else None
-    server = None
-    if enabled_http:
-        host = os.environ.get('HTTP_HOST', '0.0.0.0')
-        port = int(os.environ.get('PORT') or 8080)
-        server = ThreadingHTTPServer((host, port), Handler)
-        server.daemon_threads = True
-        server.timeout = 1
-        print('管理入口：http://%s:%d/（账号操作在 Telegram Bot）' % (host, port))
-        if generated:
-            print('首次管理密码（仅显示一次）：%s' % generated)
-    elif not cfg.get('tg_bot_token'):
-        raise ValueError('纯 Bot 模式必须设置 TG_BOT_TOKEN。')
+    init_db()
+    generated = init_password() if cfg['http_enabled'] else None
+    if not cfg['http_enabled'] and not cfg['tg_bot_token']:
+        raise EnvConfigError('纯 Bot 模式需要在 .env 填入 TG_BOT_TOKEN。')
     _shutdown.clear()
-    def stopping(*_):
-        _shutdown.set()
+    _draining.clear()
+    _restart_requested.clear()
+    _restart_status, _restart_error = 'running', ''
+    if cfg['http_enabled']:
+        server = _BoundedHTTPServer((cfg['http_host'], cfg['port']), Handler,
+                                    cfg['http_max_connections'], cfg['http_request_timeout'])
+        server.timeout = 1
+        _HTTP_SERVER = server
+        print('管理入口：http://%s:%d/admin' % (_CONTAINER_IP, cfg['port']))
+        print('监听 %s:%d；容器 IP 仅用于内网显示，外网入口用 WEB_BASE_URL。' % (cfg['http_host'], cfg['port']))
+        if generated:
+            print('首次管理员密码（仅此一次）：%s' % generated)
     for sig in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(sig, stopping)
-    workers = [threading.Thread(target=task, daemon=True, name=name) for task, name in
-               ((scheduler_loop, 'emos-scheduler'), (bot_supervisor, 'emos-bot-supervisor'),
-                (notification_loop, 'emos-notifications'))]
-    for worker in workers:
-        worker.start()
+        signal.signal(sig, lambda *_: _shutdown.set())
+    _start_core_threads()
+    restart_deadline = None
     try:
         while not _shutdown.is_set():
-            if server:
-                server.handle_request()
+            if _restart_requested.is_set():
+                if restart_deadline is None:
+                    restart_deadline = time.monotonic() + cfg_all()['shutdown_timeout']
+                if _HTTP_SERVER is not None:
+                    _HTTP_SERVER.request_idle.wait(0.05)
+                elapsed = time.monotonic() >= restart_deadline
+                if _drain_core():
+                    try:
+                        CONFIG.snapshot(force=True)
+                        if not _stop_core(max(0, restart_deadline - time.monotonic())):
+                            raise EnvConfigError('核心线程未收尾，已取消重启并恢复运行。')
+                        _restart_status = 'restarting'
+                        _exec_core(_restart_image)
+                        raise EnvConfigError('重启没有完成，已恢复运行。')
+                    except (OSError, EnvConfigError):
+                        _cancel_restart('核心重启未完成，旧核心已恢复运行。请检查更新文件与配置。')
+                    restart_deadline = None
+                elif elapsed:
+                    _cancel_restart('当前网络任务未结束，已取消重启，保留运行。', 'timeout')
+                    restart_deadline = None
+            else:
+                _start_core_threads()
+            if _HTTP_SERVER is not None:
+                if _restart_requested.is_set():
+                    _HTTP_SERVER.request_idle.wait(0.05)
+                _HTTP_SERVER.handle_request()
             else:
                 _shutdown.wait(1)
     finally:
         _shutdown.set()
-        if server:
-            server.server_close()
-        for worker in workers:
-            worker.join(timeout=55)
-        print('emoskata 已停止。')
+        if _HTTP_SERVER is not None:
+            _HTTP_SERVER.server_close()
+        for worker in _CORE_THREADS:
+            worker.join(timeout=_RUNTIME_CONFIG['shutdown_timeout'])
+        if _web_service is not None:
+            _web_service.stop()
+        close_idle_db()
+        print('emoskata 应用核心已停止。')
 
 
 if __name__ == "__main__":

@@ -6,13 +6,10 @@ services:
     ports:
       - "127.0.0.1:8080:8080"
     environment:
-      TZ: Asia/Shanghai
-      PORT: "8080"
-      TG_BOT_TOKEN: "${TG_BOT_TOKEN:-}"
-      EMOS_APP_USER_ID: "${EMOS_APP_USER_ID:-}"
-      PANEL_PASSWORD: "${PANEL_PASSWORD:-}"
-      HTTP_ENABLED: "${HTTP_ENABLED:-1}"
-      SIGN_TIMEZONE: "${SIGN_TIMEZONE:-Asia/Shanghai}"
+      EMOS_ENV_FILE: /app/config/.env
     volumes:
-      - ./data:/app/data
-    stop_grace_period: 60s
+      - ./config:/app/config
+      - ./data:/app/runtime/data
+      - ./runtime:/app/runtime
+    command: ["python3", "/app/runtime/emoskata.py"]
+    stop_grace_period: 120s

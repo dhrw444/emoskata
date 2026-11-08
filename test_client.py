@@ -1,13 +1,10 @@
 """Client contract regression tests. Run: python3 -B -m unittest -v test_client.
 Every request uses a localhost fixture or an injected transport; never official APIs.
 """
-import io
-import json
-import urllib.error
 import unittest
 from unittest.mock import patch
 
-from emos import BASES, EmosClient, EmosError, clamp_sign_time, pick_content, valid_base
+from emos import BASES, CONTENTS, EmosClient, EmosError, clamp_sign_time, pick_content, valid_base
 from test_runtime import Fixture, serve
 
 
@@ -20,9 +17,11 @@ class ClientTests(unittest.TestCase):
 
     def test_content_validation(self):
         self.assertEqual(pick_content(' 自定义 '), '自定义')
-        self.assertTrue(pick_content())
+        self.assertEqual(pick_content(), '')
+        self.assertTrue(pick_content(mode='random'))
+        self.assertEqual(pick_content('x' * 11), 'x' * 11)
         with self.assertRaises(EmosError):
-            pick_content('x' * 11)
+            pick_content('x' * 257)
 
     def test_custom_endpoint_never_appends_public_hosts(self):
         self.assertEqual(EmosClient('11_fixture', 'https://custom.example').bases,
@@ -80,7 +79,60 @@ class ClientTests(unittest.TestCase):
         with serve(Forbidden) as (_, base):
             self.assertEqual(EmosClient('11_fixture', base).sign_once()['status'], 'blocked')
 
+    def test_empty_sign_object_is_not_treated_as_signed(self):
+        # 官方原文只说「当天未签到时返回 null」。sign={} 不是已签证据，
+        # 当成已签会白丢一天；应当继续发起签到。
+        with serve() as (server, base):
+            server.modes['eFixture'] = 'empty_sign'
+            result = EmosClient('11_fixture', base).sign_once()
+            self.assertEqual(result['status'], 'signed')
+            self.assertEqual(len([hit for hit in server.hits if hit[0] == 'PUT']), 1)
+
+    def test_sign_object_with_content_skips_put(self):
+        with serve() as (server, base):
+            server.signed.add('eFixture')
+            result = EmosClient('11_fixture', base).sign_once()
+            self.assertEqual(result['status'], 'already')
+            self.assertEqual([hit for hit in server.hits if hit[0] == 'PUT'], [])
+
+    def test_sign_is_never_resent_to_the_failover_host(self):
+        # 签到不是幂等请求：网络中断时请求可能已经到达官方并签到成功，
+        # 换域名重发就是二次签到尝试（官方明确禁止接口轮询）。
+        attempts = []
+        def fake_once(method, path, endpoint, params=None):
+            attempts.append((method, path, endpoint))
+            raise EmosError('网络连接失败，稍后自动重试。', network=True)
+        client = EmosClient('11_fixture', BASES[0])
+        with patch.object(client, '_once', side_effect=fake_once), \
+             patch.object(client, 'profile', return_value={'_user_id': 'eX', '_display': 'x',
+                                                          'sign': None, 'telegram_user_id': None}):
+            self.assertEqual(client.sign_once()['status'], 'network')
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0][2], BASES[0])
+
+    def test_get_profile_still_fails_over(self):
+        attempts = []
+        def fake_once(method, path, endpoint, params=None):
+            attempts.append(endpoint)
+            if endpoint == BASES[0]:
+                raise EmosError('网络连接失败，稍后自动重试。', network=True)
+            return 200, {'user_id': 'eX'}
+        client = EmosClient('11_fixture', BASES[0])
+        with patch.object(client, '_once', side_effect=fake_once):
+            self.assertEqual(client.profile()['_user_id'], 'eX')
+        self.assertEqual(attempts, [BASES[0], BASES[1]])
+
     def test_generic_429_rate_and_429_already_are_distinct(self):
+        # 官方样例是 429 + {"message":"重复签到"}；带句号/空白/近义写法也必须判成已签，
+        # 否则会被当成限流，白白退避一天。空 message 仍是限流。
+        for message, expected in [('重复签到', 'already'), ('重复签到。', 'already'),
+                                  ('重复签到 ', 'already'), ('重复签到\u3000', 'already'),
+                                  ('您今天已经签到过了', 'already'), ('', 'rate'),
+                                  ('Too Many Requests', 'rate')]:
+            with self.subTest(message=message), serve() as (server, base):
+                server.modes['eFixture'] = 'custom'
+                server.custom = (429, {'message': message})
+                self.assertEqual(EmosClient('11_fixture', base).sign_once()['status'], expected)
         with serve() as (server, base):
             server.modes['eFixture'] = 'rate'
             result = EmosClient('11_fixture', base).sign_once()
@@ -88,12 +140,12 @@ class ClientTests(unittest.TestCase):
             server.modes['eFixture'] = 'already429'
             self.assertEqual(EmosClient('11_fixture', base).sign_once()['status'], 'already')
 
-    def test_409_already_is_preserved(self):
+    def test_409_without_explicit_daily_sign_proof_is_not_success(self):
         class Conflict(Fixture):
             def do_PUT(self):
-                self.raw(409, {'message': 'already'})
+                self.raw(409, {'message': 'conflicting request'})
         with serve(Conflict) as (_, base):
-            self.assertEqual(EmosClient('11_fixture', base).sign_once()['status'], 'already')
+            self.assertEqual(EmosClient('11_fixture', base).sign_once()['status'], 'failed')
 
     def test_200_already_message_is_not_counted_as_reward(self):
         class Already(Fixture):
@@ -162,11 +214,36 @@ class ClientTests(unittest.TestCase):
             calls = []
             def guard():
                 calls.append(1)
-                return len(calls) <= 2
+                return len(calls) <= 1
             c.before_request = guard
             self.assertEqual(c.sign_once()['status'], 'revoked')
             self.assertEqual(server.signed, set())
             self.assertTrue(all(method != 'PUT' for method, _, _ in server.hits))
+
+    def test_login_is_sign_true_does_not_skip_daily_sign_in(self):
+        with serve() as (server, base):
+            c = EmosClient('11_fixture', base)
+            logged_in, body = c.check()
+            self.assertTrue(logged_in)
+            self.assertIsNone(c.profile()['sign'])
+            result = c.sign_once()
+            self.assertEqual(result['status'], 'signed')
+            self.assertEqual(server.signed, {'eFixture'})
+            self.assertEqual([path for method, path, _ in server.hits if method == 'PUT'], ['/api/user/sign'])
+
+    def test_official_profile_sign_record_skips_without_extra_requests(self):
+        with serve() as (server, base):
+            server.signed.add('eFixture')
+            result = EmosClient('11_fixture', base).sign_once()
+            self.assertEqual(result['status'], 'already')
+            self.assertEqual(server.hits, [('GET', '/api/user', 'eFixture')])
+
+    def test_missing_profile_daily_sign_field_fails_closed(self):
+        class MissingSign(Fixture):
+            def do_GET(self):
+                self.raw(200, {'user_id': 'eFixture', 'username': 'fixture'})
+        with serve(MissingSign) as (_, base):
+            self.assertEqual(EmosClient('11_fixture', base).sign_once()['status'], 'failed')
 
     def test_bad_profile_account_stops_before_sign_check(self):
         with serve() as (server, base):
@@ -174,6 +251,38 @@ class ClientTests(unittest.TestCase):
             c.expected_user_id = 'eOther'
             self.assertEqual(c.sign_once()['status'], 'invalid')
             self.assertEqual(len(server.hits), 1)
+
+    def test_normal_mode_sends_no_content_parameter(self):
+        with serve() as (server, base):
+            self.assertEqual(EmosClient('11_fixture', base).sign_once()['status'], 'signed')
+            self.assertEqual(server.puts, [('/api/user/sign', b'')])
+
+    def test_random_mode_sends_content_from_whitelist(self):
+        with serve() as (server, base):
+            result = EmosClient('11_fixture', base).sign_once(mode='random')
+            self.assertEqual(result['status'], 'signed')
+            (path, body), = server.puts
+            self.assertTrue(path.startswith('/api/user/sign?content='), path)
+            from urllib.parse import parse_qs, urlsplit
+            value = parse_qs(urlsplit(path).query)['content'][0]
+            self.assertIn(value, CONTENTS)
+            self.assertEqual(body, b'')
+
+    def test_explicit_content_is_sent_verbatim_in_query(self):
+        with serve() as (server, base):
+            EmosClient('11_fixture', base).sign_once(' 今天也在 ')
+            (path, _), = server.puts
+            from urllib.parse import parse_qs, urlsplit
+            self.assertEqual(parse_qs(urlsplit(path).query)['content'][0], '今天也在')
+
+    def test_bad_mode_and_control_characters_fail_before_any_request(self):
+        with serve() as (server, base):
+            for mode in ('random2', ''):
+                with self.subTest(mode=mode):
+                    self.assertEqual(EmosClient('11_fixture', base).sign_once(mode=mode)['status'],
+                                     'config')
+            self.assertEqual(EmosClient('11_fixture', base).sign_once('a\nb')['status'], 'config')
+            self.assertEqual(server.hits, [])
 
 
 if __name__ == '__main__':

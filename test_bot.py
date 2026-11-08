@@ -10,7 +10,6 @@ import copy
 import io
 import json
 import os
-import re
 import socket
 import sqlite3
 import tempfile
@@ -27,7 +26,7 @@ from emos import EmosError
 class FakeAccounts:
     def __init__(self):
         self.users, self.rows, self.owners, self.tokens = {}, {}, {}, {}
-        self.grants, self.codes, self.records = {}, {}, []
+        self.grants, self.codes, self.records, self.pending = {}, {}, [], {}
         self.calls = []
         self.serial = 0
 
@@ -35,7 +34,7 @@ class FakeAccounts:
         if type(tg_id) is not int or tg_id <= 0 or chat_id not in (None, tg_id):
             raise DomainError("仅支持本人私聊")
         self.users.setdefault(tg_id, {"tg_id": tg_id, "chat_id": tg_id, "active_account_id": None,
-                                     "login_until": 0, "input_kind": "", "input_until": 0,
+                                     "login_until": 0, "login_emos_id": "", "login_revision": 0, "input_kind": "", "input_until": 0,
                                      "notify_success": 1, "notify_fail": 1, "notify_already": 0})
         return dict(self.users[tg_id])
 
@@ -46,31 +45,49 @@ class FakeAccounts:
         self.ensure_user(tg_id)
         aid = max(self.rows, default=0) + 1
         self.rows[aid] = {"id": aid, "emos_id": official, "name": name or official,
-                          "enabled": 1, "auto_sign": 1, "sign_time": "08:00", "last_status": "",
+                          "enabled": 1, "auto_sign": 1, "sign_time": "08:00", "sign_mode": "normal", "last_status": "",
                           "last_msg": "", "last_run": "", "last_carrot": None}
         self.owners[aid] = tg_id
         self.users[tg_id]["active_account_id"] = aid
         return dict(self.rows[aid])
 
-    def begin_login(self, tg_id):
+    def begin_login(self, tg_id, official_id, expected_root=None):
         self.ensure_user(tg_id)
-        self.users[tg_id]["login_until"] = int(time.time()) + 600
+        active=self.active(tg_id, required=False)
+        if expected_root is not None and (active['id'] if active else 0) != expected_root:
+            raise DomainError('当前账号已切换')
+        self.users[tg_id].update(login_until=int(time.time())+600, login_emos_id=str(official_id),
+                                 login_revision=self.users[tg_id]['login_revision']+1)
         self.calls.append(("begin_login", tg_id))
+        return self.user(tg_id)
 
     def login_pending(self, tg_id):
         return self.users.get(tg_id, {}).get("login_until", 0) > time.time()
 
     def cancel_login(self, tg_id):
-        self.users[tg_id]["login_until"] = 0
+        self.users[tg_id].update(login_until=0, login_emos_id='', login_revision=self.users[tg_id]['login_revision']+1)
 
-    def finish_login(self, tg_id, token, profile, base_url=""):
+    def finish_login(self, tg_id, token, profile, base_url="", expected_root=None, expected_login_until=None,
+                     expected_login_revision=None):
+        if expected_root is not None:
+            selected = self.active(tg_id, required=False)
+            if (selected['id'] if selected else 0) != expected_root:
+                raise DomainError('当前账号已切换')
+        if expected_login_until is not None and self.users[tg_id]['login_until'] != expected_login_until:
+            raise DomainError('登录授权请求已变化')
+        if expected_login_revision is not None and self.users[tg_id]['login_revision'] != expected_login_revision:
+            raise DomainError('登录授权请求已变化')
         self.calls.append(("finish_login", tg_id, base_url))
         if not self.login_pending(tg_id):
             raise DomainError("登录请求已过期")
         official = profile.get("user_id") or profile.get("_user_id")
         if not official:
             raise DomainError("缺少官方 ID")
-        if "telegram_user_id" in profile and int(profile["telegram_user_id"]) != tg_id:
+        if str(official) != self.users[tg_id]['login_emos_id']:
+            raise DomainError('本人填写与回传官方ID不一致')
+        if profile.get('telegram_user_id') in (None, ''):
+            raise DomainError('账号未绑定本人 Telegram')
+        if int(profile['telegram_user_id']) != tg_id:
             raise DomainError("官方授权与当前 Telegram 用户不匹配")
         aid = next((aid for aid, row in self.rows.items() if row["emos_id"] == str(official)), None)
         if aid is not None and self.owners[aid] != tg_id:
@@ -91,16 +108,26 @@ class FakeAccounts:
             raise DomainError("请先登录并选择自己的账号")
         return dict(row) if row is not None else None
 
-    def switch(self, tg_id, local_account_id):
+    def switch(self, tg_id, local_account_id, expected_root=None):
+        if expected_root is not None:
+            selected = self.active(tg_id, required=False)
+            if (selected['id'] if selected else 0) != expected_root:
+                raise DomainError('当前账号已切换')
         self.calls.append(("switch", tg_id, local_account_id))
         if self.owners.get(local_account_id) != tg_id:
             raise DomainError("不能选择不属于自己的账号")
         self.users[tg_id]["active_account_id"] = local_account_id
         return self.active(tg_id)
 
-    def set_account(self, tg_id, **fields):
-        if set(fields) - {"auto_sign", "sign_time"}:
+    def set_account(self, tg_id, expected_root=None, **fields):
+        if expected_root is not None:
+            selected = self.active(tg_id, required=False)
+            if (selected['id'] if selected else 0) != expected_root:
+                raise DomainError('当前账号已切换')
+        if set(fields) - {"auto_sign", "sign_time", "sign_mode"}:
             raise DomainError("设置字段无效")
+        if 'sign_mode' in fields and fields['sign_mode'] not in ('normal', 'random'):
+            raise DomainError('签到模式必须为普通或随机字')
         row = self.active(tg_id)
         self.calls.append(("set_account", tg_id, dict(fields)))
         self.rows[row["id"]].update(fields)
@@ -113,7 +140,11 @@ class FakeAccounts:
         self.users[tg_id].update(fields)
         return self.user(tg_id)
 
-    def issue_code(self, tg_id):
+    def issue_code(self, tg_id, expected_root=None):
+        if expected_root is not None:
+            selected = self.active(tg_id, required=False)
+            if (selected['id'] if selected else 0) != expected_root:
+                raise DomainError('当前账号已切换')
         row = self.active(tg_id)
         if not row["enabled"]:
             raise DomainError("账号已失效")
@@ -123,7 +154,11 @@ class FakeAccounts:
         self.calls.append(("issue_code", tg_id, row["id"]))
         return {"target_emos_id": row["emos_id"], "code": code, "expires_at": int(time.time()) + 600}
 
-    def redeem(self, tg_id, target_emos_id, code):
+    def redeem(self, tg_id, target_emos_id, code, expected_root=None):
+        if expected_root is not None:
+            selected = self.active(tg_id, required=False)
+            if (selected['id'] if selected else 0) != expected_root:
+                raise DomainError('当前账号已切换')
         source = self.active(tg_id)
         target = next((row for row in self.rows.values() if row["emos_id"] == target_emos_id), None)
         issued = self.codes.get(target_emos_id)
@@ -132,9 +167,41 @@ class FakeAccounts:
         if target["id"] == source["id"]:
             raise DomainError("不能关联自己")
         del self.codes[target_emos_id]
-        self.grants[source["id"], target["id"]] = True
+        self.pending[source['id'], target['id']] = int(time.time()) + 600
         self.calls.append(("redeem", tg_id, source["id"], target["id"]))
-        return dict(target)
+        return dict(target, pending=True)
+
+    def pending_links(self, tg_id):
+        aid = self.active(tg_id)['id']
+        result = {'incoming': [], 'outgoing': []}
+        for (source, target), expiry in self.pending.items():
+            if expiry <= time.time() or aid not in (source, target):
+                continue
+            result['outgoing' if aid == source else 'incoming'].append({
+                'source_id': source, 'target_id': target, 'expires_at': expiry,
+                'source_emos_id': self.rows[source]['emos_id'], 'source_name': self.rows[source]['name'],
+                'target_emos_id': self.rows[target]['emos_id'], 'target_name': self.rows[target]['name']})
+        return result
+
+    def review_link(self, tg_id, source_id, target_id, approve, expected_root=None):
+        root = self.active(tg_id)['id']
+        key = source_id, target_id
+        if (type(approve) is not bool or self.owners.get(target_id) != tg_id
+                or expected_root is not None and root != expected_root
+                or self.pending.get(key, 0) <= time.time()):
+            raise DomainError('关联申请无效或不属于本人')
+        if approve:
+            self.grants[key] = True
+        del self.pending[key]
+        self.calls.append(('review_link', tg_id, source_id, target_id, approve))
+        return {'approved': approve, 'source_id': source_id, 'target_id': target_id}
+
+    def withdraw_link(self, tg_id, source_id, target_id, expected_root=None):
+        if tg_id not in (self.owners.get(source_id), self.owners.get(target_id)):
+            raise DomainError('不能撤回别人的申请')
+        if expected_root is not None and self.active(tg_id)['id'] != expected_root:
+            raise DomainError('当前账号已切换')
+        self.pending.pop((source_id, target_id), None)
 
     def links(self, tg_id):
         aid = self.active(tg_id)["id"]
@@ -149,14 +216,22 @@ class FakeAccounts:
                 result["incoming"].append(link)
         return result
 
-    def toggle_link(self, tg_id, source_id, target_id):
+    def toggle_link(self, tg_id, source_id, target_id, expected_root=None):
+        if expected_root is not None:
+            selected = self.active(tg_id, required=False)
+            if (selected['id'] if selected else 0) != expected_root:
+                raise DomainError('当前账号已切换')
         if self.owners.get(source_id) != tg_id or (source_id, target_id) not in self.grants:
             raise DomainError("仅来源所有者可启停关联")
         self.grants[source_id, target_id] = not self.grants[source_id, target_id]
         self.calls.append(("toggle_link", tg_id, source_id, target_id))
         return self.grants[source_id, target_id]
 
-    def unlink(self, tg_id, source_id, target_id):
+    def unlink(self, tg_id, source_id, target_id, expected_root=None):
+        if expected_root is not None:
+            selected = self.active(tg_id, required=False)
+            if (selected['id'] if selected else 0) != expected_root:
+                raise DomainError('当前账号已切换')
         if tg_id not in (self.owners.get(source_id), self.owners.get(target_id)):
             raise DomainError("无权撤销关联")
         self.grants.pop((source_id, target_id), None)
@@ -181,7 +256,7 @@ class FakeAccounts:
         return [dict(row) for row in self.records if row["account_id"] in ids][:limit]
 
     def set_input(self, tg_id, kind, ttl=600):
-        if kind not in {"link", "time"}:
+        if kind not in {"link", "time", "login"}:
             raise DomainError("输入类型无效")
         self.users[tg_id].update(input_kind=kind, input_until=int(time.time()) + ttl)
         self.calls.append(("set_input", tg_id, kind, ttl))
@@ -200,8 +275,9 @@ class FakeStore:
         self.temp = tempfile.TemporaryDirectory(prefix="emos-bot-test-")
         self.path = os.path.join(self.temp.name, "settings.db")
         self.lock = threading.Lock()
-        self.config = {"base_url": "https://fake-emos.invalid", "emos_app_user_id": "eAppOwner123"}
+        self.config = {"base_url": "https://fake-emos.invalid"}
         self.runs = []
+        self.run_contents = []
         self.run_hook = None
         self.write_failure = False
         with sqlite3.connect(self.path) as conn:
@@ -219,8 +295,9 @@ class FakeStore:
         with self.lock, sqlite3.connect(self.path) as conn:
             conn.execute("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
 
-    def run_user(self, tg_id, include_links=True, expected_root=None):
+    def run_user(self, tg_id, include_links=True, expected_root=None, content=None):
         scope = self.accounts.run_scope(tg_id, include_links)
+        self.run_contents.append(content)
         if expected_root is not None and scope['root_id'] != expected_root:
             raise DomainError('当前账号已切换')
         self.runs.append((tg_id, include_links, scope["root_id"], list(scope["account_ids"])))
@@ -366,23 +443,27 @@ class BotTests(unittest.TestCase):
     def own(self, actor=101, official="eA", name="账号 A"):
         return self.store.accounts.add(actor, official, name)
 
-    def test_official_login_uses_configured_app_owner_not_tg_id(self):
-        self.message("/login")
+    def test_official_login_uses_this_users_entered_id_not_admin_or_tg_id(self):
+        self.message("/login eVerified")
         urls = [button["url"] for button in self.buttons() if "url" in button]
-        self.assertEqual(urls, ["https://t.me/emospg_bot?start=link_eAppOwner123-emos_test_bot"])
+        self.assertEqual(urls, ["https://t.me/emospg_bot?start=link_eVerified-emos_test_bot"])
         self.assertNotIn("link_101-", urls[0])
         self.assertTrue(self.store.accounts.login_pending(101))
         self.assertLessEqual(self.store.accounts.user(101)["login_until"], int(time.time()) + 600)
 
-    def test_missing_app_config_never_emits_fake_login_link(self):
-        self.store.config["emos_app_user_id"] = ""
+    def test_missing_user_id_prompts_personal_input_not_admin_configuration(self):
         self.message("/login")
-        self.assertFalse(any("url" in button for button in self.buttons()))
-        self.assertIn("EMOS_APP_USER_ID", self.text())
+        self.assertFalse(any(button.get('url','').startswith('https://t.me/emospg_bot') for button in self.buttons()))
+        self.assertIn('自己的 emos 用户 ID', self.text())
+        self.assertNotIn('EMOS_APP_USER_ID', self.text())
         self.assertFalse(self.store.accounts.login_pending(101))
+        self.assertEqual(self.store.accounts.input_state(101), 'login')
+        self.message('eVerified')
+        self.assertTrue(self.store.accounts.login_pending(101))
+        self.assertEqual(self.store.accounts.user(101)['login_emos_id'],'eVerified')
 
     def test_agreement_verified_saved_deleted_not_echoed(self):
-        self.message("/login")
+        self.message("/login eVerified")
         self.message("/start emosLinkAgree-11_private-test-secret")
         self.assertEqual(self.factory.calls, [("11_private-test-secret", "https://fake-emos.invalid")])
         self.assertEqual(self.store.accounts.active(101)["emos_id"], "eVerified")
@@ -397,33 +478,33 @@ class BotTests(unittest.TestCase):
         self.assertIn("过期", self.text())
 
     def test_expired_pending_denies_agreement(self):
-        self.message("/login")
+        self.message("/login eVerified")
         self.store.accounts.users[101]["login_until"] = int(time.time()) - 1
         self.message("/start emosLinkAgree-secret")
         self.assertFalse(self.factory.calls)
 
     def test_missing_official_profile_id_denied(self):
         self.factory.profile_data = {"name": "No ID", "telegram_user_id": 101}
-        self.message("/login")
+        self.message("/login eVerified")
         self.message("/start emosLinkAgree-secret")
         self.assertEqual(self.store.accounts.owned(101), [])
         self.assertIn("缺少账号 ID", self.text())
 
     def test_profile_tg_mismatch_denied(self):
         self.factory.profile_data["telegram_user_id"] = 202
-        self.message("/login")
+        self.message("/login eVerified")
         self.message("/start emosLinkAgree-secret")
         self.assertEqual(self.store.accounts.owned(101), [])
         self.assertIn("不匹配", self.text())
 
-    def test_profile_optional_tg_and_fallback_id(self):
-        self.factory.profile_data = {"_user_id": "eFallback", "name": "备用"}
-        self.message("/login")
+    def test_profile_fallback_id_with_verified_tg(self):
+        self.factory.profile_data = {"_user_id": "eFallback", "name": "备用", "telegram_user_id": 101}
+        self.message("/login eFallback")
         self.message("/start emosLinkAgree-secret")
         self.assertEqual(self.store.accounts.active(101)["emos_id"], "eFallback")
 
     def test_refusal_id_must_match_actor(self):
-        self.message("/login")
+        self.message("/login eVerified")
         self.message("/start emosLinkRefuse-202")
         self.assertTrue(self.store.accounts.login_pending(101))
         self.message("/start emosLinkRefuse-101")
@@ -431,14 +512,14 @@ class BotTests(unittest.TestCase):
 
     def test_existing_owner_cannot_be_stolen(self):
         self.own(202, "eVerified", "其他人")
-        self.message("/login")
+        self.message("/login eVerified")
         self.message("/start emosLinkAgree-secret")
         self.assertEqual(self.store.accounts.owned(101), [])
         self.assertEqual(len(self.store.accounts.owned(202)), 1)
 
     def test_groups_and_impersonation_denied(self):
-        self.message("/login", chat=-55, chat_type="group")
-        self.message("/login", actor=202, chat=101)
+        self.message("/login eVerified", chat=-55, chat_type="group")
+        self.message("/login eVerified", actor=202, chat=101)
         self.callback("sign:1", actor=202, chat=101)
         self.callback("sign:1", chat=-55, chat_type="supergroup")
         self.assertEqual(self.store.accounts.users, {})
@@ -504,6 +585,8 @@ class BotTests(unittest.TestCase):
         self.assertLessEqual(len(payload), 64)
         self.assertEqual(bot.Bot._association_args(payload), ("eTarget", code))
         self.message("/start " + payload, actor=202)
+        self.assertFalse(self.store.accounts.grants)
+        self.callback('review:1:2:1:1', actor=101)
         self.assertTrue(self.store.accounts.grants[2, 1])
         self.assertNotIn(code, self.text(202))
         self.assertTrue(any(action[:2] == ("delete", 202) for action in self.tg.actions))
@@ -515,6 +598,8 @@ class BotTests(unittest.TestCase):
         self.message("/link eB")
         self.assertFalse(self.store.accounts.grants)
         self.message("/link eB " + issued["code"])
+        self.assertFalse(self.store.accounts.grants)
+        self.callback('review:%d:%d:%d:1' % (b['id'], a['id'], b['id']), actor=202)
         self.assertEqual(self.store.accounts.grants, {(a["id"], b["id"]): True})
         self.message("/link eB " + issued["code"])
         self.assertEqual(len([call for call in self.store.accounts.calls if call[0] == "redeem"]), 1)
@@ -540,6 +625,8 @@ class BotTests(unittest.TestCase):
         code = self.store.accounts.issue_code(202)["code"]
         self.callback("guide:link:%d" % a["id"])
         self.message("eTarget " + code)
+        self.assertFalse(self.store.accounts.grants)
+        self.callback('review:%d:%d:%d:1' % (target['id'], a['id'], target['id']), actor=202)
         self.assertTrue(self.store.accounts.grants[a["id"], target["id"]])
         self.assertEqual(self.store.accounts.input_state(101), "")
         self.assertNotIn(code, self.text())
@@ -559,6 +646,31 @@ class BotTests(unittest.TestCase):
         self.assertEqual(self.store.accounts.active(101)["sign_time"], "08:00")
         self.message("/time 00:30")
         self.assertEqual(self.store.accounts.active(101)["sign_time"], "01:30")
+
+    def test_sign_mode_toggle_persists_and_shows_mark(self):
+        a = self.own()
+        self.assertEqual(self.store.accounts.user(101)['active_account_id'], a['id'])
+        self.callback("mode:%d:random" % a['id'])
+        self.assertEqual(self.store.accounts.rows[a['id']]['sign_mode'], 'random')
+        self.assertIn('签到模式：随机字签到', self.text())
+        labels = [button['text'] for button in self.buttons()]
+        self.assertIn('✓ 随机字签到', labels)
+        self.assertIn('普通签到', labels)
+        self.callback("mode:%d:normal" % a['id'])
+        self.assertEqual(self.store.accounts.rows[a['id']]['sign_mode'], 'normal')
+        self.assertIn('签到模式：普通签到（不带附言）', self.text())
+        self.assertIn('✓ 普通签到', [button['text'] for button in self.buttons()])
+
+    def test_sign_mode_toggle_rejects_other_account_and_bad_mode(self):
+        a = self.own()
+        other = self.own(202, 'eB')
+        self.store.accounts.set_account(101, expected_root=a['id'], sign_mode='normal')
+        self.callback("mode:%d:random" % other['id'])
+        self.assertIn('当前账号已切换', self.text())
+        self.assertEqual(self.store.accounts.rows[a['id']]['sign_mode'], 'normal')
+        self.callback("mode:%d:weird" % a['id'])
+        self.assertIn('签到模式必须为普通或随机字', self.text())
+        self.assertEqual(self.store.accounts.rows[a['id']]['sign_mode'], 'normal')
 
     def test_auto_and_preferences_fields_no_enabled_revive(self):
         a = self.own()
@@ -598,8 +710,11 @@ class BotTests(unittest.TestCase):
                                           (d["id"], a["id"]): True})
         self.message("/sign")
         self.assertEqual(self.store.runs, [(101, True, a["id"], [a["id"], target["id"]])])
-        self.message("/sign 3")
-        self.assertEqual(len(self.store.runs), 1)
+        self.assertEqual(self.store.run_contents, [None])
+        # 附言就是用户输入的文字，官方用它做随机签到；不再当作非法参数拒绝。
+        self.message("/sign 今天也在")
+        self.assertEqual(len(self.store.runs), 2)
+        self.assertEqual(self.store.run_contents[-1], "今天也在")
 
     def test_revoke_during_sign_removes_target_report(self):
         a = self.own()
@@ -670,7 +785,7 @@ class BotTests(unittest.TestCase):
     def test_profile_failure_never_leaks_secret_to_stdout_or_ui(self):
         secret = "11_super-secret-value"
         self.factory.error = EmosError("https://api.telegram.org/botfake-token/path Bearer " + secret)
-        self.message("/login")
+        self.message("/login eVerified")
         capture = io.StringIO()
         with redirect_stdout(capture):
             self.message("/start emosLinkAgree-" + secret)
@@ -708,7 +823,7 @@ class BotTests(unittest.TestCase):
 
     def test_async_profile_does_not_block_poll_or_callbacks(self):
         entered, release, answered = threading.Event(), threading.Event(), threading.Event()
-        self.store.accounts.begin_login(101)
+        self.store.accounts.begin_login(101, "eVerified")
         asynchronous = self.make_bot(False, workers=2, max_jobs=4)
         self.factory.hook = lambda: (entered.set(), release.wait(2))
         old_answer = self.tg.answer
@@ -780,7 +895,7 @@ class BotTests(unittest.TestCase):
         self.assertFalse(any(run[0] == 101 for run in self.store.runs))
 
     def test_login_expiring_during_profile_cannot_finish(self):
-        self.message("/login")
+        self.message("/login eVerified")
         self.factory.hook = lambda: self.store.accounts.cancel_login(101)
         self.message("/start emosLinkAgree-secret")
         self.assertEqual(self.store.accounts.owned(101), [])

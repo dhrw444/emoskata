@@ -14,20 +14,15 @@ CONTENTS = ('签到', '打卡', '今日签到', '来签到', '今天也在', '�
 
 
 class EmosError(Exception):
-    def __init__(self, message, status=None, payload=None, network=False,
-                 kind=None, retry_after=0):
+    def __init__(self, message, status=None, network=False, kind=None, retry_after=0):
         super().__init__(message)
-        self.message, self.status, self.payload = message, status, payload
+        self.message, self.status = message, status
         self.network = network
         self.kind = kind or ('network' if network else 'failed')
         self.retry_after = retry_after
 
     def __str__(self):
         return self.message
-
-
-def _status_of(error):
-    return error.kind
 
 
 def _safe_json(raw):
@@ -38,11 +33,15 @@ def _safe_json(raw):
     return body if isinstance(body, dict) else None
 
 
-def pick_content(preferred=''):
-    content = str(preferred or '').strip() or random.choice(CONTENTS)
-    if len(content) > 10:
-        raise EmosError('签到附言最多 10 个字。')
-    return content
+def pick_content(preferred='', mode='normal'):
+    if mode not in ('normal', 'random'):
+        raise EmosError('签到模式必须为普通或随机字。', kind='config')
+    if not isinstance(preferred, str):
+        raise EmosError('签到附言必须为文字。', kind='config')
+    content = preferred.strip()
+    if len(content) > 256 or any(ord(c) < 32 or ord(c) == 127 for c in content):
+        raise EmosError('签到附言最多 256 字，且不能含控制字符（本程序限制）。', kind='config')
+    return content or (random.choice(CONTENTS) if mode == 'random' else '')
 
 
 def clamp_sign_time(hhmm):
@@ -71,18 +70,18 @@ class _NoCredentialRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def _already_message(body):
-    text = str(body.get('message') or '').lower()
-    return body.get('is_sign') is True or any(
-        word in text for word in ('已签到', '已经签到', '已签过', 'already signed',
-                                  'already checked'))
+    text = str(body.get('message') or '').strip().lower().rstrip('。.!！')
+    return text in ('重复签到', '已签到', '已经签到', '已签过', '今日已签到',
+                    '今天已签到', '您今天已经签到过了', 'already signed', 'already checked')
 
 
 class EmosClient:
     def __init__(self, token, base='', timeout=TIMEOUT):
         self.before_request = None
         self.expected_user_id = None
+        self.expected_telegram_id = None
         self.token = str(token or '').strip()
-        if not re.fullmatch(r'[A-Za-z0-9_-]{1,256}', self.token) or '_' not in self.token:
+        if not re.fullmatch(r'[A-Za-z0-9_-]{8,256}', self.token):
             raise EmosError('登录密钥格式错误，请重新通过官方 Bot 授权。')
         endpoint = valid_base(base)
         self.bases = [endpoint]
@@ -129,14 +128,22 @@ class EmosClient:
             if any(x in text for x in ('unauthenticated', 'invalid token', 'token expired', '密钥失效')):
                 raise EmosError('登录密钥失效，请重新授权。', status, kind='invalid')
             raise EmosError('接口拒绝访问，账号未被停用。', status, kind='blocked')
-        if status == 429 and not _already_message(body):
+        if status == 429 and not (path == '/api/user/sign' and _already_message(body)):
             delay = min(86400, max(0, int(retry))) if str(retry).isdigit() else 0
             raise EmosError('接口请求过多，稍后重试。', status, kind='rate', retry_after=delay)
         return status, body
 
     def call(self, method, path, params=None):
+        """GET 可以在备用域名上重试；PUT /api/user/sign 不是幂等请求。
+
+        签到换域名重发等于向官方多提交一次签到尝试（官方明确禁止接口轮询）。
+        网络中断时请求可能已经到达服务器并签到成功，所以只报 network，
+        由本地退避稍后再查；网关拦截（blocked，403/HTML）确定没有执行，可以换域名。
+        """
+        bases = list(self.bases)
+        non_idempotent = method in ('PUT', 'POST', 'DELETE')
         last = None
-        for base in list(self.bases):
+        for index, base in enumerate(bases):
             try:
                 result = self._once(method, path, base, params)
                 self.bases = [base] + [other for other in self.bases if other != base]
@@ -144,6 +151,10 @@ class EmosClient:
             except EmosError as error:
                 last = error
                 if error.kind not in ('network', 'blocked'):
+                    raise
+                if non_idempotent and error.kind == 'network':
+                    raise
+                if index + 1 >= len(bases):
                     raise
         raise last or EmosError('所有接口均不可用。', network=True)
 
@@ -161,44 +172,45 @@ class EmosClient:
         return result
 
     def check(self):
+        """Official '判断是否登录': is_sign is logged-in state, not today's sign-in."""
         status, body = self.call('GET', '/api/sign/check')
         if status != 200 or not isinstance(body.get('is_sign'), bool):
-            raise EmosError('签到状态响应不完整。', status)
+            raise EmosError('登录状态响应不完整。', status)
+        if body['is_sign'] and not body.get('user_id'):
+            raise EmosError('登录状态缺少官方账号 ID。', status)
         return body['is_sign'], body
 
     def do_sign(self, content=''):
-        text = pick_content(content)
-        status, body = self.call('PUT', '/api/user/sign', {'content': text})
-        if status == 400 and not content:
-            choices = [s for s in CONTENTS if s != text]
-            status, body = self.call('PUT', '/api/user/sign', {'content': random.choice(choices)})
-        return status, body
+        """content 已由 sign_once 校验并选定；空字符串表示不带附言的普通签到。"""
+        return self.call('PUT', '/api/user/sign', {'content': content} if content else None)
 
-    def reset_token(self):
-        status, body = self.call('PUT', '/api/user/resetToken')
-        token = body.get('token')
-        if status != 200 or not isinstance(token, str) or not token:
-            raise EmosError('重置密钥响应无效。', status)
-        self.token = token
-        return token
-
-    def sign_once(self, content=''):
+    def sign_once(self, content='', mode='normal'):
         result = {'status': 'failed', 'message': '', 'point': None, 'days': None,
                   'rank': None, 'name': '', 'retry_after': 0}
         try:
+            content = pick_content(content, mode)
             profile = self.profile()
             result['name'] = profile['_display']
             if self.expected_user_id and profile['_user_id'] != str(self.expected_user_id):
                 raise EmosError('当前密钥的官方账号 ID 与登记账号不一致，请重新授权。', kind='invalid')
-            signed, check_body = self.check()
-            checked_id = check_body.get('user_id')
-            if checked_id is not None and str(checked_id) != profile['_user_id']:
-                raise EmosError('签到状态返回了其他账号 ID，本次未执行。')
-            if signed:
+            if self.expected_telegram_id is not None:
+                linked = profile.get('telegram_user_id')
+                if isinstance(linked, str) and re.fullmatch(r'[0-9]{1,19}', linked):
+                    linked = int(linked)
+                if type(linked) is not int or linked != self.expected_telegram_id:
+                    raise EmosError('官方 TG 绑定已取消或改变，请本人重新授权。', kind='invalid')
+            if 'sign' not in profile:
+                raise EmosError('官方用户资料缺少当天签到信息，本次未执行。')
+            today_sign = profile['sign']
+            if today_sign is not None and not isinstance(today_sign, dict):
+                raise EmosError('官方当天签到信息结构不完整，本次未执行。')
+            # 官方原文只说「当天未签到时返回 null」。空对象不是已签证据，
+            # 当成已签会白丢一天萝卜；宁可多一次 PUT，官方会用 429 重复签到告诉我们。
+            if today_sign:
                 result.update(status='already', message='今日已签到')
                 return result
             status, body = self.do_sign(content)
-            if status == 409 or (status in (200, 429) and _already_message(body)):
+            if status in (200, 429) and _already_message(body):
                 result.update(status='already', message='今日已签到')
             elif status == 200:
                 fields = ('earn_point', 'continuous_days', 'sign_index')
@@ -207,7 +219,8 @@ class EmosClient:
                 result.update(status='signed', message='签到成功', point=body['earn_point'],
                               days=body['continuous_days'], rank=body['sign_index'])
             else:
-                raise EmosError('签到未成功（HTTP %d）。' % status, status)
+                raise EmosError('签到被官方拒绝（HTTP %d），请核对附言后手动重试。' % status,
+                                status, kind='rejected' if status in (400, 422) else 'failed')
         except EmosError as error:
             result.update(status=error.kind, message=error.message, retry_after=error.retry_after)
         return result

@@ -24,12 +24,12 @@ class DomainError(Exception):
 
 
 _ACCOUNT_FIELDS = (
-    "id", "emos_id", "name", "enabled", "auto_sign", "sign_time",
+    "id", "emos_id", "name", "enabled", "auto_sign", "sign_time", "sign_mode",
     "last_status", "last_msg", "last_carrot", "last_run", "last_day",
     "retry_count", "next_run_at", "created",
 )
 _USER_FIELDS = (
-    "tg_id", "chat_id", "active_account_id", "login_until", "input_kind",
+    "tg_id", "chat_id", "active_account_id", "login_until", "login_emos_id", "login_revision", "input_kind",
     "input_until", "notify_success", "notify_fail", "notify_already", "created",
 )
 _PREFERENCES = ("notify_success", "notify_fail", "notify_already")
@@ -144,7 +144,7 @@ class AccountService:
             ("next_run_at", "INTEGER DEFAULT 0"), ("created", "TEXT DEFAULT ''"),
             ("emos_id", "TEXT"), ("owner_tg_id", "INTEGER"),
             ("base_url", "TEXT DEFAULT ''"), ("auto_sign", "INTEGER DEFAULT 1"),
-            ("sign_time", "TEXT DEFAULT ''"),
+            ("sign_time", "TEXT DEFAULT ''"), ("sign_mode", "TEXT NOT NULL DEFAULT 'normal'"),
         )
         for column, ddl in additions:
             if column not in columns:
@@ -177,6 +177,11 @@ class AccountService:
                 notify_already INTEGER NOT NULL DEFAULT 0, created TEXT DEFAULT ''
             )
         """)
+        user_columns = {row[1] for row in conn.execute('PRAGMA table_info(tg_users)')}
+        for name, ddl in (('login_emos_id', "TEXT NOT NULL DEFAULT ''"),
+                          ('login_revision', 'INTEGER NOT NULL DEFAULT 0')):
+            if name not in user_columns:
+                conn.execute('ALTER TABLE tg_users ADD COLUMN %s %s' % (name, ddl))
         conn.execute("""
             CREATE TABLE IF NOT EXISTS account_links (
                 source_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
@@ -195,6 +200,13 @@ class AccountService:
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_codes_target ON link_codes(target_id)")
+        conn.execute('CREATE TABLE IF NOT EXISTS link_requests ('
+                     'source_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,'
+                     'target_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,'
+                     'source_owner INTEGER NOT NULL,target_owner INTEGER NOT NULL,'
+                     'expires_at INTEGER NOT NULL,created TEXT NOT NULL,'
+                     'PRIMARY KEY(source_id,target_id),CHECK(source_id<>target_id))')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_link_requests_target ON link_requests(target_id)')
         conn.execute("""
             CREATE TABLE IF NOT EXISTS logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, account_id INTEGER NOT NULL,
@@ -202,7 +214,8 @@ class AccountService:
                 message TEXT DEFAULT '', carrot INTEGER
             )
         """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_id ON logs(id DESC)")
+        conn.execute('DROP INDEX IF EXISTS idx_logs_id')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_logs_account ON logs(account_id,id DESC)')
 
     @staticmethod
     def _now():
@@ -241,12 +254,15 @@ class AccountService:
             row = conn.execute("SELECT * FROM tg_users WHERE tg_id=?", (tg_id,)).fetchone()
             return _user(row) if row is not None else None
 
-    def begin_login(self, tg_id) -> None:
-        tg_id = _positive_id(tg_id)
+    def begin_login(self, tg_id, official_id, expected_root=None) -> dict:
+        tg_id, official_id = _positive_id(tg_id), _official_id(official_id)
         with self._write() as conn:
             self._ensure(conn, tg_id)
-            conn.execute("UPDATE tg_users SET login_until=? WHERE tg_id=?",
-                         (self._now() + 600, tg_id))
+            self._expected(conn, tg_id, expected_root)
+            conn.execute('UPDATE tg_users SET login_until=?,login_emos_id=?,'
+                         'login_revision=login_revision+1 WHERE tg_id=?',
+                         (self._now() + 600, official_id, tg_id))
+            return _user(conn.execute('SELECT * FROM tg_users WHERE tg_id=?', (tg_id,)).fetchone())
 
     def login_pending(self, tg_id) -> bool:
         row = self.user(tg_id)
@@ -255,9 +271,11 @@ class AccountService:
     def cancel_login(self, tg_id) -> None:
         tg_id = _positive_id(tg_id)
         with self._write() as conn:
-            conn.execute("UPDATE tg_users SET login_until=0 WHERE tg_id=?", (tg_id,))
+            conn.execute("UPDATE tg_users SET login_until=0,login_emos_id='',"
+                         "login_revision=login_revision+1 WHERE tg_id=?", (tg_id,))
 
-    def finish_login(self, tg_id, token, profile, base_url="") -> dict:
+    def finish_login(self, tg_id, token, profile, base_url='', expected_root=None,
+                     expected_login_until=None, expected_login_revision=None) -> dict:
         tg_id = _positive_id(tg_id)
         if not isinstance(profile, Mapping):
             raise DomainError("登录资料无效，请重新授权")
@@ -265,12 +283,13 @@ class AccountService:
         if official is None or (isinstance(official, str) and not official.strip()):
             official = profile.get("_user_id")
         official = _official_id(official)
-        if "telegram_user_id" in profile:
-            telegram_id = profile["telegram_user_id"]
-            if isinstance(telegram_id, str) and telegram_id.isascii() and telegram_id.isdigit():
-                telegram_id = int(telegram_id) if len(telegram_id) <= 19 else 0
-            if type(telegram_id) is not int or telegram_id != tg_id:
-                raise DomainError("官方授权与当前 Telegram 用户不匹配")
+        telegram_id = profile.get("telegram_user_id")
+        if telegram_id in (None, ""):
+            raise DomainError("官方账号尚未绑定 Telegram。请在 emos 官网绑定本人 TG，再重新 /login；账号未保存")
+        if isinstance(telegram_id, str) and telegram_id.isascii() and telegram_id.isdigit():
+            telegram_id = int(telegram_id) if len(telegram_id) <= 19 else 0
+        if type(telegram_id) is not int or telegram_id != tg_id:
+            raise DomainError("官方授权与当前 Telegram 用户不匹配")
         if not isinstance(token, str) or not token.strip() or len(token) > 8192:
             raise DomainError("登录凭证无效，请重新授权")
         token = token.strip()
@@ -282,10 +301,16 @@ class AccountService:
                    or profile.get("name") or official).strip()[:80] or official
         with self._write() as conn:
             now = self._now()
-            pending = conn.execute("SELECT login_until FROM tg_users WHERE tg_id=?",
+            pending = conn.execute('SELECT login_until,login_emos_id,login_revision FROM tg_users WHERE tg_id=?',
                                    (tg_id,)).fetchone()
-            if pending is None or pending["login_until"] <= now:
-                raise DomainError("登录请求已过期或未发起，请重新登录")
+            if pending is None or pending['login_until'] <= now:
+                raise DomainError('登录请求已过期或未发起，请重新登录')
+            self._expected(conn, tg_id, expected_root)
+            if (expected_login_until is not None and pending['login_until'] != expected_login_until
+                    or expected_login_revision is not None and pending['login_revision'] != expected_login_revision):
+                raise DomainError('登录授权请求已变化，请重新发起')
+            if pending['login_emos_id'] != official:
+                raise DomainError('官方回传账号 ID 与本人本次填写的 ID 不一致，账号未保存')
             row = conn.execute("SELECT * FROM accounts WHERE emos_id=?", (official,)).fetchone()
             matches = conn.execute("SELECT * FROM accounts WHERE token=? ORDER BY id",
                                    (token,)).fetchall()
@@ -318,8 +343,8 @@ class AccountService:
             if "retry_day" in columns:
                 conn.execute("UPDATE accounts SET retry_day='' WHERE id=? AND owner_tg_id=?",
                              (account_id, tg_id))
-            conn.execute("UPDATE tg_users SET active_account_id=?,login_until=0 WHERE tg_id=?",
-                         (account_id, tg_id))
+            conn.execute("UPDATE tg_users SET active_account_id=?,login_until=0,login_emos_id='',"
+                         "login_revision=login_revision+1 WHERE tg_id=?", (account_id, tg_id))
             return _account(conn.execute("SELECT * FROM accounts WHERE id=?",
                                          (account_id,)).fetchone())
 
@@ -337,9 +362,20 @@ class AccountService:
             row = self._active(conn, tg_id, required)
             return _account(row) if row is not None else None
 
-    def switch(self, tg_id, local_account_id) -> dict:
+    @staticmethod
+    def _expected(conn, tg_id, expected_root):
+        if expected_root is None:
+            return
+        if type(expected_root) is not int or expected_root < 0:
+            raise DomainError('当前账号参数无效')
+        row = AccountService._active(conn, tg_id, required=False)
+        if (row['id'] if row is not None else 0) != expected_root:
+            raise DomainError('当前账号已切换，请刷新页面后重试')
+
+    def switch(self, tg_id, local_account_id, expected_root=None) -> dict:
         tg_id, local_account_id = _positive_id(tg_id), _positive_id(local_account_id)
         with self._write() as conn:
+            self._expected(conn, tg_id, expected_root)
             row = conn.execute("SELECT * FROM accounts WHERE id=? AND owner_tg_id=? "
                                "AND emos_id IS NOT NULL AND emos_id<>''",
                                (local_account_id, tg_id)).fetchone()
@@ -350,13 +386,17 @@ class AccountService:
                          (local_account_id, tg_id))
             return _account(row)
 
-    def set_account(self, tg_id, **fields) -> dict:
+    def set_account(self, tg_id, expected_root=None, **fields) -> dict:
         tg_id = _positive_id(tg_id)
-        if set(fields) - {"auto_sign", "sign_time"}:
-            raise DomainError("只允许设置自动签到与签到时间")
-        values = {key: _flag(value) if key == "auto_sign" else _clamp_time(value)
+        if set(fields) - {"auto_sign", "sign_time", "sign_mode"}:
+            raise DomainError("只允许设置自动签到、签到时间和签到模式")
+        if 'sign_mode' in fields and fields['sign_mode'] not in ('normal', 'random'):
+            raise DomainError('签到模式必须为普通或随机字')
+        values = {key: _flag(value) if key == "auto_sign" else
+                  _clamp_time(value) if key == 'sign_time' else value
                   for key, value in fields.items()}
         with self._write() as conn:
+            self._expected(conn, tg_id, expected_root)
             row = self._active(conn, tg_id)
             if values:
                 conn.execute("UPDATE accounts SET " + ",".join(key + "=?" for key in values)
@@ -378,9 +418,10 @@ class AccountService:
             return _user(conn.execute("SELECT * FROM tg_users WHERE tg_id=?",
                                       (tg_id,)).fetchone())
 
-    def issue_code(self, tg_id) -> dict:
+    def issue_code(self, tg_id, expected_root=None) -> dict:
         tg_id = _positive_id(tg_id)
         with self._write() as conn:
+            self._expected(conn, tg_id, expected_root)
             row = self._active(conn, tg_id)
             if not row["emos_id"] or row["enabled"] != 1 or row["last_status"] == "invalid":
                 raise DomainError("当前账号未验证或已失效，请重新登录")
@@ -415,7 +456,7 @@ class AccountService:
             self._redeem_failures[tg_id] = ((started, count + 1) if started + 60 > now
                                            else (now, 1))
 
-    def redeem(self, tg_id, target_emos_id, code) -> dict:
+    def redeem(self, tg_id, target_emos_id, code, expected_root=None) -> dict:
         tg_id = _positive_id(tg_id)
         self._redemption_limit(tg_id)
         try:
@@ -424,6 +465,7 @@ class AccountService:
                 raise DomainError("关联 ID 或一次性码无效、过期或已使用")
             digest = hashlib.sha256(code.strip().encode("utf-8")).hexdigest()
             with self._write() as conn:
+                self._expected(conn, tg_id, expected_root)
                 source = self._active(conn, tg_id)
                 if source["enabled"] != 1 or source["last_status"] == "invalid" or not source["emos_id"]:
                     raise DomainError("当前账号未验证或已失效，请重新登录")
@@ -440,11 +482,22 @@ class AccountService:
                     (digest, target["id"], target["owner_tg_id"], self._now()))
                 if consumed.rowcount != 1:
                     raise DomainError("关联 ID 或一次性码无效、过期或已使用")
-                conn.execute(
-                    "INSERT INTO account_links(source_id,target_id,enabled,created) VALUES(?,?,1,?) "
-                    "ON CONFLICT(source_id,target_id) DO UPDATE SET enabled=1",
-                    (source["id"], target["id"], self._created(self._now())))
-                result = _account(target)
+                now = self._now()
+                conn.execute('DELETE FROM link_requests WHERE expires_at<=?', (now,))
+                if conn.execute('SELECT 1 FROM account_links WHERE source_id=? AND target_id=?',
+                                (source['id'], target['id'])).fetchone():
+                    raise DomainError('该账号已经关联，请使用现有关联开关')
+                pending = conn.execute('SELECT COUNT(*) FROM link_requests WHERE source_id=? OR target_id=?',
+                                       (source['id'],target['id'])).fetchone()[0]
+                if pending >= 20:
+                    raise DomainError('待确认关联申请已满，请先处理现有申请')
+                conn.execute('INSERT INTO link_requests VALUES(?,?,?,?,?,?) '
+                             'ON CONFLICT(source_id,target_id) DO UPDATE SET '
+                             'source_owner=excluded.source_owner,target_owner=excluded.target_owner,'
+                             'expires_at=excluded.expires_at,created=excluded.created',
+                             (source['id'],target['id'],tg_id,target['owner_tg_id'],now+600,self._created(now)))
+                result = {'id':target['id'],'emos_id':_safe_text(target['emos_id'],(target['token'],)),
+                          'name':_safe_text(target['name'],(target['token'],)), 'pending':True}
         except DomainError:
             self._redemption_result(tg_id, False)
             raise
@@ -478,22 +531,24 @@ class AccountService:
             result["outgoing" if row["source_id"] == row["root_id"] else "incoming"].append(entry)
         return result
 
-    def toggle_link(self, tg_id, source_id, target_id) -> bool:
+    def toggle_link(self, tg_id, source_id, target_id, expected_root=None, enabled=None) -> bool:
         tg_id, source_id, target_id = map(_positive_id, (tg_id, source_id, target_id))
         with self._write() as conn:
+            self._expected(conn, tg_id, expected_root)
             row = conn.execute("SELECT l.enabled FROM account_links l JOIN accounts s "
                                "ON s.id=l.source_id WHERE l.source_id=? AND l.target_id=? "
                                "AND s.owner_tg_id=?", (source_id, target_id, tg_id)).fetchone()
             if row is None:
                 raise DomainError("只能暂停或恢复自己账号的外向关联")
-            enabled = 0 if _stored_flag(row["enabled"]) else 1
+            enabled = (0 if _stored_flag(row['enabled']) else 1) if enabled is None else _flag(enabled)
             conn.execute("UPDATE account_links SET enabled=? WHERE source_id=? AND target_id=?",
                          (enabled, source_id, target_id))
             return bool(enabled)
 
-    def unlink(self, tg_id, source_id, target_id) -> None:
+    def unlink(self, tg_id, source_id, target_id, expected_root=None) -> None:
         tg_id, source_id, target_id = map(_positive_id, (tg_id, source_id, target_id))
         with self._write() as conn:
+            self._expected(conn, tg_id, expected_root)
             row = conn.execute("SELECT s.owner_tg_id AS source_owner,t.owner_tg_id AS target_owner "
                                "FROM accounts s CROSS JOIN accounts t WHERE s.id=? AND t.id=?",
                                (source_id, target_id)).fetchone()
@@ -501,6 +556,65 @@ class AccountService:
                 raise DomainError("只能撤销包含自己账号的关联")
             conn.execute("DELETE FROM account_links WHERE source_id=? AND target_id=?",
                          (source_id, target_id))
+            conn.execute('DELETE FROM link_requests WHERE source_id=? AND target_id=?',(source_id,target_id))
+
+    def pending_links(self, tg_id):
+        tg_id = _positive_id(tg_id)
+        result = {'outgoing': [], 'incoming': []}
+        with closing(self._db()) as conn:
+            root = self._active(conn, tg_id, required=False)
+            if root is None:
+                return result
+            rows = conn.execute('SELECT p.source_id,p.target_id,p.expires_at,'
+                                's.name AS source_name,s.emos_id AS source_emos_id,'
+                                't.name AS target_name,t.emos_id AS target_emos_id,'
+                                's.token AS source_token,t.token AS target_token '
+                                'FROM link_requests p JOIN accounts s ON s.id=p.source_id '
+                                'JOIN accounts t ON t.id=p.target_id '
+                                'WHERE (p.source_id=? OR p.target_id=?) AND p.expires_at>? '
+                                'AND s.owner_tg_id=p.source_owner AND t.owner_tg_id=p.target_owner '
+                                'ORDER BY p.created', (root['id'], root['id'], self._now())).fetchall()
+        for row in rows:
+            entry = {key: row[key] for key in ('source_id','target_id','expires_at','source_name',
+                                               'source_emos_id','target_name','target_emos_id')}
+            for key in ('source_name','source_emos_id','target_name','target_emos_id'):
+                entry[key] = _safe_text(entry[key], (row['source_token'],row['target_token']))
+            result['outgoing' if row['source_id']==root['id'] else 'incoming'].append(entry)
+        return result
+
+    def review_link(self, tg_id, source_id, target_id, approve, expected_root=None):
+        tg_id, source_id, target_id = map(_positive_id, (tg_id,source_id,target_id))
+        if type(approve) is not bool:
+            raise DomainError('关联审核选项无效')
+        with self._write() as conn:
+            self._expected(conn,tg_id,expected_root)
+            target = conn.execute('SELECT * FROM accounts WHERE id=? AND owner_tg_id=?',
+                                  (target_id,tg_id)).fetchone()
+            source = conn.execute('SELECT * FROM accounts WHERE id=?',(source_id,)).fetchone()
+            pending = conn.execute('SELECT * FROM link_requests WHERE source_id=? AND target_id=?',
+                                   (source_id,target_id)).fetchone()
+            if target is None or source is None or pending is None or pending['expires_at']<=self._now():
+                raise DomainError('关联申请不存在、已过期或不属于本人')
+            if pending['target_owner']!=tg_id or pending['source_owner']!=source['owner_tg_id']:
+                raise DomainError('关联账号归属已变化，请重新申请')
+            if approve:
+                if not target['enabled'] or not source['enabled'] or target['last_status']=='invalid' or source['last_status']=='invalid':
+                    raise DomainError('关联账号凭证已失效，请重新登录')
+                conn.execute('INSERT INTO account_links(source_id,target_id,enabled,created) VALUES(?,?,1,?) '
+                             'ON CONFLICT(source_id,target_id) DO UPDATE SET enabled=1',
+                             (source_id,target_id,self._created(self._now())))
+            conn.execute('DELETE FROM link_requests WHERE source_id=? AND target_id=?',(source_id,target_id))
+        return {'approved': approve, 'source_id':source_id, 'target_id':target_id}
+
+    def withdraw_link(self,tg_id,source_id,target_id,expected_root=None):
+        tg_id,source_id,target_id=map(_positive_id,(tg_id,source_id,target_id))
+        with self._write() as conn:
+            self._expected(conn,tg_id,expected_root)
+            row=conn.execute('SELECT s.owner_tg_id AS source_owner,t.owner_tg_id AS target_owner '
+                             'FROM accounts s JOIN accounts t ON t.id=? WHERE s.id=?',(target_id,source_id)).fetchone()
+            if row is None or tg_id not in (row['source_owner'],row['target_owner']):
+                raise DomainError('只能取消涉及本人账号的申请')
+            conn.execute('DELETE FROM link_requests WHERE source_id=? AND target_id=?',(source_id,target_id))
 
     def run_scope(self, tg_id, include_links=True) -> dict:
         tg_id = _positive_id(tg_id)
@@ -579,7 +693,7 @@ class AccountService:
 
     def set_input(self, tg_id, kind, ttl=600) -> None:
         tg_id = _positive_id(tg_id)
-        if kind not in ("link", "time") or not isinstance(kind, str):
+        if kind not in ("link", "time", "login") or not isinstance(kind, str):
             raise DomainError("输入会话类型无效")
         if type(ttl) is not int or ttl <= 0:
             raise DomainError("输入会话时限必须为正整数")
@@ -593,7 +707,7 @@ class AccountService:
 
     def input_state(self, tg_id) -> str:
         row = self.user(tg_id)
-        if row and row["input_until"] > self._now() and row["input_kind"] in ("link", "time"):
+        if row and row["input_until"] > self._now() and row["input_kind"] in ("link", "time", "login"):
             return row["input_kind"]
         return ""
 

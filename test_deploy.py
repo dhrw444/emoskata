@@ -2,9 +2,7 @@
 Run: python3 -B -m unittest -v test_deploy
 Build: python3 build_single.py | Deps: Python standard library.
 """
-import ast
 from contextlib import contextmanager
-from datetime import datetime, timezone
 import importlib.util
 import json
 import os
@@ -21,24 +19,17 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent
 from test_runtime import FakeTG, serve
+from test_support import configure, BUILD_FILES, fixture_app
 
 
 class DeployTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='emos-deploy-test-')
         self.addCleanup(self.temp.cleanup)
-        self.env = patch.dict(os.environ, {'DATA_DIR': self.temp.name,
-                                           'PANEL_PASSWORD': 'fixture_password'})
-        self.env.start()
-        self.addCleanup(self.env.stop)
-        for key in ('TG_BOT_TOKEN', 'SIGN_TIME', 'SIGN_TIMEZONE', 'EMOS_BASE_URL', 'EMOS_APP_USER_ID', 'PUBLIC_BASE'):
-            os.environ.pop(key, None)
-        spec = importlib.util.spec_from_file_location('deploy_fixture_app', ROOT / 'app.py')
-        self.app = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(self.app)
+        from test_support import fixture_app
+        self.app = fixture_app(self, self.temp.name, 'deploy_fixture_app')
         self.app.init_db()
         self.app.init_password()
-        self.app.set_setting('base_url', 'http://127.0.0.1:1')
 
     @contextmanager
     def panel(self):
@@ -86,9 +77,9 @@ class DeployTests(unittest.TestCase):
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM settings WHERE key LIKE 'oauth_%'").fetchone()[0], 0)
 
     def test_logged_in_management_lists_no_raw_credentials(self):
-        self.app.set_setting('tg_bot_token', '123456:fixture_bot_secret')
+        configure(self.app, tg_bot_token='123456:fixture_bot_secret')
         service = self.app.Store().accounts
-        service.begin_login(101)
+        service.begin_login(101, 'eFixture')
         service.finish_login(101, '11_fixture_sensitive', {'user_id': 'eFixture', 'telegram_user_id': 101})
         with self.panel() as server:
             cookie = self.cookie(server)
@@ -112,7 +103,7 @@ class DeployTests(unittest.TestCase):
                              {'Cookie': cookie, 'Sec-Fetch-Site': 'same-site'})[0], 403)
 
     def test_https_management_cookie_secure(self):
-        os.environ['PUBLIC_BASE'] = 'https://manage.example'
+        configure(self.app, public_base='https://manage.example')
         with self.panel() as server:
             _, headers, _ = self.request(server, '/api/login', 'POST', {'password': 'fixture_password'})
             self.assertIn('; Secure', headers['Set-Cookie'])
@@ -124,42 +115,57 @@ class DeployTests(unittest.TestCase):
             self.assertEqual(self.request(server, '/api/login', 'POST', '', {'Content-Length': '70000'})[0], 400)
 
     def test_settings_keep_existing_bot_token_when_field_blank(self):
-        self.app.set_setting('tg_bot_token', '123456:fixture_keep')
+        configure(self.app, tg_bot_token='123456:fixture_keep')
         with self.panel() as server:
             cookie = self.cookie(server)
-            data = {'tg_bot_token': '', 'emos_app_user_id': 'eAppFixture', 'sign_time': '00:15'}
+            data = {'tg_bot_token': '', 'sign_time': '01:15'}
             self.assertEqual(self.request(server, '/api/config', 'POST', data, {'Cookie': cookie})[0], 200)
         self.assertEqual(self.app.cfg_all()['tg_bot_token'], '123456:fixture_keep')
-        self.assertEqual(self.app.cfg_all()['emos_app_user_id'], 'eAppFixture')
         self.assertEqual(self.app.cfg_all()['sign_time'], '01:15')
 
     def test_invalid_config_rolls_back_not_half_written(self):
         old = self.app.cfg_all()
         with self.panel() as server:
             cookie = self.cookie(server)
-            data = {'content': 'x', 'base_url': 'file:///tmp/secret'}
+            data = {'sign_time': '10:30', 'base_url': 'file:///tmp/secret'}
             self.assertEqual(self.request(server, '/api/config', 'POST', data, {'Cookie': cookie})[0], 400)
-        self.assertEqual(self.app.cfg_all()['content'], old['content'])
+        self.assertEqual(self.app.cfg_all()['sign_time'], old['sign_time'])
         self.assertEqual(self.app.cfg_all()['base_url'], old['base_url'])
 
-    def test_environment_overrides_and_password_rotation_clear_sessions(self):
+    def test_process_environment_is_ignored_and_env_password_rotation_clears_sessions(self):
         old = self.app.create_session('127.0.0.1', 'fixture')
-        os.environ['TG_BOT_TOKEN'] = '123456:fixture_env'
-        os.environ['EMOS_APP_USER_ID'] = 'eAppEnv'
-        self.assertEqual(self.app.cfg_all()['tg_bot_token'], '123456:fixture_env')
-        self.assertEqual(self.app.cfg_all()['emos_app_user_id'], 'eAppEnv')
-        os.environ['PANEL_PASSWORD'] = 'new_fixture_password'
+        os.environ['TG_BOT_TOKEN'] = '123456:ignored_process_env'
+        os.environ['EMOS_APP_USER_ID'] = 'ignoredAppEnv'
+        self.assertEqual(self.app.cfg_all()['tg_bot_token'], '')
+        self.assertNotIn('emos_app_user_id', self.app.cfg_all())
+        configure(self.app, panel_password='new_fixture_password')
         self.app.init_password()
         self.assertFalse(self.app.session_ok(old))
         self.assertTrue(self.app.verify_password('new_fixture_password'))
 
     def test_blank_environment_variables_keep_management_configuration(self):
-        self.app.set_setting('tg_bot_token', '123456:fixture_stored')
-        self.app.set_setting('emos_app_user_id', 'eAppStored')
+        configure(self.app, tg_bot_token='123456:fixture_stored')
         os.environ['TG_BOT_TOKEN'] = ''
         os.environ['EMOS_APP_USER_ID'] = ''
         self.assertEqual(self.app.cfg_all()['tg_bot_token'], '123456:fixture_stored')
-        self.assertEqual(self.app.cfg_all()['emos_app_user_id'], 'eAppStored')
+        self.assertNotIn('emos_app_user_id', self.app.cfg_all())
+
+    def test_admin_configures_bot_not_users_official_id(self):
+        with self.panel() as server:
+            cookie = self.cookie(server)
+            body = {'tg_bot_token': '123456:fixture_from_web',
+                    'web_base_url': 'https://sign.example.com'}
+            self.assertEqual(self.request(server, '/api/config', 'POST', body, {'Cookie': cookie})[0], 200)
+            _, _, exposed = self.request(server, '/api/config', headers={'Cookie': cookie})
+            self.assertTrue(json.loads(exposed)['tg_bot_configured'])
+            self.assertNotIn('fixture_from_web', exposed)
+            page = self.request(server, '/', headers={'Cookie': cookie})[2]
+            self.assertIn('id="token"', page)
+            self.assertNotIn('id="app-id"', page)
+            self.assertIn('id="web-base"', page)
+        self.assertEqual(self.app.cfg_all()['tg_bot_token'], '123456:fixture_from_web')
+        self.assertNotIn('emos_app_user_id', self.app.cfg_all())
+        self.assertEqual(self.app.cfg_all()['web_base_url'], 'https://sign.example.com')
 
     def test_global_account_write_and_sign_routes_disabled(self):
         with self.panel() as server:
@@ -171,7 +177,7 @@ class DeployTests(unittest.TestCase):
     def test_rebuild_reproducible_and_namespace_separated(self):
         stage = Path(self.temp.name) / 'stage'
         stage.mkdir()
-        for file in ('build_single.py', 'app.py', 'emos.py', 'accounts.py', 'bot.py'):
+        for file in BUILD_FILES:
             shutil.copy2(ROOT / file, stage / file)
         subprocess.run([sys.executable, '-B', str(stage / 'build_single.py')], check=True, capture_output=True)
         first = (stage / 'emoskata.py').read_bytes()
@@ -191,21 +197,15 @@ class DeployTests(unittest.TestCase):
         stage.mkdir()
         sources = Path(self.temp.name) / 'sources'
         sources.mkdir()
-        for file in ('build_single.py', 'app.py', 'emos.py', 'accounts.py', 'bot.py'):
+        for file in BUILD_FILES:
             shutil.copy2(ROOT / file, sources / file)
         subprocess.run([sys.executable, '-B', str(sources / 'build_single.py')], check=True, capture_output=True)
         shutil.copy2(sources / 'emoskata.py', stage / 'emoskata.py')
-        spec = importlib.util.spec_from_file_location('single_runtime_fixture', stage / 'emoskata.py')
-        single = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(single)
+        single = fixture_app(self, stage, 'single_runtime_fixture', stage / 'emoskata.py')
         self.assertEqual([p.name for p in stage.glob('*.py')], ['emoskata.py'])
-        single.app.DATA_DIR = str(stage / 'data')
-        Path(single.app.DATA_DIR).mkdir()
-        single.app.DB_PATH = str(stage / 'data' / 'data.db')
         single.app.init_db()
         with serve() as (server, base):
-            single.app.set_setting('base_url', base)
-            single.app.set_setting('emos_app_user_id', 'eAppFixture')
+            configure(single.app, base_url=base)
             server.identities = {'11_singleA': {'user_id': 'eA', 'telegram_user_id': 101},
                                  '11_singleB': {'user_id': 'eB', 'telegram_user_id': 202}}
             tg = FakeTG()
@@ -216,11 +216,14 @@ class DeployTests(unittest.TestCase):
                     'from': {'id': actor}, 'chat': {'id': actor, 'type': 'private'}, 'text': text}})
             with patch.object(single.app._shutdown, 'wait', return_value=False):
                 for n, actor, token in ((1, 101, '11_singleA'), (3, 202, '11_singleB')):
-                    command(n, actor, '/login')
+                    command(n, actor, '/login ' + server.identities[token]['user_id'])
                     command(n + 1, actor, '/start emosLinkAgree-' + token)
                 service = single.app.Store().accounts
                 code = service.issue_code(202)
                 command(5, 101, '/link eB ' + code['code'])
+                a, b = service.active(101), service.active(202)
+                self.assertFalse(service.can_run(101, a['id'], b['id']))
+                service.review_link(202, a['id'], b['id'], True, expected_root=b['id'])
                 command(6, 101, '/sign')
                 self.assertEqual(server.signed, {'eA', 'eB'})
                 a, b = service.active(101), service.active(202)
@@ -228,6 +231,28 @@ class DeployTests(unittest.TestCase):
                 server.signed.clear()
                 command(7, 101, '/sign')
                 self.assertEqual(server.signed, {'eA'})
+                configure(single.app, web_base_url='http://127.0.0.1:8080')
+                web = single.app.personal_web()
+                self.addCleanup(web.stop)
+                from urllib.parse import parse_qs, urlsplit
+                login_code = parse_qs(urlsplit(web.issue_url(101)).fragment)['code'][0]
+                web_login = web.exchange(login_code)
+                self.assertEqual(web.authenticate(web_login['sid'])['tg_id'], 101)
+                page_state = web.state(101)
+                self.assertEqual([row['emos_id'] for row in page_state['owned']], ['eA'])
+                self.assertEqual(page_state['targets'], [])
+                issued = web.action(202, 'code', {'account_id': b['id']})
+                web.action(101, 'link', {'account_id': a['id'], 'target_emos_id': 'eB', 'code': issued['code']})
+                self.assertFalse(service.can_run(101, a['id'], b['id']))
+                web.action(202, 'review', {'account_id': b['id'], 'source_id': a['id'],
+                                         'target_id': b['id'], 'approve': True})
+                server.signed.clear()
+                started = web.start_sign(101, {'account_id': a['id'], 'request_id': 'fixture_single_web_0001'})
+                web.queue.join()
+                self.assertEqual([row['emos_id'] for row in web.job(101, started['job_id'])['rows']], ['eA', 'eB'])
+                self.assertEqual(server.signed, {'eA', 'eB'})
+                web.action(202, 'unlink', {'account_id': b['id'], 'source_id': a['id'], 'target_id': b['id']})
+                self.assertEqual(web.state(101)['targets'], [])
             instance.stop()
 
 

@@ -3,24 +3,20 @@ Run: python3 -B -m unittest -v test_runtime
 Deps: Python standard library; no Telegram or official server traffic.
 """
 import contextlib
-import importlib.util
 import json
 import os
 from pathlib import Path
-import queue
-import sqlite3
 import tempfile
 import threading
 import time
 import unittest
 from datetime import datetime, timezone
-from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent
 import bot
-from emos import EmosClient, EmosError
+from test_support import configure
 
 
 class Fixture(BaseHTTPRequestHandler):
@@ -52,23 +48,34 @@ class Fixture(BaseHTTPRequestHandler):
         if mode == 'invalid':
             return self.raw(401, {'message': 'Unauthenticated.'})
         if self.path == '/api/user':
-            return self.raw(200, profile)
-        if self.path == '/api/sign/check':
+            result = dict(profile)
+            if mode == 'empty_sign':
+                result['sign'] = {}
+            elif mode == 'no_sign':
+                result.pop('sign', None)
+            else:
+                result['sign'] = ({'earn_point': 3, 'continuous_days': 2, 'sign_index': 9}
+                                  if profile['user_id'] in self.server.signed else None)
             hook = self.server.check_hook
             if hook:
                 hook(profile['user_id'])
-            return self.raw(200, {'is_sign': profile['user_id'] in self.server.signed,
-                                  'user_id': profile['user_id']})
+            return self.raw(200, result)
+        if self.path == '/api/sign/check':
+            return self.raw(200, {'is_sign': True, 'user_id': profile['user_id']})
         return self.raw(404, {})
 
     def do_PUT(self):
         profile = self.identity()
         self.server.hits.append(('PUT', self.path.split('?')[0], profile['user_id']))
+        self.server.puts.append((self.path, self.rfile.read(int(self.headers.get('Content-Length') or 0))))
         mode = self.server.modes.get(profile['user_id'], '')
         if mode == 'rate':
             return self.raw(429, {'message': 'Too Many Requests'}, headers={'Retry-After': '600'})
         if mode == 'already429':
-            return self.raw(429, {'message': '今日已签到'})
+            return self.raw(429, {'message': '重复签到'})
+        if mode == 'custom':
+            status, body = self.server.custom
+            return self.raw(status, body)
         if mode == 'boom':
             return self.raw(500, {'message': 'Synthetic outage'})
         if mode == 'malformed':
@@ -82,6 +89,7 @@ def serve(handler=Fixture):
     server = ThreadingHTTPServer(('127.0.0.1', 0), handler)
     server.identities, server.modes = {}, {}
     server.signed, server.hits, server.check_hook = set(), [], None
+    server.puts = []
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -115,22 +123,10 @@ class RuntimeTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='emos-runtime-test-')
         self.addCleanup(self.temp.cleanup)
-        env = patch.dict(os.environ, {'DATA_DIR': self.temp.name, 'PANEL_PASSWORD': 'fixture_password',
-                                     'TG_BOT_TOKEN': '', 'EMOS_BASE_URL': '', 'SIGN_TIMEZONE': '',
-                                     'SIGN_TIME': '', 'EMOS_APP_USER_ID': ''})
-        env.start()
-        self.addCleanup(env.stop)
-        for key in ('TG_BOT_TOKEN', 'EMOS_BASE_URL', 'SIGN_TIMEZONE', 'SIGN_TIME', 'EMOS_APP_USER_ID'):
-            os.environ.pop(key, None)
-        spec = importlib.util.spec_from_file_location('runtime_fixture_app', ROOT / 'app.py')
-        self.app = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(self.app)
+        from test_support import fixture_app, configure
+        self.app = fixture_app(self, self.temp.name, 'runtime_fixture_app')
         self.app.init_db()
-        self.app.set_setting('timezone', 'UTC')
-        self.app.set_setting('sign_time', '08:00')
-        self.app.set_setting('emos_app_user_id', 'eApplication')
-        self.app.set_setting('base_url', 'http://127.0.0.1:1')
-        self.app.set_setting('tg_bot_token', 'fixture:bot')
+        configure(self.app, tg_bot_token='123456:fixture_bot')
         self.service = self.app.Store().accounts
         fast = patch.object(self.app._shutdown, 'wait', return_value=False)
         fast.start()
@@ -143,7 +139,7 @@ class RuntimeTests(unittest.TestCase):
         self.tokens = {101: '11_fixture_A', 202: '11_fixture_B', 303: '11_fixture_C'}
 
     def login(self, actor, official, base):
-        self.service.begin_login(actor)
+        self.service.begin_login(actor, official)
         return self.service.finish_login(actor, self.tokens[actor],
             {'user_id': official, 'username': official, 'telegram_user_id': actor}, base)
 
@@ -151,6 +147,8 @@ class RuntimeTests(unittest.TestCase):
         a, b = self.login(101, 'eA', base), self.login(202, 'eB', base)
         code = self.service.issue_code(202)
         self.service.redeem(101, 'eB', code['code'])
+        self.assertFalse(self.service.can_run(101, a['id'], b['id']))
+        self.service.review_link(202, a['id'], b['id'], True, expected_root=b['id'])
         return a, b
 
     def seed_http(self, server):
@@ -174,14 +172,14 @@ class RuntimeTests(unittest.TestCase):
     def test_actual_bot_login_link_sign_and_revoke(self):
         with serve() as (server, base):
             self.seed_http(server)
-            self.app.set_setting('base_url', base)
+            configure(self.app, base_url=base)
             tg = FakeTG()
             instance = bot.Bot('fixture:bot', self.app.Store(), tg=tg, synchronous=True)
             instance._accept_me(tg.get_me())
-            for actor in (101, 202, 303):
-                self.dispatch(instance, actor, '/login')
+            for actor, official in ((101, 'eA'), (202, 'eB'), (303, 'eC')):
+                self.dispatch(instance, actor, '/login ' + official)
                 url = tg.messages[-1][2][0][0]['url']
-                self.assertEqual(url, 'https://t.me/emospg_bot?start=link_eApplication-fixture_emos_bot')
+                self.assertEqual(url, 'https://t.me/emospg_bot?start=link_' + official + '-fixture_emos_bot')
                 self.dispatch(instance, actor, '/start emosLinkAgree-' + self.tokens[actor])
                 self.assertIsNotNone(self.service.active(actor, required=False))
             self.dispatch(instance, 202, '/code')
@@ -189,6 +187,9 @@ class RuntimeTests(unittest.TestCase):
             import re
             code = re.search(r'一次性码：<code>([^<]+)</code>', issued_text)[1]
             self.dispatch(instance, 101, '/link eB ' + code)
+            a, b = self.service.active(101), self.service.active(202)
+            self.assertFalse(self.service.can_run(101, a['id'], b['id']))
+            self.dispatch(instance, 202, data='review:%d:%d:%d:1' % (b['id'], a['id'], b['id']))
             self.dispatch(instance, 101, '/sign')
             self.assertEqual(server.signed, {'eA', 'eB'})
             self.assertNotIn(self.tokens[101], '\n'.join(text for _, text, _ in tg.messages))
@@ -220,6 +221,7 @@ class RuntimeTests(unittest.TestCase):
             c = self.login(303, 'eC', base)
             code = self.service.issue_code(303)
             self.service.redeem(202, 'eC', code['code'])
+            self.service.review_link(303, b['id'], c['id'], True, expected_root=c['id'])
             rows = self.app.run_user(101)
             self.assertEqual([row['id'] for row in rows], [a['id'], b['id']])
             self.assertEqual(server.signed, {'eA', 'eB'})
@@ -261,13 +263,32 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(len([hit for hit in server.hits if hit[0] == 'PUT']), 1)
             self.assertEqual(self.app._account_record(a['id'])['last_day'], '2026-11-07')
 
+    def test_auto_sign_honours_each_account_sign_mode(self):
+        with serve() as (server, base):
+            self.seed_http(server)
+            a = self.login(101, 'eA', base)
+            self.service.set_account(101, expected_root=a['id'], sign_mode='random')
+            self.hour = 10
+            self.assertEqual(len(self.app.scheduler_tick()), 1)
+            (path, body), = server.puts
+            self.assertIn('content=', path)
+            self.assertEqual(body, b'')
+
+    def test_auto_sign_normal_mode_has_no_content_parameter(self):
+        with serve() as (server, base):
+            self.seed_http(server)
+            self.login(101, 'eA', base)
+            self.hour = 10
+            self.assertEqual(len(self.app.scheduler_tick()), 1)
+            self.assertEqual(server.puts, [('/api/user/sign', b'')])
+
     def test_scheduler_runs_all_owned_not_only_active_selection(self):
         with serve() as (server, base):
             self.seed_http(server)
             self.login(101, 'eA', base)
-            self.service.begin_login(101)
+            self.service.begin_login(101, 'eA2')
             self.service.finish_login(101, '11_fixture_A2', {'user_id': 'eA2', 'telegram_user_id': 101}, base)
-            server.identities['11_fixture_A2'] = {'user_id': 'eA2', 'username': 'Second'}
+            server.identities['11_fixture_A2'] = {'user_id': 'eA2', 'username': 'Second', 'telegram_user_id': 101}
             self.assertEqual(len(self.app.scheduler_tick()), 2)
             self.assertEqual(server.signed, {'eA', 'eA2'})
 
@@ -392,6 +413,7 @@ class RuntimeTests(unittest.TestCase):
         c = self.login(303, 'eC', 'http://127.0.0.1:1')
         issued = self.service.issue_code(303)
         self.service.redeem(202, 'eC', issued['code'])
+        self.service.review_link(303, b['id'], c['id'], True, expected_root=c['id'])
         self.service.set_preferences(202, notify_success=False)
         self.app._queue_result({'id': c['id'], 'emos_id': 'eC', 'name': 'C', 'status': 'signed',
                                 'message': 'ok', 'carrot': 1}, self.app.cfg_all())
@@ -406,11 +428,11 @@ class RuntimeTests(unittest.TestCase):
                 raise RuntimeError('fixture abort')
         self.assertIsNone(self.app.get_setting('must_rollback'))
 
-    def test_new_environment_password_invalidates_old_cookie(self):
+    def test_new_env_file_password_invalidates_old_cookie(self):
         self.app.init_password()
         session = self.app.create_session('127.0.0.1', 'fixture')
         self.assertTrue(self.app.session_ok(session))
-        os.environ['PANEL_PASSWORD'] = 'fixture_password_rotated'
+        configure(self.app, panel_password='fixture_password_rotated')
         self.app.init_password()
         self.assertFalse(self.app.verify_password('fixture_password'))
         self.assertTrue(self.app.verify_password('fixture_password_rotated'))
@@ -418,9 +440,8 @@ class RuntimeTests(unittest.TestCase):
 
     def test_cancel_during_http_login_prevents_account_save(self):
         entered, release = threading.Event(), threading.Event()
-        self.app.set_setting('base_url', 'https://example.invalid')
+        configure(self.app, base_url='https://example.invalid')
         tg = FakeTG()
-        outer = self
         class WaitingClient:
             def __init__(self, *args):
                 pass
@@ -432,7 +453,7 @@ class RuntimeTests(unittest.TestCase):
                            synchronous=False, workers=2)
         instance._accept_me(tg.get_me())
         try:
-            self.dispatch(instance, 101, '/login')
+            self.dispatch(instance, 101, '/login eCancelled')
             instance._handle({'update_id': 2, 'message': {'message_id': 2,
                              'from': {'id': 101}, 'chat': {'id': 101, 'type': 'private'},
                              'text': '/start emosLinkAgree-11_fixture_pending'}})
@@ -459,11 +480,25 @@ class RuntimeTests(unittest.TestCase):
         with serve() as (server, base):
             self.seed_http(server)
             a = self.login(101, 'eA', base)
-            self.service.begin_login(101)
+            self.service.begin_login(101, 'eSecond')
             self.service.finish_login(101, '11_second_root', {'user_id': 'eSecond', 'telegram_user_id': 101}, base)
             with self.assertRaises(self.app.DomainError):
                 self.app.run_user(101, expected_root=a['id'])
             self.assertEqual(server.hits, [])
+
+    def test_logs_are_capped_per_account(self):
+        with serve() as (server, base):
+            self.seed_http(server)
+            a = self.login(101, 'eA', base)
+            cfg = self.app.cfg_all()
+            account = {'id': a['id'], 'token': self.tokens[101], 'emos_id': 'eA'}
+            for index in range(self.app.LOG_KEEP + 5):
+                self.app._store_result(account, {'status': 'failed', 'message': 'x%d' % index,
+                                                 'point': None}, cfg, 'auto')
+            with self.app.db() as conn:
+                count = conn.execute('SELECT COUNT(*) c FROM logs WHERE account_id=?',
+                                     (a['id'],)).fetchone()['c']
+            self.assertEqual(count, self.app.LOG_KEEP)
 
     def test_timezone_last_day_is_not_host_clock(self):
         os.environ['TZ'] = 'UTC'

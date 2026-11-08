@@ -8,7 +8,6 @@ import sys
 sys.dont_write_bytecode = True
 
 import hashlib
-import inspect
 import json
 import queue
 import re
@@ -81,7 +80,7 @@ class AccountCase(unittest.TestCase):
             AccountService.init_schema(conn)
 
     def login(self, tg_id, official, token=None, **extra):
-        self.service.begin_login(tg_id)
+        self.service.begin_login(tg_id, official)
         profile = {"user_id": official, "telegram_user_id": tg_id, "name": "账号" + str(official)}
         profile.update(extra)
         return self.service.finish_login(tg_id, token or "fake-token-" + str(official), profile)
@@ -91,7 +90,14 @@ class AccountCase(unittest.TestCase):
 
     def link(self, source_owner, target_owner):
         issued = self.service.issue_code(target_owner)
-        return self.service.redeem(source_owner, issued["target_emos_id"], issued["code"])
+        result = self.service.redeem(source_owner, issued["target_emos_id"], issued["code"])
+        source = self.service.active(source_owner)
+        target = self.service.active(target_owner)
+        self.assertTrue(result['pending'])
+        self.assertFalse(self.service.can_run(source_owner, source['id'], target['id']))
+        self.service.review_link(target_owner, source['id'], target['id'], True,
+                                 expected_root=target['id'])
+        return result
 
     def query(self, sql, params=()):
         with closing(self.store.db()) as conn:
@@ -140,7 +146,7 @@ class AccountCase(unittest.TestCase):
 
     def test_login_pending_expiration_and_cancel_are_isolated(self):
         with patch("accounts.time.time", return_value=1000):
-            self.service.begin_login(101)
+            self.service.begin_login(101, 'A')
             self.assertEqual(self.service.user(101)["login_until"], 1600)
             self.assertTrue(self.service.login_pending(101))
             self.assertFalse(self.service.login_pending(202))
@@ -151,8 +157,8 @@ class AccountCase(unittest.TestCase):
             with self.assertRaises(DomainError):
                 self.service.finish_login(101, "fake", {"user_id": "A"})
         self.assertEqual(self.count("accounts"), 0)
-        self.service.begin_login(101)
-        self.service.begin_login(202)
+        self.service.begin_login(101, 'A')
+        self.service.begin_login(202, 'A')
         self.service.cancel_login(101)
         self.assertFalse(self.service.login_pending(101))
         self.assertTrue(self.service.login_pending(202))
@@ -160,17 +166,16 @@ class AccountCase(unittest.TestCase):
     def test_finish_requires_pending_for_actor(self):
         with self.assertRaises(DomainError):
             self.service.finish_login(101, "fake", {"user_id": "A"})
-        self.service.begin_login(101)
+        self.service.begin_login(101, 'A')
         with self.assertRaises(DomainError):
             self.service.finish_login(202, "fake", {"user_id": "A", "telegram_user_id": 202})
         self.assertTrue(self.service.login_pending(101))
         self.assertEqual(self.count("accounts"), 0)
 
     def test_profile_id_and_telegram_identity_are_enforced(self):
-        self.service.begin_login(101)
+        self.service.begin_login(101, '123')
         for profile in ({}, {"id": "A"}, {"user_id": " "}, {"user_id": False},
                         {"user_id": []}, {"user_id": "A", "telegram_user_id": 202},
-                        {"user_id": "A", "telegram_user_id": None},
                         {"user_id": "A", "telegram_user_id": True}):
             with self.subTest(profile=profile), self.assertRaises(DomainError):
                 self.service.finish_login(101, "fake", profile)
@@ -179,12 +184,12 @@ class AccountCase(unittest.TestCase):
         account = self.service.finish_login(101, "fake", {"_user_id": 123, "telegram_user_id": "101"})
         self.assertEqual(account["emos_id"], "123")
         self.assertFalse(self.service.login_pending(101))
-        self.service.begin_login(101)
-        account = self.service.finish_login(101, "fake-two", {"user_id": "ABC"})
+        self.service.begin_login(101, 'ABC')
+        account = self.service.finish_login(101, "fake-two", {"user_id": "ABC", "telegram_user_id": 101})
         self.assertEqual(account["emos_id"], "ABC")
 
     def test_login_stores_verified_identity_and_only_safe_account_fields(self):
-        self.service.begin_login(101)
+        self.service.begin_login(101, '00123')
         account = self.service.finish_login(101, " fake-secret-A ",
                                             {"user_id": "00123", "telegram_user_id": 101,
                                              "_display": "已验证名字"}, " https://example.invalid ")
@@ -229,8 +234,9 @@ class AccountCase(unittest.TestCase):
 
     def test_cannot_steal_registered_official_id_or_token(self):
         a = self.login(101, "A", "fake-owner-A")
-        self.service.begin_login(202)
+        self.service.begin_login(202, 'A')
         for token, official in (("fake-new", "A"), ("fake-owner-A", "A"), ("fake-owner-A", "B")):
+            self.service.begin_login(202, official)
             with self.subTest(token=token, official=official), self.assertRaises(DomainError):
                 self.service.finish_login(202, token, {"user_id": official, "telegram_user_id": 202})
         self.assertEqual(self.count("accounts"), 1)
@@ -243,7 +249,7 @@ class AccountCase(unittest.TestCase):
 
     def test_conflicting_verified_id_for_same_owned_token_is_rejected(self):
         a = self.login(101, "A", "fake-shared")
-        self.service.begin_login(101)
+        self.service.begin_login(101, 'B')
         with self.assertRaises(DomainError):
             self.service.finish_login(101, "fake-shared", {"user_id": "B", "telegram_user_id": 101})
         self.assertEqual(self.count("accounts"), 1)
@@ -252,7 +258,7 @@ class AccountCase(unittest.TestCase):
 
     def test_legacy_official_id_cannot_be_claimed_with_different_token(self):
         self.mutate("INSERT INTO accounts(name,token,emos_id) VALUES('旧账号','fake-legacy','OLD')")
-        self.service.begin_login(101)
+        self.service.begin_login(101, 'OLD')
         with self.assertRaises(DomainError):
             self.service.finish_login(101, "fake-other", {"user_id": "OLD", "telegram_user_id": 101})
         self.assertEqual(self.query("SELECT owner_tg_id FROM accounts")[0]["owner_tg_id"], None)
@@ -356,6 +362,10 @@ class AccountCase(unittest.TestCase):
         linked = self.service.redeem(101, "B-200", issued["code"])
         self.assertEqual(linked["id"], b["id"])
         self.assertEqual(self.count("link_codes"), 0)
+        self.assertTrue(linked['pending'])
+        self.assertEqual(self.count('account_links'), 0)
+        self.assertFalse(self.service.can_run(101, a['id'], b['id']))
+        self.service.review_link(202, a['id'], b['id'], True)
         self.assertEqual(self.service.run_scope(101), {"root_id": a["id"], "account_ids": [a["id"], b["id"]]})
 
     def test_id_alone_bad_code_and_stale_code_never_authorize(self):
@@ -371,10 +381,13 @@ class AccountCase(unittest.TestCase):
         self.service.redeem(101, "B-200", new["code"])
         with self.assertRaises(DomainError):
             self.service.redeem(101, "B-200", new["code"])
+        self.assertEqual(self.count("account_links"), 0)
+        self.assertEqual(self.count('link_requests'), 1)
+        self.service.review_link(202, a['id'], b['id'], True)
         self.assertEqual(self.count("account_links"), 1)
 
     def test_code_expiration_boundary_and_issuer_ownership_match(self):
-        _, b, _ = self.trio()
+        a, b, _ = self.trio()
         with patch("accounts.time.time", return_value=1000):
             code = self.service.issue_code(202)
         with patch("accounts.time.time", return_value=1600), self.assertRaises(DomainError):
@@ -388,6 +401,8 @@ class AccountCase(unittest.TestCase):
         self.mutate("UPDATE link_codes SET issued_by=202")
         self.service.redeem(101, "B-200", code["code"])
         self.assertEqual(self.count("link_codes"), 0)
+        self.assertEqual(self.count('account_links'), 0)
+        self.service.review_link(202, a['id'], b['id'], True)
         self.assertEqual(self.query("SELECT target_id FROM account_links")[0]["target_id"], b["id"])
 
     def test_self_link_rejected_without_consuming_own_code(self):
@@ -429,14 +444,17 @@ class AccountCase(unittest.TestCase):
         actual = [outcomes.get_nowait(), outcomes.get_nowait()]
         self.assertEqual(sorted(row[1] for row in actual), ["denied", "ok"])
         winner = next(row[0] for row in actual if row[1] == "ok")
-        links = self.query("SELECT source_id,target_id FROM account_links")
+        self.assertEqual(self.count('account_links'), 0)
+        links = self.query("SELECT source_id,target_id FROM link_requests")
         self.assertEqual(links, [{"source_id": a["id"] if winner == 101 else c["id"], "target_id": b["id"]}])
+        self.service.review_link(202, links[0]['source_id'], b['id'], True)
+        self.assertEqual(self.count('account_links'), 1)
         self.assertEqual(self.count("link_codes"), 0)
 
     def test_code_consume_and_insert_roll_back_together(self):
         a, b, _ = self.trio()
         issued = self.service.issue_code(202)
-        self.mutate("CREATE TRIGGER reject_link BEFORE INSERT ON account_links BEGIN "
+        self.mutate("CREATE TRIGGER reject_link BEFORE INSERT ON link_requests BEGIN "
                     "SELECT RAISE(ABORT,'synthetic insertion failure'); END")
         with self.assertRaises(DomainError):
             self.service.redeem(101, "B-200", issued["code"])
@@ -444,6 +462,8 @@ class AccountCase(unittest.TestCase):
         self.assertEqual(self.count("account_links"), 0)
         self.mutate("DROP TRIGGER reject_link")
         self.service.redeem(101, "B-200", issued["code"])
+        self.assertFalse(self.service.can_run(101, a["id"], b["id"]))
+        self.service.review_link(202, a['id'], b['id'], True)
         self.assertTrue(self.service.can_run(101, a["id"], b["id"]))
 
     def test_one_hop_no_reverse_or_transitive_visibility_logs_or_run(self):
@@ -589,7 +609,7 @@ class AccountCase(unittest.TestCase):
         for payload in (self.service.active(101), self.service.owned(101), self.service.visible(101),
                         self.service.logs(101), self.service.watchers(a["id"]), self.service.user(101)):
             self.assert_no_credentials(payload, ("fake-payload-secret-A",))
-        self.service.begin_login(202)
+        self.service.begin_login(202, 'A')
         with self.assertRaises(DomainError) as caught:
             self.service.finish_login(202, "fake-payload-secret-A", {"user_id": "A", "telegram_user_id": 202})
         self.assertNotIn("fake-payload-secret-A", str(caught.exception))
@@ -623,7 +643,7 @@ class AccountCase(unittest.TestCase):
             self.assertEqual(self.service.input_state(101), "link")
         with patch("accounts.time.time", return_value=1600):
             self.assertEqual(self.service.input_state(101), "")
-        for kind, ttl in (("login", 600), ("", 1), ("link", 0), ("link", True), ("time", 2**64)):
+        for kind, ttl in (("invalid", 600), ("", 1), ("link", 0), ("link", True), ("time", 2**64)):
             with self.subTest(kind=kind, ttl=ttl), self.assertRaises(DomainError):
                 self.service.set_input(101, kind, ttl)
         self.service.set_input(101, "time")
@@ -666,7 +686,12 @@ class AccountCase(unittest.TestCase):
         replacement = self.service.issue_code(202)
         with patch("accounts.time.time", return_value=1060):
             self.service.redeem(101, "B-200", replacement["code"])
-        self.assertEqual(self.count("account_links"), 2)
+        self.assertEqual(self.count("account_links"), 0)
+        self.assertEqual(self.count('link_requests'), 2)
+        with patch('accounts.time.time', return_value=1060):
+            for row in self.query('SELECT source_id,target_id FROM link_requests'):
+                self.service.review_link(202, row['source_id'], row['target_id'], True)
+        self.assertEqual(self.count('account_links'), 2)
 
     def test_cascade_delete_clears_active_links_and_codes_not_legacy_logs(self):
         a, b, _ = self.trio()
@@ -684,7 +709,7 @@ class AccountCase(unittest.TestCase):
     def test_all_state_transitions_use_supplied_write_context(self):
         before = self.store.writes
         self.service.ensure_user(101)
-        self.service.begin_login(101)
+        self.service.begin_login(101, 'A')
         self.service.set_preferences(101, notify_already=True)
         self.service.set_input(101, "link")
         self.service.clear_input(101)
@@ -746,7 +771,7 @@ class MigrationCase(unittest.TestCase):
 
     def test_verified_exact_legacy_token_claims_same_row_without_deleting_history(self):
         self.migrate()
-        self.service.begin_login(101)
+        self.service.begin_login(101, 'OFFICIAL')
         account = self.service.finish_login(101, "fake-old-legacy",
                                             {"user_id": "OFFICIAL", "telegram_user_id": 101, "name": "新名字"})
         self.assertEqual(account["id"], 1)
@@ -829,7 +854,7 @@ class MigrationCase(unittest.TestCase):
         self.migrate()
         with self.store.write() as conn:
             conn.execute("INSERT INTO accounts(name,token,created) VALUES('旧重复','fake-old-legacy','重复历史')")
-        self.service.begin_login(101)
+        self.service.begin_login(101, 'OFFICIAL')
         account = self.service.finish_login(101, "fake-old-legacy", {"user_id": "OFFICIAL", "telegram_user_id": 101})
         self.assertEqual(account["id"], 1)
         self.assertEqual(len(self.rows("SELECT * FROM accounts")), 3)
@@ -869,7 +894,7 @@ def probes():
             AccountService.init_schema(conn)
         accounts = {}
         for actor, official in ((101, "A"), (202, "B"), (303, "C")):
-            service.begin_login(actor)
+            service.begin_login(actor, official)
             accounts[official] = service.finish_login(
                 actor, "probe-fake-" + official, {"user_id": official, "telegram_user_id": actor, "name": official})
         code = service.issue_code(202)
@@ -887,8 +912,11 @@ def probes():
             count = conn.execute("SELECT COUNT(*) FROM link_codes").fetchone()[0]
         print("PROBE wrong_id=" + json.dumps({"outcome": wrong, "remaining_codes": count}, sort_keys=True), flush=True)
         service.redeem(101, "B", code["code"])
+        print('PROBE before_confirmation=' + json.dumps(service.run_scope(101)), flush=True)
+        service.review_link(202, accounts['A']['id'], accounts['B']['id'], True)
         code_c = service.issue_code(303)
         service.redeem(202, "C", code_c["code"])
+        service.review_link(303, accounts['B']['id'], accounts['C']['id'], True)
         with store.write() as conn:
             for account in accounts.values():
                 conn.execute("INSERT INTO logs(account_id,name,ts,status,message) VALUES(?,?,'probe','signed','probe')",

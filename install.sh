@@ -14,16 +14,16 @@ if [ "$HERE" != "$DIR" ]; then
 fi
 chmod 700 "$DIR/data"
 if [ ! -f "$DIR/.env" ]; then
-    python3 -c 'import pathlib,secrets,sys; p=pathlib.Path(sys.argv[1])/".env"; p.write_text("PANEL_PASSWORD="+secrets.token_urlsafe(18)+"\nTG_BOT_TOKEN=\nEMOS_APP_USER_ID=\nPORT=8080\nHTTP_HOST=127.0.0.1\nSIGN_TIMEZONE=Asia/Shanghai\n");p.chmod(0o600)' "$DIR"
+    EMOS_ENV_FILE="$DIR/.env" python3 "$DIR/emoskata.py" --init-config
     echo "初始配置已写入 $DIR/.env（权限 600），凭据不打印。"
 fi
 if command -v systemctl >/dev/null 2>&1 && [ "$(id -u)" = 0 ]; then
-    python3 -c 'import pathlib,sys; d=sys.argv[1]; p=pathlib.Path("/etc/systemd/system/emoskata.service"); p.write_text("[Unit]\nDescription=emoskata Telegram signing Bot\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=simple\nWorkingDirectory="+d+"\nEnvironmentFile="+d+"/.env\nExecStart=/usr/bin/env python3 "+d+"/emoskata.py\nRestart=always\nRestartSec=5\nTimeoutStopSec=60\nUMask=0077\n[Install]\nWantedBy=multi-user.target\n")' "$DIR"
+    python3 -c 'import pathlib,sys; d=sys.argv[1]; p=pathlib.Path("/etc/systemd/system/emoskata.service"); p.write_text("[Unit]\nDescription=emoskata Telegram signing Bot\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=simple\nWorkingDirectory="+d+"\nEnvironment=EMOS_ENV_FILE="+d+"/.env\nExecStart=/usr/bin/env python3 "+d+"/emoskata.py\nRestart=always\nRestartSec=5\nTimeoutStopSec=120\nUMask=0077\n[Install]\nWantedBy=multi-user.target\n")' "$DIR"
     systemctl daemon-reload
     systemctl enable emoskata
     systemctl restart emoskata
     echo '服务已启动；日志用 journalctl -u emoskata -f。'
 else
-    echo "手动运行：cd $DIR && set -a && . ./.env && set +a && python3 emoskata.py"
+    echo "手动运行：EMOS_ENV_FILE=$DIR/.env python3 $DIR/emoskata.py"
 fi
-echo '配置 Bot Token 与应用创建者的 emos 用户 ID，再去 TG Bot 登录。'
+echo '管理员只配置 Bot Token；每个用户在自己的 TG Bot 登录流程填写本人 emos 用户 ID。'

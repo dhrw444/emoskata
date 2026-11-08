@@ -7,10 +7,11 @@ COPY emoskata.py /app/
 RUN apk add --no-cache tzdata && cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
 
 ENV TZ=Asia/Shanghai \
-    PORT=8080 \
-    PYTHONUNBUFFERED=1
+    EMOS_ENV_FILE=/app/config/.env \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
 
-VOLUME ["/app/data"]
+VOLUME ["/app/data", "/app/config"]
 EXPOSE 8080
 
 CMD ["python3", "emoskata.py"]
