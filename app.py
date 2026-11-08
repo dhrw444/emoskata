@@ -1181,6 +1181,75 @@ class _BoundedHTTPServer(ThreadingHTTPServer):
             self.slots.release()
 
 
+_PROBE_MARK = '__emoskata_probe_ok__'
+# 子进程里真的 exec 一遍新代码：__name__ 是 __probe__ 而不是 __main__，所以 main() 不会跑、
+# 端口不会被占，但模块顶层一崩（缺依赖、导入即抛、名字写错）都会在这里炸掉。
+_PROBE_BOOTSTRAP = (
+    "import os,sys\n"
+    "path = sys.argv[1]; mark = sys.argv[2]\n"
+    "with open(path, 'rb') as handle: source = handle.read()\n"
+    "sys.argv = [sys.argv[3]]\n"
+    "sys.path[0] = os.path.dirname(path)\n"
+    "exec(compile(source, path, 'exec'), {'__name__': '__probe__', '__file__': path,\n"
+    "                                    '__package__': None, '__spec__': None})\n"
+    "print(mark)\n"
+)
+
+
+def _probe_core(image, entry):
+    """在执行 execv 之前，先用子进程把新 py 真的跑一遍。
+
+    ast.parse 只能证明「语法合法」。真正会让服务躺下的是那种语法没错、一导入就崩的
+    文件（顶层写错一个名字、缺个导入）。以前只做编译检查，这种文件能一路过闸，
+    exec 之后进程直接消失 —— 这个门禁就是补这个洞。
+
+    两点讲究：
+    * 源码用**独立副本文件**传给子进程，不传共享 fd。父进程的临时文件 offset 会被
+      子进程的读取带到末尾，execv 之后新核心读到 0 字节，当场死掉（这个坑真踩过）。
+    * 用 .env 的副本跑。新版本若改了配置 schema，ConfigStore 会重写文件；那只能发生在
+      切换之后，不能发生在「自检没过、旧核心还在跑」的时候，否则旧版本下次启动会因为
+      不认识新键而直接起不来。
+    """
+    import shutil
+    import subprocess
+    import tempfile
+    workdir = tempfile.mkdtemp(prefix='.emos-probe-')
+    try:
+        try:
+            raw = CONFIG.path.read_bytes()
+        except OSError:
+            raise EnvConfigError('配置文件不可读取，无法做启动自检。当前核心保留运行。') from None
+        env_copy = os.path.join(workdir, '.env')
+        with open(env_copy, 'wb') as handle:
+            handle.write(raw)
+        os.chmod(env_copy, 0o600)
+        image.seek(0)
+        source_copy = os.path.join(workdir, os.path.basename(entry))
+        with open(source_copy, 'wb') as handle:
+            handle.write(image.read())
+        image.seek(0)
+        environment = dict(os.environ, EMOS_ENV_FILE=env_copy, PYTHONDONTWRITEBYTECODE='1')
+        for key in ('PORT', 'HTTP_ENABLED', 'DATA_DIR', 'TG_BOT_TOKEN', 'TG_ALLOWED_USER_IDS'):
+            environment.pop(key, None)
+        try:
+            done = subprocess.run(
+                [sys.executable, '-u', '-c', _PROBE_BOOTSTRAP, source_copy, _PROBE_MARK, entry],
+                cwd=workdir, env=environment, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=90)
+        except subprocess.TimeoutExpired:
+            raise EnvConfigError('新 py 启动自检 90 秒未完成，已拒绝重启，当前核心保留运行。') from None
+        except OSError:
+            raise EnvConfigError('无法启动自检进程，已拒绝重启，当前核心保留运行。') from None
+        output = (done.stdout or b'').decode('utf-8', 'replace')
+        if done.returncode != 0 or _PROBE_MARK not in output:
+            tail = [line.strip() for line in output.strip().splitlines() if line.strip()][-3:]
+            raise EnvConfigError(
+                '新 py 语法合法，但启动自检失败（退出码 %s）：%s。当前核心保留运行，文件未切换。'
+                % (done.returncode, ' | '.join(tail) if tail else '无输出'))
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def _prepare_core():
     import ast
     import tempfile
@@ -1210,9 +1279,15 @@ def _prepare_core():
                     compile(handle.read(2097152), path, 'exec')
         CONFIG.snapshot(force=True)
         image = tempfile.TemporaryFile()
-        image.write(source)
-        image.flush()
-        image.seek(0)
+        try:
+            image.write(source)
+            image.flush()
+            image.seek(0)
+            _probe_core(image, entry)
+        except BaseException:
+            # 自检没过就别把临时文件留成悬空句柄（ResourceWarning 抓到过一次）。
+            image.close()
+            raise
         return image
     except EnvConfigError:
         raise

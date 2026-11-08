@@ -21,12 +21,14 @@
 17. **生产规则补真测试**：`test_bot` 用的 `FakeAccounts` 自己复刻了 `sign_mode` 校验，导致生产规则零覆盖（变异测试证实：删掉 `accounts.py` 的校验，`test_bot`/`test_accounts` 全绿）。新增 `test_accounts.AccountCase.test_set_account_sign_mode_whitelist_and_persistence`，用变异测试确认能抓到删除。
 18. **替身签名守卫**：`test_bot` 的 `FakeAccounts` 复刻了 27 个生产方法，签名漂移会让 Bot 层测试假通过（实测生产 `toggle_link` 已多出 `enabled`，替身没跟上）。新增 `test_bot_fake_matches_production_signatures` 双向校验：同名方法签名必须一致，且生产新增的公开异步方法不能缺席。变异测试确认：给生产加尾部参数 → 失败；给生产加新公开方法 → 失败。
 19. **单文件漂移门禁**：`build_single.py --check` 只比较不写，CI 用它拦住「磁盘模块改了但 `emoskata.py` 没重建」（Docker 只拷 `emoskata.py`，这种漂移会让镜像跑旧代码）。实测把 `emos.py` 改回旧写法后 `--check` 返回 exit=1。
+20. **启动自检（真执行，不只是编译）**：`_prepare_core` 原来只做 `ast.parse` + `compile`，语法合法但一导入就崩的文件能一路过闸，`execv` 之后进程直接消失，服务再也起不来。现在在 `execv` 前用子进程真的 exec 一遍新 py（`__name__='__probe__'`，`main()` 不跑、端口不占），退出码非 0 就 400 拒绝切换，旧核心继续服务。源码走独立副本文件（子进程读共享 fd 会把 offset 带到末尾，execv 后新核心读到 0 字节当场死掉——这个坑真踩过）；`.env` 也走副本，避免「自检没过但配置已被新 schema 重写」。
+21. **关掉自检失败的临时文件**：`_prepare_core` 里 `TemporaryFile` 在自检抛错时原样泄漏，`-W error::ResourceWarning` 抓到，已改为失败即 close。
 
 ## 主审实际执行
 
 ```sh
-python3 -B -m unittest discover -s . -p 'test_*.py'   # 209 项，OK
-python3 -B build_single.py                            # 249465 字节，7 个隔离模块
+python3 -B -m unittest discover -s . -p 'test_*.py'   # 231 项，OK
+python3 -B build_single.py                            # 270651 字节，7 个隔离模块
 python3 -B build_single.py --check                    # 单文件与磁盘模块一致（CI 门禁）
 python3 -B check_web_js.py                            # 内嵌 JS 语法通过
 python3 -m pyflakes *.py                              # 无输出

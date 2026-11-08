@@ -21,6 +21,34 @@ from test_support import fixture_app
 ROOT = Path(__file__).resolve().parent
 
 
+def _single_file(sources):
+    """按 build_single.py 的 bootstrap 形状拼一个最小单文件。
+
+    测试夹具必须长得像真文件：只有 _SOURCES 赋值的话，模块根本不会被执行，
+    「导入即崩」的测试就永远在测空气（这个坑真踩过）。
+    """
+    return ('''import sys as _sys
+import types as _types
+import importlib.util as _import_util
+
+_SOURCES = %r
+_package_name = '_emoskata_embedded'
+_package = _types.ModuleType(_package_name)
+_package.__path__ = []
+_package.__file__ = __file__
+_sys.modules[_package_name] = _package
+for _name, _source in _SOURCES.items():
+    _qualified = _package_name + '.' + _name
+    _module = _types.ModuleType(_qualified)
+    _module.__file__ = __file__
+    _module.__package__ = _package_name
+    _module.__spec__ = _import_util.spec_from_loader(_qualified, loader=None)
+    _sys.modules[_qualified] = _module
+    setattr(_package, _name, _module)
+    exec(compile(_source, __file__ + ':' + _name, 'exec'), _module.__dict__)
+''' % (sources,))
+
+
 def request(port, path, body=None, cookie=''):
     client = HTTPConnection('127.0.0.1', port, timeout=3)
     client.request('POST' if body is not None else 'GET', path,
@@ -173,6 +201,61 @@ class UpdateTests(unittest.TestCase):
         with patch.object(module, '__file__', str(self.entry)), self.assertRaises(EnvConfigError):
             module._prepare_core()
         self.assertFalse(module._shutdown.is_set())
+
+    def test_preflight_rejects_import_time_crash_that_is_syntactically_valid(self):
+        # 语法合法、一导入就抛：只有真的执行过一遍才拦得住。以前这里只 compile，
+        # 这种文件能一路过闸，execv 之后进程直接消失 —— 服务再也起不来。
+        #
+        # 夹具必须带真实的 bootstrap（把内嵌模块 exec 进 sys.modules）。
+        # 只有 _SOURCES 赋值的话，模块根本不会被执行，这个测试就永远在测空气。
+        module = fixture_app(self, self.root / 'fixture', 'crash_app')
+        body = {name: "VALUE = 1\n" for name in
+                ('envconfig', 'runtime_info', 'emos', 'accounts', 'webui', 'bot', 'app')}
+        with patch.object(module, '__file__', str(self.entry)):
+            self.entry.write_text(_single_file(body))
+            image = module._prepare_core()      # 干净版本要能过闸
+            image.close()
+            broken = dict(body, app="raise RuntimeError('导入即崩')\n")
+            self.entry.write_text(_single_file(broken))
+            with self.assertRaises(EnvConfigError) as caught:
+                module._prepare_core()
+            self.assertIn('自检', str(caught.exception))
+            self.assertIn('导入即崩', str(caught.exception))
+        self.assertFalse(module._shutdown.is_set())
+
+    def test_probe_does_not_consume_the_image_that_execv_needs(self):
+        # 自检用共享 fd 读一遍会把 offset 带到末尾，execv 后新核心读到 0 字节当场死亡。
+        # 这个测试盯的就是「自检跑完之后 image 仍从 0 开始」。
+        module = fixture_app(self, self.root / 'fixture', 'offset_app')
+        body = {name: "VALUE = 1\n" for name in
+                ('envconfig', 'runtime_info', 'emos', 'accounts', 'webui', 'bot', 'app')}
+        self.entry.write_text(_single_file(body))
+        with patch.object(module, '__file__', str(self.entry)):
+            image = module._prepare_core()
+            try:
+                self.assertEqual(image.read(), self.entry.read_bytes())
+            finally:
+                image.close()
+
+    def test_probe_uses_a_copy_of_the_env_file(self):
+        # 新版本改了配置 schema 时，自检里的 ConfigStore 会重写 .env。
+        # 那只能发生在切换之后 —— 现在拿副本跑，真文件必须一个字节都没动。
+        #
+        # 判据要「主动改写」才算数：光比字节的话，自带完整 .env 根本不会触发重写，
+        # 用真文件跑也一样不变，测试等于没测（变异验证抓到过这个洞）。
+        module = fixture_app(self, self.root / 'fixture', 'envcopy_app')
+        body = {name: "VALUE = 1\n" for name in
+                ('envconfig', 'runtime_info', 'emos', 'accounts', 'webui', 'bot', 'app')}
+        body['app'] = ("import os\n"
+                       "import pathlib\n"
+                       "_target = pathlib.Path(os.environ['EMOS_ENV_FILE'])\n"
+                       "_target.write_bytes(_target.read_bytes() + b'# probe rewrote me\\n')\n")
+        self.entry.write_text(_single_file(body))
+        original = module.CONFIG.path.read_bytes()
+        with patch.object(module, '__file__', str(self.entry)):
+            image = module._prepare_core()
+            image.close()
+        self.assertEqual(module.CONFIG.path.read_bytes(), original)
 
 
 if __name__ == '__main__':
