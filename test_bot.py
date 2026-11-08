@@ -1,9 +1,7 @@
-"""Bot 路由、消息失败、队列、菜单和替身签名回归。
+"""Bot 路由、消息失败、任务队列、菜单和替身签名回归。
 
-仅使用临时目录、伪凭证和本地服务；不把替身成功视为生产授权或容器验收。
-Runtime: Python 3.10+ / 标准库。
-Test: python3 -B -m unittest test_bot
-"""
+夹具只使用临时或演练数据；本地通过不代表真实官方授权。
+Test: python3 -B -m unittest test_bot。"""
 
 from collections import deque
 from contextlib import redirect_stdout
@@ -108,7 +106,8 @@ class FakeAccounts:
         self.cancel_login(tg_id)
         return row
 
-    def login_with_token(self, tg_id, token, profile, base_url="", expected_root=None):
+    def login_with_token(self, tg_id, token, profile, base_url="", expected_root=None,
+                         expected_login_revision=None):
         """只用于 Bot 交互测试；真实域权限由 test_owner_accounts 覆盖。"""
         if not self.primary_account(tg_id):
             raise DomainError('请先官方授权主账号')
@@ -132,6 +131,25 @@ class FakeAccounts:
         self.tokens[row["id"]] = token
         self.users[tg_id]["active_account_id"] = row["id"]
         return row
+
+    def logout(self, tg_id, account_id=None, all_accounts=False, expected_root=None):
+        selected = self.active(tg_id, required=False)
+        if expected_root is not None and (selected['id'] if selected else 0) != expected_root:
+            raise DomainError('当前账号已切换')
+        if type(all_accounts) is not bool or (all_accounts and account_id is not None):
+            raise DomainError('退出范围无效')
+        target = account_id if account_id is not None else (selected['id'] if selected else None)
+        ids = [aid for aid in self.rows if self.owners[aid] == tg_id and (all_accounts or aid == target)]
+        if not ids:
+            raise DomainError('没有可退出的本人账号')
+        cleared = sum(bool(self.tokens.get(aid)) for aid in ids)
+        for aid in ids:
+            self.tokens[aid] = ''
+            self.rows[aid].update(enabled=0, auto_sign=0, logged_in=False)
+        self.cancel_login(tg_id)
+        self.clear_input(tg_id)
+        return {'account_ids': ids, 'accounts': len(ids), 'tokens_cleared': cleared,
+                'all_accounts': all_accounts, 'local_only': True}
 
     def owned(self, tg_id):
         return [dict(row) for aid, row in self.rows.items() if self.owners[aid] == tg_id]
@@ -537,16 +555,30 @@ class BotTests(unittest.TestCase):
         self.assertTrue(self.store.accounts.login_pending(101))
         self.assertLessEqual(self.store.accounts.user(101)["login_until"], int(time.time()) + 600)
 
-    def test_missing_user_id_prompts_personal_input_not_admin_configuration(self):
+    def test_missing_configured_user_id_reports_env_key_without_asking_for_input(self):
+        # 未配置 EMOS_USER_ID 时不进入输入态，只指向 .env 的配置项。
         self.message("/login")
         self.assertFalse(any(button.get('url','').startswith('https://t.me/emospg_bot') for button in self.buttons()))
-        self.assertIn('自己的 emos 用户 ID', self.text())
-        self.assertNotIn('EMOS_APP_USER_ID', self.text())
+        self.assertIn('EMOS_USER_ID', self.text())
+        self.assertIn('.env', self.text())
         self.assertFalse(self.store.accounts.login_pending(101))
-        self.assertEqual(self.store.accounts.input_state(101), 'login')
-        self.message('eVerified')
+        self.assertEqual(self.store.accounts.input_state(101), '')
+
+    def test_configured_user_id_jumps_to_official_bot_without_asking(self):
+        # 配好 EMOS_USER_ID 后 /login 直接给出官方授权链接，不再索要 ID。
+        self.store.config['emos_user_id'] = 'eConfigured'
+        self.message("/login")
+        urls = [button["url"] for button in self.buttons() if "url" in button]
+        self.assertEqual(urls, ["https://t.me/emospg_bot?start=link_eConfigured-emos_test_bot"])
         self.assertTrue(self.store.accounts.login_pending(101))
-        self.assertEqual(self.store.accounts.user(101)['login_emos_id'],'eVerified')
+        self.assertEqual(self.store.accounts.user(101)['login_emos_id'], 'eConfigured')
+        self.assertEqual(self.store.accounts.input_state(101), '')
+
+    def test_explicit_argument_overrides_configured_user_id(self):
+        self.store.config['emos_user_id'] = 'eConfigured'
+        self.message("/login eOverride")
+        urls = [button["url"] for button in self.buttons() if "url" in button]
+        self.assertEqual(urls, ["https://t.me/emospg_bot?start=link_eOverride-emos_test_bot"])
 
     def test_agreement_verified_saved_deleted_not_echoed(self):
         self.message("/login eVerified")
@@ -626,7 +658,7 @@ class BotTests(unittest.TestCase):
         other = self.own(202, "eB")
         self.callback("switch:%d:%d" % (a["id"], other["id"]))
         self.assertEqual(self.store.accounts.active(101)["id"], a["id"])
-        self.assertIn("本人", self.text())
+        self.assertIn("只能选择已登录的账号", self.text())
 
     def test_old_root_callbacks_reject_after_switch(self):
         a = self.own()

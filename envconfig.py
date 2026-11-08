@@ -1,10 +1,7 @@
-"""配置 schema、校验、原子保存及解析缓存。
+""".env 的 schema、输入校验、原子保存与文件指纹缓存。
 
-只有首次创建 .env 才继承同名环境值；运行中以文件为准。
-EMOS_ENV_FILE 仅选路径，热配置通过 stat 指纹重新读取；监听和工作池参数需重启。
-Runtime: Python 3.10+ / 标准库。
-Test: python3 -B -m unittest test_runtime
-"""
+环境变量只在首次创建文件时播种；运行中以文件为准，部分字段重启生效。
+Runtime: Python 3.10+，标准库；文件锁使用 POSIX fcntl。"""
 from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
@@ -55,20 +52,25 @@ SCHEMA = {
     'RETRY_DELAYS': Field('300,900,2700', '失败退避（秒）', '1–5 档递增，每档至少 300 秒；当天耗尽后停止。', 'delays'),
     'BOT_WORKERS': Field('2', 'Bot 操作线程数', '默认 2；1 更省内存，最多 8。', 'int', 1, 8, restart=True),
     'BOT_MAX_JOBS': Field('16', 'Bot 待办上限', '包含正在运行任务；达到上限后明确拒绝新操作。', 'int', 4, 128, restart=True),
-    'TG_ALLOWED_USER_IDS': Field('', '本人 TG 用户 ID',
+    'TG_ALLOWED_USER_IDS': Field('', '唯一 TG 用户 ID',
                                  '只填一个正整数 ID；同时作为通知接收人。留空关闭 Bot 和个人网页入口。', 'owner_id'),
+    'EMOS_USER_ID': Field('', 'emos 用户 ID',
+                          'emos 官网账号卡片上的用户 ID；填写后 /login 直接跳转官方 Bot，不再要求输入。', 'emos_id'),
+    'EMOS_AUTH_BOT': Field('emospg_bot', 'emos 官方授权 Bot',
+                           '官方授权入口的 Bot 用户名，不含 @；官方变更时只改这里。', 'tg_bot'),
     'TG_POLL_TIMEOUT': Field('45', 'TG 长轮询等待（秒）', '延长空闲等待减少连接与 CPU；范围 10–50。', 'int', 10, 50, restart=True),
     'SCHEDULER_INTERVAL': Field('60', '本地调度检查（秒）', '只检查本地数据库，不轮询官方接口。', 'int', 15, 300),
     'HTTP_REQUEST_TIMEOUT': Field('15', '网页请求超时（秒）', '防止空连接永久占用线程。', 'int', 3, 60, restart=True),
     'HTTP_MAX_CONNECTIONS': Field('8', '网页并发连接上限', '超出立即返回忙碌；减少线程和内存峰值。', 'int', 2, 64, restart=True),
     'ADMIN_SESSION_HOURS': Field('24', '管理员会话（小时）', '管理员 Cookie 有效期；改密码会清除管理员会话。', 'int', 1, 168),
-    'WEB_SESSION_HOURS': Field('168', '个人网页会话（小时）', '只代表本人，不获得其他账号登录权限。', 'int', 1, 168),
+    'WEB_SESSION_HOURS': Field('168', '个人网页会话（小时）', '只代表当前 TG 用户，不获得其他账号登录权限。', 'int', 1, 168),
     'SHUTDOWN_TIMEOUT': Field('90', '软重启收尾上限（秒）', '停止接新任务并等待网络任务结束；未收尾不会强行 exec。', 'int', 30, 300),
 }
 _RETIRED_KEYS = frozenset({'EMOS_APP_USER_ID', 'SIGN_CONTENT'})
 CFG_TO_ENV = {
     'tg_bot_token': 'TG_BOT_TOKEN', 'tg_api_base_url': 'TG_API_BASE_URL',
     'tg_allowed_user_ids': 'TG_ALLOWED_USER_IDS',
+    'emos_user_id': 'EMOS_USER_ID', 'emos_auth_bot': 'EMOS_AUTH_BOT',
     'base_url': 'EMOS_BASE_URL',
     'web_base_url': 'WEB_BASE_URL', 'public_base': 'PUBLIC_BASE',
     'sign_time': 'SIGN_TIME', 'timezone': 'SIGN_TIMEZONE',
@@ -201,6 +203,15 @@ def validate_env(values, allow_unset_password=False):
             # 空值用于首次配置；权限入口必须拒绝空身份，不能当作不限用户。
             if value and (not re.fullmatch(r'[1-9][0-9]{0,18}', value) or int(value) >= 2**63):
                 raise EnvConfigError('%s 只能填一个正整数 TG 用户 ID。' % key)
+        elif field.kind == 'tg_bot':
+            # Telegram 用户名规则：字母开头，5–32 位字母数字下划线。
+            if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{4,31}', value):
+                raise EnvConfigError('%s 只能填 Bot 用户名，不含 @，5–32 位。' % key)
+        elif field.kind == 'emos_id':
+            # 与 Bot 侧同一判据：只收官网用户 ID，拒绝误填 emos Token。
+            if value and (not re.fullmatch(r'[A-Za-z0-9_]{1,48}', value)
+                          or re.fullmatch(r'[0-9]+_[A-Za-z0-9_-]{8,}', value)):
+                raise EnvConfigError('%s 只能填 emos 官网用户 ID，不要填 Token。' % key)
         elif field.kind == 'delays':
             pieces = value.split(',')
             if not 1 <= len(pieces) <= 5 or any(not p.strip().isdigit() for p in pieces):

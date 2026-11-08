@@ -1,11 +1,8 @@
-"""SQLite 持久化、账号调度、通知、HTTP 和应用核心生命周期。
+"""SQLite、调度、通知、管理员 HTTP 与应用核心生命周期。
 
-配置来自 .env；相对 DATA_DIR 固定在入口文件目录。写事务与借出连接纳入排空。
-稳态一个进程，预检临时启动子进程；仅验证导入，不承诺启动健康或自动回滚。
-Run: python3 emoskata.py（单文件）或 python3 app.py（需同目录模块）
-Runtime: Python 3.10+ / 标准库。
-Test: python3 -B -m unittest test_runtime test_update test_quality_runtime
-"""
+配置和数据路径在启动时固定；更新先隔离预检，再排空任务并在同 PID 切换。
+Run: python3 emoskata.py；分模块运行用 python3 app.py。
+Runtime: Python 3.10+，标准库，POSIX。"""
 
 import hashlib
 import html
@@ -32,6 +29,14 @@ from runtime_info import container_ip, snapshot as resource_snapshot
 from emos import EmosClient, EmosError, clamp_sign_time, pick_content
 from accounts import AccountService, DomainError
 from webui import WebService, render_page
+from updates import (recover_entry, capture_image, mark_ready, exec_update,
+                     restore_missing_entry, snapshot_database)
+
+# 恢复未完成的更新必须发生在读取配置、打开数据库和创建线程之前。
+recover_entry(__file__)
+capture_image(__file__, globals().get('__emos_image__'))
+_STARTUP_PROBE = os.environ.get('EMOS_STARTUP_PROBE') == '1'
+_CORE_START_GATE = threading.Event()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG = ConfigStore(config_path(__file__), create=True)
@@ -61,9 +66,13 @@ _active_bot = None
 _active_bot_lock = threading.Lock()
 _notifications = queue.Queue(maxsize=256)
 _notification_drops = 0
+_notification_wakeup = threading.Event()
 
 
 def request_restart():
+    """在锁内固定并预检候选字节，成功后进入排空状态。
+
+    已有重启或正在停机返回 False；候选失败抛配置错误，旧核心继续运行。"""
     global _restart_status, _restart_error, _restart_image
     with _restart_lock:
         if _restart_requested.is_set() or _shutdown.is_set():
@@ -77,16 +86,51 @@ def request_restart():
 
 
 _db_pool_lock = threading.Lock()
+_db_available = threading.Condition(_db_pool_lock)
 _db_pool = []
+_db_owners = set()
+_db_quarantine = []
 _db_borrowed = 0
-# 只限制归还后的空闲缓存；活跃连接数不由此常量封顶。
+_db_total = 0
+_db_closing = 0
+_db_waiters = 0
+_db_sealed = False
+_db_purging = False
 _DB_IDLE_LIMIT = 3
+_DB_TOTAL_LIMIT = 8
+_DB_WAIT_TIMEOUT = 20.0
 LOG_KEEP = 200
 
 
+class DatabaseBusy(sqlite3.OperationalError):
+    """数据库达到容量或正在收尾；不暴露 SQL、凭据和底层异常。"""
+
+
+def _close_physical(connection):
+    global _db_total, _db_closing
+    failed = False
+    try:
+        connection.close()
+    except BaseException:
+        failed = True
+    finally:
+        with _db_available:
+            _db_closing -= 1
+            if failed:
+                _db_quarantine.append(connection)
+            else:
+                _db_total -= 1
+            _db_available.notify_all()
+    if failed:
+        raise DatabaseBusy('数据库连接关闭未完成；暂不接收新租约。') from None
+
+
 class _Connection:
-    def __init__(self, connection):
+    def __init__(self, connection, owner):
         self.connection = connection
+        self.owner = owner
+        self._lock = threading.Lock()
+        self._discard = False
 
     def __getattr__(self, name):
         if self.connection is None:
@@ -99,56 +143,129 @@ class _Connection:
     def __exit__(self, *args):
         try:
             return self.connection.__exit__(*args)
+        except BaseException:
+            self._discard = True
+            raise
         finally:
             self.close()
 
     def close(self):
-        global _db_borrowed
-        connection, self.connection = self.connection, None
+        global _db_borrowed, _db_closing
+        with self._lock:
+            connection, self.connection = self.connection, None
         if connection is None:
             return
         try:
             if connection.in_transaction:
                 connection.rollback()
-        except sqlite3.Error:
-            connection.close()
-            connection = None
-        with _db_pool_lock:
+        except BaseException:
+            self._discard = True
+        with _db_available:
             _db_borrowed -= 1
-            if connection is not None and len(_db_pool) < _DB_IDLE_LIMIT:
+            _db_owners.discard(self.owner)
+            if not self._discard and not _db_sealed and len(_db_pool) < _DB_IDLE_LIMIT:
                 _db_pool.append(connection)
+                _db_available.notify_all()
                 return
-        if connection is not None:
-            connection.close()
+            _db_closing += 1
+        _close_physical(connection)
 
 
 def db():
-    """借用或按需创建 SQLite 连接；归还时最多缓存三个空闲连接。
+    """最多八个物理 SQLite 连接；含创建和关闭中的连接，空闲缓存最多三个。
 
-    活跃连接数受调用方并发影响，此处不是总连接数上限。
+    满容量有限等待；禁止同线程嵌套借用，内部查询必须复用已有 conn。
+    创建失败归还预约；物理关闭失败隔离连接，不能继续补建绕过上限。
     """
-    global _db_borrowed
-    with _db_pool_lock:
-        connection = _db_pool.pop() if _db_pool else None
-    if connection is None:
-        connection = sqlite3.connect(DB_PATH, timeout=20, check_same_thread=False)
-        connection.row_factory = sqlite3.Row
-        connection.execute('PRAGMA foreign_keys=ON')
-        connection.execute('PRAGMA cache_size=-256')
-    with _db_pool_lock:
-        _db_borrowed += 1
-    return _Connection(connection)
+    global _db_borrowed, _db_total, _db_waiters, _db_closing
+    owner = threading.get_ident()
+    connection = None
+    reserved_new = False
+    deadline = time.monotonic() + _DB_WAIT_TIMEOUT
+    with _db_available:
+        if owner in _db_owners:
+            raise sqlite3.ProgrammingError('嵌套查询必须复用当前数据库连接。')
+        _db_waiters += 1
+        try:
+            while True:
+                if _db_sealed or _db_quarantine:
+                    raise DatabaseBusy('数据库正在收尾，请稍后重试。')
+                if not _db_purging and _db_borrowed < _DB_TOTAL_LIMIT:
+                    if _db_pool:
+                        connection = _db_pool.pop()
+                        break
+                    if _db_total < _DB_TOTAL_LIMIT:
+                        _db_total += 1
+                        reserved_new = True
+                        break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise DatabaseBusy('数据库并发已满，请稍后重试。')
+                _db_available.wait(remaining)
+            _db_borrowed += 1
+            _db_owners.add(owner)
+        finally:
+            _db_waiters -= 1
+    try:
+        if reserved_new:
+            connection = sqlite3.connect(DB_PATH, timeout=20, check_same_thread=False)
+            connection.row_factory = sqlite3.Row
+            connection.execute('PRAGMA foreign_keys=ON')
+            connection.execute('PRAGMA cache_size=-256')
+        return _Connection(connection, owner)
+    except BaseException:
+        with _db_available:
+            _db_borrowed -= 1
+            _db_owners.discard(owner)
+            if connection is None:
+                _db_total -= int(reserved_new)
+            else:
+                _db_closing += 1
+            _db_available.notify_all()
+        if connection is not None:
+            _close_physical(connection)
+        raise
 
 
 def close_idle_db():
-    with _db_pool_lock:
-        connections, _db_pool[:] = list(_db_pool), []
-    for connection in connections:
-        connection.close()
+    """同步关闭空闲和隔离连接，关闭完成前暂停新的预约。"""
+    global _db_closing, _db_purging
+    with _db_available:
+        while _db_purging:
+            _db_available.wait()
+        _db_purging = True
+        connections = list(_db_pool) + list(_db_quarantine)
+        _db_pool.clear()
+        _db_quarantine.clear()
+        _db_closing += len(connections)
+    error = None
+    try:
+        for connection in connections:
+            try:
+                _close_physical(connection)
+            except DatabaseBusy as failure:
+                error = failure
+    finally:
+        with _db_available:
+            _db_purging = False
+            _db_available.notify_all()
+    if error is not None:
+        raise error
+
+
+def _seal_db_pool(sealed):
+    global _db_sealed
+    with _db_available:
+        _db_sealed = sealed
+        _db_available.notify_all()
+
 
 
 @contextmanager
 def write_db():
+    """串行持有 BEGIN IMMEDIATE 写事务；退出时提交或回滚，并归还连接租约。
+
+    事务中的其他查询必须复用 conn，不能再次 db()。"""
     with _write_lock:
         with db() as conn:
             conn.execute('BEGIN IMMEDIATE')
@@ -156,6 +273,9 @@ def write_db():
 
 
 def init_db():
+    """在一个写事务内补齐 schema、索引和限流记录；不清空账号及签到历史。
+
+    迁移不兼容时抛错；目录及数据库权限的 chmod 为尽力执行。"""
     with write_db() as conn:
         for statement in (
             'CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value TEXT)',
@@ -308,6 +428,9 @@ def verify_password(pw):
 
 
 def init_password():
+    """把当前配置密码同步为 scrypt 校验值；密码变化时清除管理员会话。
+
+    只有首次创建配置才返回用于一次性展示的密码。"""
     source = CONFIG.password()
     if not verify_password(source):
         with write_db() as conn:
@@ -474,14 +597,27 @@ def _deliver_notification(task):
     return True
 
 
+def _request_shutdown():
+    """设置停机标记，并给通知队列送入一次唤醒。
+
+    信号处理器只设标记；这里由正常收尾路径调用，避免信号中重入队列锁。"""
+    _shutdown.set()
+    if _notification_wakeup.is_set():
+        return
+    _notification_wakeup.set()
+    try:
+        _notifications.put_nowait(None)
+    except queue.Full:
+        pass
+
+
 def notification_loop():
+    """等待通知而不定时空转；None 只用于停机唤醒，任务计数始终归还。"""
     while not _shutdown.is_set():
+        task = _notifications.get()
         try:
-            task = _notifications.get(timeout=1)
-        except queue.Empty:
-            continue
-        try:
-            _deliver_notification(task)
+            if task is not None and not _shutdown.is_set():
+                _deliver_notification(task)
         except Exception:
             print('[notify] 发送失败，详细签到结果已保存在账号日志。')
         finally:
@@ -490,7 +626,9 @@ def notification_loop():
 
 def _account_record(account_id):
     with db() as conn:
-        row = conn.execute('SELECT * FROM accounts WHERE id=?', (account_id,)).fetchone()
+        row = conn.execute('SELECT a.*,u.login_revision AS owner_login_revision '
+                           'FROM accounts a LEFT JOIN tg_users u ON u.tg_id=a.owner_tg_id '
+                           'WHERE a.id=?', (account_id,)).fetchone()
     return dict(row) if row else None
 
 
@@ -500,6 +638,9 @@ def _next_retry(count):
 
 
 def _store_result(account, result, cfg, trigger):
+    """在写事务中核对凭据、归属和登录代际，再写结果与有限日志。
+
+    过期快照返回 None；invalid 停用账号，未知余额不覆盖已有余额。"""
     now = now_local(cfg)
     today, stamp = now.strftime('%Y-%m-%d'), now.strftime('%Y-%m-%d %H:%M:%S')
     status = result['status']
@@ -507,6 +648,14 @@ def _store_result(account, result, cfg, trigger):
         current = conn.execute('SELECT * FROM accounts WHERE id=?', (account['id'],)).fetchone()
         if not current or current['token'] != account['token'] or current['emos_id'] != account['emos_id']:
             return None
+        if current['owner_tg_id'] != account.get('owner_tg_id'):
+            return None
+        revision = account.get('owner_login_revision')
+        if revision is not None:
+            owner = conn.execute('SELECT login_revision FROM tg_users WHERE tg_id=?',
+                                 (current['owner_tg_id'],)).fetchone()
+            if owner is None or owner['login_revision'] != revision:
+                return None
         safe_name = str(current['name'] or '').replace(current['token'], '[凭证已隐藏]')
         result = dict(result)
         result['message'] = str(result.get('message') or '').replace(current['token'], '[凭证已隐藏]')
@@ -551,10 +700,11 @@ def _store_result(account, result, cfg, trigger):
 
 
 def _auto_permission(owner, source_id, target_id, cfg):
+    """自动签到前的即时授权复核；主账号失效或归属改变即拒绝，不依赖启动时的快照。"""
     live = cfg_all()
     if 'tg_allowed_user_ids' in live:
         if (not owner_permitted(live, owner) or source_id != target_id
-                or Store().accounts.primary_account(owner) is None):
+                or not Store().accounts.has_primary_account(owner)):
             return False
     now = now_local(cfg)
     with db() as conn:
@@ -579,6 +729,9 @@ def _auto_permission(owner, source_id, target_id, cfg):
 
 
 def _run_ids(cfg, account_ids, trigger='manual', actor=None, root_id=None, scopes=None, content=None):
+    """串行执行账号列表；请求前复核权限，写回时再核对账号快照。
+
+    已有执行返回 None。撤销可拦截后续请求和旧结果，不能撤回已发送的 HTTP。"""
     if not _run_lock.acquire(blocking=False):
         return None
     rows, unavailable = [], set()
@@ -604,7 +757,7 @@ def _run_ids(cfg, account_ids, trigger='manual', actor=None, root_id=None, scope
                 live = cfg_all()
                 if 'tg_allowed_user_ids' in live:
                     if (not owner_permitted(live, current['owner_tg_id'])
-                            or service.primary_account(current['owner_tg_id']) is None):
+                            or not service.has_primary_account(current['owner_tg_id'])):
                         return False
                 if actor is not None:
                     return service.can_run(actor, root_id, account_id)
@@ -615,7 +768,8 @@ def _run_ids(cfg, account_ids, trigger='manual', actor=None, root_id=None, scope
                 return True
             if not allowed():
                 continue
-            endpoint = account.get('base_url') or cfg.get('base_url') or 'https://emos.best'
+            endpoint = (account.get('base_url') or cfg.get('base_url')
+                        or SCHEMA['EMOS_BASE_URL'].default)
             if endpoint in unavailable:
                 result = {'status': 'network', 'message': '同一接口暂不可达，已安排退避重试。', 'point': None}
             else:
@@ -645,7 +799,7 @@ def _run_ids(cfg, account_ids, trigger='manual', actor=None, root_id=None, scope
 def run_user(tg_id, include_links=True, expected_root=None, content=None):
     live = cfg_all()
     if 'tg_allowed_user_ids' in live and not owner_permitted(live, tg_id):
-        raise DomainError('只允许配置的本人 TG 用户操作。')
+        raise DomainError('只允许配置的 TG 用户操作。')
     if _draining.is_set():
         raise DomainError('应用核心正在重启，暂不接收新的签到任务。')
     if content is not None:
@@ -662,8 +816,12 @@ def run_user(tg_id, include_links=True, expected_root=None, content=None):
 
 
 def _eligible(account, now, cfg, automatic):
+    """本地调度候选判据：启用、有凭据、当天未完成且退避允许。
+
+    automatic=True 才检查自动开关和时间；网络身份和授权另行核验。"""
     today = now.strftime('%Y-%m-%d')
-    if not account['enabled'] or account['last_day'] == today:
+    if (not account['enabled'] or not str(account['token'] or '').strip()
+            or account['last_day'] == today):
         return False
     if automatic:
         if not account['auto_sign']:
@@ -687,7 +845,7 @@ def scheduler_tick(cfg=None):
     scopes = {}
     owner_mode = 'tg_allowed_user_ids' in cfg
     owner = configured_owner(cfg) if owner_mode else None
-    if owner_mode and (owner is None or Store().accounts.primary_account(owner) is None):
+    if owner_mode and (owner is None or not Store().accounts.has_primary_account(owner)):
         return []
     with db() as conn:
         if owner_mode:
@@ -768,12 +926,13 @@ async function go(ev){
 </script></body></html>"""
 
 
-PAGE = '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>emoskata · 核心管理</title><style>\n:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#101318;color:#eef2f7;font:14px/1.6 system-ui,sans-serif}main{max-width:960px;margin:auto;padding:22px 16px 60px}h1{font-size:24px}h2{font-size:17px;margin-top:0}section{background:#191f28;border:1px solid #303a49;border-radius:12px;padding:20px;margin:16px 0}label{display:block;margin-top:12px}input,select{width:100%;padding:9px;background:#111722;color:inherit;border:1px solid #303a49;border-radius:8px;font:inherit}button{padding:9px 14px;margin:12px 8px 0 0;border:0;border-radius:8px;background:#76a7ff;color:#111722;font:600 14px system-ui;cursor:pointer}button.secondary{background:#2b3646;color:inherit}button.danger{background:#51323a;color:#ffc1c7}.muted,small{color:#9caabd}small{display:block}.check{display:flex;gap:8px;align-items:center}.check input{width:auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:12px}.grid label{margin:0;padding:10px;border-bottom:1px solid #303a49}#message{white-space:pre-wrap;color:#a7d8bc}#runtime{white-space:pre-wrap}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:8px;border-bottom:1px solid #303a49}.scroll{overflow:auto}.top{display:flex;align-items:center;justify-content:space-between}\n</style></head><body><main><div class="top"><h1>🥕 emoskata · 核心管理</h1><button id="logout" class="secondary">退出</button></div><p class="muted">系统参数只读写同一份 .env。本人账号、签到设置和通知保存在 SQLite；历史共享数据保留但不启用；管理员密码不能用于个人登录。</p>\n<section><h2>Bot 服务</h2><label>Telegram Bot Token<input id="token" type="password" autocomplete="off" placeholder="留空保留，不回显"></label><label class="check"><input id="clear-token" type="checkbox">明确清除 Bot Token</label><p id="configured" class="muted"></p><p class="muted">本人 emos 用户 ID 由各用户在自己的 Bot 登录流程填写，管理员不代填、不共享。官方授权后按账号 ID 与本人 TG 绑定核验。</p><label>个人网页公开地址<input id="web-base" placeholder="https://sign.example.com"></label><small>公网 HTTPS；仅填写域名和可选端口，不含路径。</small></section>\n<section><h2>全部系统参数</h2><p class="muted">带“重启生效”的参数保存后点击下面的核心重启。改变 DATA_DIR 会切换数据库位置，不会搬迁数据；仅更新程序时保持原目录。</p><div id="fields" class="grid"></div><button id="save">保存到 .env</button><button id="reload" class="secondary">重新读取配置</button></section><div id="message" role="status" aria-live="polite"></div>\n<section><h2>应用核心</h2><div id="runtime">正在读取…</div><button id="refresh-runtime" class="secondary">刷新运行信息</button><button id="restart" class="danger">重启应用核心</button><p class="muted">不重启宿主机，不需要 root。先删除旧 emoskata.py，再把新文件上传到同一路径，确认上传完成后点击重启。文件缺失或语法错误会拒绝重启并保留旧核心。</p></section>\n<section><h2>账号运行状态 · 只读</h2><div class="scroll"><table><thead><tr><th>账号</th><th>官方 ID</th><th>状态</th><th>可用余额</th><th>本次所得</th><th>最近签到</th></tr></thead><tbody id="rows"></tbody></table></div><p class="muted">首号官方授权、其他账号 Token 添加及账号设置请从本人 TG Bot 进入。旧版账号和记录不会因更新被清空。</p></section></main><script>\nconst $=id=>document.getElementById(id);let revision=\'\',controls=new Map();\nasync function api(path,body){const r=await fetch(\'/api/\'+path,{credentials:\'same-origin\',method:body===undefined?\'GET\':\'POST\',headers:{\'Content-Type\':\'application/json\'},body:body===undefined?undefined:JSON.stringify(body)});const j=await r.json();if(r.status===401){location.replace(\'/login\');throw Error(\'管理员会话已失效\');}if(!r.ok)throw Error(j.error||\'操作失败\');return j;}\nfunction say(text){$(\'message\').textContent=text||\'\';}\nasync function runtime(){const s=await api(\'runtime\');$(\'runtime\').textContent=\'核心 PID：\'+s.pid+\' · 线程：\'+s.threads+\'\\n当前内存：\'+(s.rss_bytes==null?\'不可读取\':(s.rss_bytes/1048576).toFixed(1)+\' MiB\')+\' · 峰值：\'+(s.max_rss_bytes==null?\'不可读取\':(s.max_rss_bytes/1048576).toFixed(1)+\' MiB\')+\'\\n监听：\'+s.bind_host+\':\'+s.port+\' · 容器 IP：\'+s.container_ip+\'\\n状态：\'+s.restart_status+\' · 网页待办：\'+s.pending_web_jobs+\' · 通知待办：\'+s.notification_queue+(s.restart_error?\'\\n\'+s.restart_error:\'\');}\nasync function load(){const c=await api(\'config\');revision=c.revision;controls=new Map([[\'TG_BOT_TOKEN\',$(\'token\')],[\'WEB_BASE_URL\',$(\'web-base\')]]);$(\'token\').value=\'\';$(\'clear-token\').checked=false;$(\'web-base\').value=c.web_base_url||\'\';$(\'configured\').textContent=c.tg_bot_configured?\'Token 已配置。留空保存保持不变。\':\'尚未配置 Token。\';$(\'fields\').replaceChildren();for(const f of c.fields){if(controls.has(f.key))continue;const label=document.createElement(\'label\');label.append(document.createTextNode(f.label+(f.restart?\' · 重启生效\':\'\')));const input=document.createElement(f.kind===\'bool\'?\'select\':\'input\');if(f.kind===\'bool\'){for(const [value,text] of [[\'1\',\'开启\'],[\'0\',\'关闭\']]){const option=document.createElement(\'option\');option.value=value;option.textContent=text;input.append(option);}}else{input.type=f.secret?\'password\':f.kind===\'int\'?\'number\':\'text\';if(f.kind===\'int\'){input.min=f.minimum;input.max=f.maximum;}if(f.secret){input.autocomplete=\'new-password\';input.placeholder=f.configured?\'已配置，留空保留\':\'留空保留\';}}input.value=f.value;input.dataset.key=f.key;label.append(input);const detail=document.createElement(\'small\');detail.textContent=f.description;label.append(detail);$(\'fields\').append(label);controls.set(f.key,input);}const rows=await api(\'accounts\');$(\'rows\').replaceChildren();for(const row of rows){const tr=document.createElement(\'tr\');for(const text of [row.name,row.emos_id||\'待重新授权\',row.last_status||\'未运行\',Number.isInteger(row.carrot)?row.carrot:\'未知\',Number.isInteger(row.last_carrot)?\'+\'+row.last_carrot:\'—\',row.last_run||\'—\']){const td=document.createElement(\'td\');td.textContent=text;tr.append(td);}$(\'rows\').append(tr);}await runtime();}\nasync function operation(fn){document.querySelectorAll(\'button\').forEach(b=>b.disabled=true);try{await fn();}catch(e){say(e.message||\'操作失败\');}finally{document.querySelectorAll(\'button\').forEach(b=>b.disabled=false);}}\n$(\'save\').onclick=()=>operation(async()=>{const changes={};for(const [key,control] of controls)changes[key]=control.value;const clear_secrets=$(\'clear-token\').checked?[\'TG_BOT_TOKEN\']:[];const result=await api(\'config\',{changes,revision,clear_secrets});say(\'已保存到唯一配置文件 .env。\'+(result.restart_required.length?\'\\n重启生效：\'+result.restart_required.join(\', \'):\'\'));if(result.changed.includes(\'PANEL_PASSWORD\'))location.replace(\'/login\');else await load();});\n$(\'reload\').onclick=()=>operation(load);$(\'refresh-runtime\').onclick=()=>operation(runtime);\n$(\'restart\').onclick=()=>operation(async()=>{if(!confirm(\'确认新 py 已上传完成？这只重启应用核心，账号和配置不删除。\'))return;const r=await api(\'restart\',{confirm:true});say(r.message+\'\\n网络任务收尾后重启，可稍后刷新运行信息。\');});\n$(\'logout\').onclick=()=>operation(async()=>{await api(\'logout\',{});location.replace(\'/login\');});load().catch(e=>say(e.message));\n</script></body></html>\n'
+PAGE = '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>emoskata · 核心管理</title><style>\n:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#101318;color:#eef2f7;font:14px/1.6 system-ui,sans-serif}main{max-width:960px;margin:auto;padding:22px 16px 60px}h1{font-size:24px}h2{font-size:17px;margin-top:0}section{background:#191f28;border:1px solid #303a49;border-radius:12px;padding:20px;margin:16px 0}label{display:block;margin-top:12px}input,select{width:100%;padding:9px;background:#111722;color:inherit;border:1px solid #303a49;border-radius:8px;font:inherit}button{padding:9px 14px;margin:12px 8px 0 0;border:0;border-radius:8px;background:#76a7ff;color:#111722;font:600 14px system-ui;cursor:pointer}button.secondary{background:#2b3646;color:inherit}button.danger{background:#51323a;color:#ffc1c7}.muted,small{color:#9caabd}small{display:block}.check{display:flex;gap:8px;align-items:center}.check input{width:auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:12px}.grid label{margin:0;padding:10px;border-bottom:1px solid #303a49}#message{white-space:pre-wrap;color:#a7d8bc}#runtime{white-space:pre-wrap}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:8px;border-bottom:1px solid #303a49}.scroll{overflow:auto}.top{display:flex;align-items:center;justify-content:space-between}\n</style></head><body><main><div class="top"><h1>🥕 emoskata · 核心管理</h1><button id="logout" class="secondary">退出</button></div><p class="muted">系统参数只读写同一份 .env。账号、签到设置和通知保存在 SQLite；历史共享数据保留但不启用；管理员密码不能用于个人登录。</p>\n<section><h2>Bot 服务</h2><label>Telegram Bot Token<input id="token" type="password" autocomplete="off" placeholder="留空保留，不回显"></label><label class="check"><input id="clear-token" type="checkbox">明确清除 Bot Token</label><p id="configured" class="muted"></p><p class="muted">emos 用户 ID 在下方系统参数的 EMOS_USER_ID 配置；填写后 Bot 的 /login 直接跳转官方授权，不再索要。官方授权后按账号 ID 与 TG 绑定核验。</p><label>个人网页公开地址<input id="web-base" placeholder="https://sign.example.com"></label><small>公网 HTTPS；仅填写域名和可选端口，不含路径。</small></section>\n<section><h2>全部系统参数</h2><p class="muted">带“重启生效”的参数保存后点击下面的核心重启。改变 DATA_DIR 会切换数据库位置，不会搬迁数据；仅更新程序时保持原目录。</p><div id="fields" class="grid"></div><button id="save">保存到 .env</button><button id="reload" class="secondary">重新读取配置</button></section><div id="message" role="status" aria-live="polite"></div>\n<section><h2>应用核心</h2><div id="runtime">正在读取…</div><button id="refresh-runtime" class="secondary">刷新运行信息</button><button id="restart" class="danger">重启应用核心</button><p class="muted">不重启宿主机，不需要 root。先删除旧 emoskata.py，再把新文件上传到同一路径，确认上传完成后点击重启。文件缺失或语法错误会拒绝重启并保留旧核心。</p></section>\n<section><h2>账号运行状态 · 只读</h2><div class="scroll"><table><thead><tr><th>账号</th><th>官方 ID</th><th>状态</th><th>可用余额</th><th>本次所得</th><th>最近签到</th></tr></thead><tbody id="rows"></tbody></table></div><p class="muted">首号官方授权、其他账号 Token 添加及账号设置请从 TG Bot 进入。旧版账号和记录不会因更新被清空。</p></section></main><script>\nconst $=id=>document.getElementById(id);let revision=\'\',controls=new Map();\nasync function api(path,body){const r=await fetch(\'/api/\'+path,{credentials:\'same-origin\',method:body===undefined?\'GET\':\'POST\',headers:{\'Content-Type\':\'application/json\'},body:body===undefined?undefined:JSON.stringify(body)});const j=await r.json();if(r.status===401){location.replace(\'/login\');throw Error(\'管理员会话已失效\');}if(!r.ok)throw Error(j.error||\'操作失败\');return j;}\nfunction say(text){$(\'message\').textContent=text||\'\';}\nasync function runtime(){const s=await api(\'runtime\');$(\'runtime\').textContent=\'核心 PID：\'+s.pid+\' · 线程：\'+s.threads+\'\\n当前内存：\'+(s.rss_bytes==null?\'不可读取\':(s.rss_bytes/1048576).toFixed(1)+\' MiB\')+\' · 峰值：\'+(s.max_rss_bytes==null?\'不可读取\':(s.max_rss_bytes/1048576).toFixed(1)+\' MiB\')+\'\\n监听：\'+s.bind_host+\':\'+s.port+\' · 容器 IP：\'+s.container_ip+\'\\n状态：\'+s.restart_status+\' · 网页待办：\'+s.pending_web_jobs+\' · 通知待办：\'+s.notification_queue+(s.restart_error?\'\\n\'+s.restart_error:\'\');}\nasync function load(){const c=await api(\'config\');revision=c.revision;controls=new Map([[\'TG_BOT_TOKEN\',$(\'token\')],[\'WEB_BASE_URL\',$(\'web-base\')]]);$(\'token\').value=\'\';$(\'clear-token\').checked=false;$(\'web-base\').value=c.web_base_url||\'\';$(\'configured\').textContent=c.tg_bot_configured?\'Token 已配置。留空保存保持不变。\':\'尚未配置 Token。\';$(\'fields\').replaceChildren();for(const f of c.fields){if(controls.has(f.key))continue;const label=document.createElement(\'label\');label.append(document.createTextNode(f.label+(f.restart?\' · 重启生效\':\'\')));const input=document.createElement(f.kind===\'bool\'?\'select\':\'input\');if(f.kind===\'bool\'){for(const [value,text] of [[\'1\',\'开启\'],[\'0\',\'关闭\']]){const option=document.createElement(\'option\');option.value=value;option.textContent=text;input.append(option);}}else{input.type=f.secret?\'password\':f.kind===\'int\'?\'number\':\'text\';if(f.kind===\'int\'){input.min=f.minimum;input.max=f.maximum;}if(f.secret){input.autocomplete=\'new-password\';input.placeholder=f.configured?\'已配置，留空保留\':\'留空保留\';}}input.value=f.value;input.dataset.key=f.key;label.append(input);const detail=document.createElement(\'small\');detail.textContent=f.description;label.append(detail);$(\'fields\').append(label);controls.set(f.key,input);}const rows=await api(\'accounts\');$(\'rows\').replaceChildren();for(const row of rows){const tr=document.createElement(\'tr\');for(const text of [row.name,row.emos_id||\'待重新授权\',row.last_status||\'未运行\',Number.isInteger(row.carrot)?row.carrot:\'未知\',Number.isInteger(row.last_carrot)?\'+\'+row.last_carrot:\'—\',row.last_run||\'—\']){const td=document.createElement(\'td\');td.textContent=text;tr.append(td);}$(\'rows\').append(tr);}await runtime();}\nasync function operation(fn){document.querySelectorAll(\'button\').forEach(b=>b.disabled=true);try{await fn();}catch(e){say(e.message||\'操作失败\');}finally{document.querySelectorAll(\'button\').forEach(b=>b.disabled=false);}}\n$(\'save\').onclick=()=>operation(async()=>{const changes={};for(const [key,control] of controls)changes[key]=control.value;const clear_secrets=$(\'clear-token\').checked?[\'TG_BOT_TOKEN\']:[];const result=await api(\'config\',{changes,revision,clear_secrets});say(\'已保存到唯一配置文件 .env。\'+(result.restart_required.length?\'\\n重启生效：\'+result.restart_required.join(\', \'):\'\'));if(result.changed.includes(\'PANEL_PASSWORD\'))location.replace(\'/login\');else await load();});\n$(\'reload\').onclick=()=>operation(load);$(\'refresh-runtime\').onclick=()=>operation(runtime);\n$(\'restart\').onclick=()=>operation(async()=>{if(!confirm(\'确认新 py 已上传完成？这只重启应用核心，账号和配置不删除。\'))return;const r=await api(\'restart\',{confirm:true});say(r.message+\'\\n网络任务收尾后重启，可稍后刷新运行信息。\');});\n$(\'logout\').onclick=()=>operation(async()=>{await api(\'logout\',{});location.replace(\'/login\');});load().catch(e=>say(e.message));\n</script></body></html>\n'
 
 
 # HTTP 入口
 
 def _cookie_value(handler, name):
+    """读取请求中的第一个同名 Cookie；缺失返回空字符串。"""
     raw = handler.headers.get('Cookie') or ''
     for part in raw.split(';'):
         key, _, value = part.strip().partition('=')
@@ -828,7 +987,7 @@ class Handler(BaseHTTPRequestHandler):
         sid = _cookie_value(self, 'wsid')
         session = personal_web().authenticate(sid)
         if session is None:
-            self._send(401, {'ok': False, 'error': '请从本人 Bot 重新打开网页配置。'})
+            self._send(401, {'ok': False, 'error': '请从 Bot 重新打开网页配置。'})
             return None
         if mutating:
             try:
@@ -871,7 +1030,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(429, {'ok': False, 'error': '尝试过多，请稍后再试。'})
             if set(body) != {'code'}:
                 rl_fail(ip)
-                return self._send(400, {'ok': False, 'error': '仅接受本人一次性网页入口。'})
+                return self._send(400, {'ok': False, 'error': '仅接受一次性网页入口。'})
             try:
                 login = personal_web().exchange(body.get('code'))
             except DomainError as error:
@@ -898,6 +1057,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, {'ok': False, 'error': str(error)})
 
     server_version = "emos-panel/1.0"
+
+    def handle_one_request(self):
+        try:
+            return super().handle_one_request()
+        except DatabaseBusy:
+            self.close_connection = True
+            return self._send(503, {'ok': False, 'error': '数据库繁忙，请稍后重试。'})
 
     def log_message(self, fmt, *args):
         pass
@@ -1081,7 +1247,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(410, {'ok': False, 'error': '请在 TG Bot 通过官方 Bot 登录添加账号。'})
 
         if path == '/api/run':
-            return self._send(410, {'ok': False, 'error': '请在 TG Bot 对本人及已授权关联账号签到。'})
+            return self._send(410, {'ok': False, 'error': '请在 TG Bot 内签到。'})
 
         if path == '/api/config':
             try:
@@ -1106,7 +1272,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(202, {'ok': True, 'message': '正在收尾任务并重启应用核心，不重启宿主机。'})
 
         if path == '/api/notify-test':
-            return self._send(410, {'ok': False, 'error': '通知属于各用户本人，请在 Bot 或本人网页配置。管理员不设全局通知目标。'})
+            return self._send(410, {'ok': False, 'error': '通知请在 Bot 或配置网页里设置。管理员不设全局通知目标。'})
 
         return self._send(404, {"ok": False, "error": "not found"})
 
@@ -1161,9 +1327,9 @@ def bot_supervisor():
                         with _active_bot_lock:
                             _active_bot = current
                         thread.start()
-                        print('[bot] 本人官方首登、Token 多账号及网页入口已启用。')
+                        print('[bot] 官方首登、Token 多账号及网页入口已启用。')
                     else:
-                        print('[bot] 请在 .env 配置 Bot Token 和唯一本人 TG ID。')
+                        print('[bot] 请在 .env 配置 Bot Token 和唯一 TG ID。')
             except Exception:
                 print('[bot] 当前配置或网络暂不可用，稍后重试。')
             _shutdown.wait(5)
@@ -1232,27 +1398,16 @@ class _BoundedHTTPServer(ThreadingHTTPServer):
 
 
 _PROBE_MARK = '__emoskata_probe_ok__'
-# 导入预检使用 __probe__；不运行 main，不验证监听、迁移或 worker 启动。
-_PROBE_BOOTSTRAP = (
-    "import os,sys\n"
-    "path = sys.argv[1]; mark = sys.argv[2]\n"
-    "with open(path, 'rb') as handle: source = handle.read()\n"
-    "sys.argv = [sys.argv[3]]\n"
-    "sys.path[0] = os.path.dirname(path)\n"
-    "exec(compile(source, path, 'exec'), {'__name__': '__probe__', '__file__': path,\n"
-    "                                    '__package__': None, '__spec__': None})\n"
-    "print(mark)\n"
-)
+# 预检引导：以 __probe__ 导入候选后调用 main()，用 EMOS_STARTUP_PROBE 让 main 在就绪处提前返回。
+_PROBE_BOOTSTRAP = "import os,sys\npath,mark,entry=sys.argv[1:4]\nwith open(path,'rb') as handle: source=handle.read()\nsys.argv=[entry]\nsys.path[0]=os.path.dirname(path)\nnamespace={'__name__':'__probe__','__file__':path,'__package__':None,'__spec__':None,\n           '__emos_image__':source}\nexec(compile(source,path,'exec'),namespace)\nmain=namespace.get('main')\nif callable(main): main()\nprint(mark)\n"
 
 
 def _probe_core(image, entry, module_dir=None):
-    """以 __probe__ 执行候选入口的导入预检，不运行 main 或监听端口。
+    """在临时子进程执行候选初始化，验证数据库迁移、监听与核心线程创建。
 
-    源码用独立副本读取并复位 image 游标，避免消费 exec 随后需要的已验证字节。
-    .env 使用副本；DATA_DIR 为绝对路径时仍会检查或创建该目录，但不打开 SQLite。
-    分模块部署传入依赖目录；单文件只使用内嵌模块，不从源码目录补依赖。
-    不覆盖 main 的迁移、绑定端口及线程启动，也不提供自动回滚。
-    """
+    配置和 SQLite 都使用副本；业务线程停在门闩，不进入 Bot、调度或通知。
+    候选沿用当前端口时改绑临时端口，真实切换仍要重新绑定目标端口。
+    失败抛配置错误；不返回镜像，也不是任意候选代码的安全沙箱。"""
     import shutil
     import subprocess
     import tempfile
@@ -1266,12 +1421,33 @@ def _probe_core(image, entry, module_dir=None):
         with open(env_copy, 'wb') as handle:
             handle.write(raw)
         os.chmod(env_copy, 0o600)
+        # 预检用真实 SQLite 的一致性副本，不迁移生产数据。
+        candidate = ConfigStore(env_copy)
+        candidate_cfg = candidate.app_config()
+        selected = Path(candidate_cfg['data_dir']).expanduser()
+        selected = selected if selected.is_absolute() else Path(entry).parent / selected
+        if selected.exists() and not selected.is_dir():
+            raise EnvConfigError('数据目录不是目录；更新未切换。')
+        probe_data = Path(workdir) / 'data'
+        probe_data.mkdir(mode=0o700)
+        selected_db = selected / 'data.db'
+        if selected_db.exists():
+            try:
+                snapshot_database(str(selected_db), str(probe_data / 'data.db'))
+            except (sqlite3.Error, OSError, RuntimeError):
+                raise EnvConfigError('现有数据库无法生成一致性副本；更新未切换。') from None
+        candidate.update({'DATA_DIR': str(probe_data)})
         image.seek(0)
         source_copy = os.path.join(workdir, os.path.basename(entry))
         with open(source_copy, 'wb') as handle:
             handle.write(image.read())
         image.seek(0)
-        environment = dict(os.environ, EMOS_ENV_FILE=env_copy, PYTHONDONTWRITEBYTECODE='1')
+        environment = dict(os.environ, EMOS_ENV_FILE=env_copy, PYTHONDONTWRITEBYTECODE='1',
+                           EMOS_STARTUP_PROBE='1')
+        environment.pop('EMOS_UPDATE_ACTIVE', None)
+        # 自己仍占有的端口只能在同地址的临时端口验证；新端口实际试绑定。
+        environment['EMOS_PROBE_REUSE_BIND'] = '1' if (
+            _HTTP_SERVER is not None and candidate_cfg['port'] == _HTTP_SERVER.server_port) else '0'
         # 隔离调用方的导入路径；仅分模块入口需要显式提供同目录依赖。
         environment.pop('PYTHONPATH', None)
         if module_dir is not None:
@@ -1298,17 +1474,22 @@ def _probe_core(image, entry, module_dir=None):
 
 
 def _prepare_core():
-    """读取并固定候选字节，验证语法和导入，返回游标为零的镜像。
+    """固定候选字节并完成语法及隔离启动预检，返回游标为零的临时镜像。
 
-    接受后删除或重传入口不会影响 exec 使用的字节；失败关闭镜像。
-    不验证 main 的数据库迁移和监听，也不保存旧版本回滚副本。
-    """
+    只有入口本身缺失时尝试恢复成功快照，并要求再次重启；依赖缺失不覆盖入口。
+    异常关闭镜像。接受后再删或重传入口不改变本次使用的字节。"""
     import ast
     import tempfile
     entry = os.path.abspath(__file__)
     try:
-        with open(entry, 'rb') as handle:
-            source = handle.read(2097153)
+        try:
+            with open(entry, 'rb') as handle:
+                source = handle.read(2097153)
+        except FileNotFoundError:
+            restored = _restore_last_good(entry)
+            if restored is None:
+                raise EnvConfigError('更新文件缺失且没有可用的成功快照；当前核心保留运行，请重新上传 py。') from None
+            raise EnvConfigError('入口文件缺失，已从最近一次成功启动的快照恢复到 %s。请再次发起重启。' % restored) from None
         if not source or len(source) > 2097152:
             raise EnvConfigError('更新文件为空或过大，请先上传完整 py。当前核心保留运行。')
         tree = ast.parse(source, filename=entry)
@@ -1347,26 +1528,24 @@ def _prepare_core():
         raise EnvConfigError('更新文件缺失、未上传完整或语法无效。当前核心保留运行，请重新上传 py。') from None
 
 
+def _restore_last_good(entry):
+    """只恢复缺失入口；快照定位与排他写入由 updates 统一维护。"""
+    return restore_missing_entry(entry, str(CONFIG.path))
+
 def _exec_core(image=None):
-    # exec 读取已验证的临时镜像，不重新打开可能正被删除或上传的入口。
-    """用已固定的镜像替换当前进程；不重新读取可能被重传的路径。
-    """
+    """切换已验证字节；启动失败时由更新事务恢复旧代码、配置和数据库。"""
     image = image or _prepare_core()
-    os.environ['EMOS_ENV_FILE'] = str(CONFIG.path)
-    os.set_inheritable(image.fileno(), True)
-    bootstrap = ("import os,sys; p=sys.argv[1]; fd=int(sys.argv[2]); "
-                 "sys.argv=[p]; sys.path[0]=os.path.dirname(p); "
-                 "f=os.fdopen(fd,'rb'); s=f.read(); f.close(); "
-                 "exec(compile(s,p,'exec'), {'__name__':'__main__','__file__':p,"
-                 "'__package__':None,'__spec__':None})")
-    try:
-        os.execv(sys.executable, [sys.executable, '-u', '-c', bootstrap,
-                                 os.path.abspath(__file__), str(image.fileno())])
-    finally:
-        image.close()
+    cfg = CONFIG.app_config()
+    selected = Path(cfg['data_dir']).expanduser()
+    selected = selected if selected.is_absolute() else Path(BASE_DIR) / selected
+    exec_update(image, os.path.abspath(__file__), str(CONFIG.path),
+                list(dict.fromkeys((DB_PATH, str(selected / 'data.db')))))
 
 
 def _drain_core(timeout=0):
+    """开始拒收新业务，检查队列、请求、连接和网络任务是否都已归还。
+
+    这是一次即时判定，不等待；main 负责重试和截止时间。"""
     if _web_service is not None:
         _web_service.begin_drain()
         with _web_service.lock:
@@ -1375,7 +1554,7 @@ def _drain_core(timeout=0):
     if _run_lock.locked():
         return False
     with _db_pool_lock:
-        if _db_borrowed:
+        if _db_borrowed or _db_closing or _db_waiters or _db_quarantine:
             return False
     with _active_bot_lock:
         current = _active_bot
@@ -1393,6 +1572,12 @@ def _drain_core(timeout=0):
     return True
 
 
+def _gated_core_task(task):
+    _CORE_START_GATE.wait()
+    if not _shutdown.is_set():
+        task()
+
+
 def _start_core_threads():
     tasks = (('emos-scheduler', scheduler_loop), ('emos-supervisor', bot_supervisor),
              ('emos-notifications', notification_loop))
@@ -1401,14 +1586,17 @@ def _start_core_threads():
     for name, task in tasks:
         thread = existing.get(name)
         if thread is None or not thread.is_alive():
-            thread = threading.Thread(target=task, daemon=False, name=name)
+            thread = threading.Thread(target=_gated_core_task, args=(task,), daemon=False, name=name)
             thread.start()
         _CORE_THREADS.append(thread)
 
 
 def _resume_core():
+    _seal_db_pool(False)
     _shutdown.clear()
+    _notification_wakeup.clear()
     _draining.clear()
+    _CORE_START_GATE.set()
     if _web_service is not None:
         _web_service.resume()
     with _active_bot_lock:
@@ -1419,10 +1607,12 @@ def _resume_core():
 
 
 def _stop_core(timeout):
-    """等待核心线程停止，返回是否全部结束；调用方需留出调度时间。
-    """
+    """通知核心退出并等待线程、连接收尾；返回是否允许安全 exec。
+
+    没有收完返回 False，调用方取消更新并恢复旧核心。"""
     deadline = time.monotonic() + max(0, timeout)
-    _shutdown.set()
+    _request_shutdown()
+    _CORE_START_GATE.set()
     for worker in _CORE_THREADS:
         worker.join(max(0, deadline - time.monotonic()))
     if _web_service is not None:
@@ -1433,13 +1623,15 @@ def _stop_core(timeout):
         thread.join(max(0, deadline - time.monotonic()))
     ready = not any(thread.is_alive() for thread in threads)
     with _db_pool_lock:
-        ready = ready and not _db_borrowed
+        ready = ready and not (_db_borrowed or _db_closing or _db_waiters or _db_quarantine)
     if ready:
+        _seal_db_pool(True)
         close_idle_db()
     return ready
 
 
 def _cancel_restart(message, status='failed'):
+    """拒绝重启时统一回滚状态，避免界面显示"正在重启"但实际没动。"""
     global _restart_status, _restart_error, _restart_image
     _restart_status, _restart_error = status, message
     if _restart_image is not None:
@@ -1454,40 +1646,54 @@ _restart_image = None
 
 
 def main():
+    """初始化持久化、监听和核心线程；就绪提交后才释放业务门闩。
+
+    预检模式在就绪点返回；正常模式处理停机与同 PID 更新，finally 收尾自己创建的资源。"""
     global _HTTP_SERVER, _restart_status, _restart_error
-    cfg = cfg_all()
-    init_db()
-    legacy = import_legacy_config()
-    if legacy['imported']:
-        print('[config] 已把旧版系统配置搬进 .env：%s' % ', '.join(legacy['imported']))
-        cfg = cfg_all()
-    if legacy['rejected']:
-        print('[config] 旧版配置项不合法、已忽略（请在网页重新填写）：%s'
-              % ', '.join(legacy['rejected']))
-    generated = init_password() if cfg['http_enabled'] else None
-    if legacy['password_inherited']:
-        # 继承的密码不再次打印，避免配置迁移泄露原密码。
-        generated = None
-    if not cfg['http_enabled'] and not cfg['tg_bot_token']:
-        raise EnvConfigError('纯 Bot 模式需要在 .env 填入 TG_BOT_TOKEN。')
-    _shutdown.clear()
-    _draining.clear()
-    _restart_requested.clear()
-    _restart_status, _restart_error = 'running', ''
-    if cfg['http_enabled']:
-        server = _BoundedHTTPServer((cfg['http_host'], cfg['port']), Handler,
-                                    cfg['http_max_connections'], cfg['http_request_timeout'])
-        server.timeout = 1
-        _HTTP_SERVER = server
-        print('管理入口：http://%s:%d/admin' % (_CONTAINER_IP, cfg['port']))
-        print('监听 %s:%d；容器 IP 仅用于内网显示，外网入口用 WEB_BASE_URL。' % (cfg['http_host'], cfg['port']))
-        if generated:
-            print('首次管理员密码（仅此一次）：%s' % generated)
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(sig, lambda *_: _shutdown.set())
-    _start_core_threads()
+    _CORE_START_GATE.clear()
+    _HTTP_SERVER = None
+    server = None
     restart_deadline = None
     try:
+        cfg = cfg_all()
+        init_db()
+        legacy = import_legacy_config()
+        if legacy['imported']:
+            if not _STARTUP_PROBE:
+                print('[config] 已导入旧配置：%s' % ', '.join(legacy['imported']))
+            cfg = cfg_all()
+        if legacy['rejected'] and not _STARTUP_PROBE:
+            print('[config] 部分旧配置无效，请在管理页检查。')
+        generated = init_password() if cfg['http_enabled'] else None
+        if legacy['password_inherited']:
+            generated = None
+        if not cfg['http_enabled'] and (not cfg['tg_bot_token'] or configured_owner(cfg) is None):
+            raise EnvConfigError('纯 Bot 模式需要 Bot Token 和唯一 TG ID。')
+        _shutdown.clear()
+        _notification_wakeup.clear()
+        _draining.clear()
+        _restart_requested.clear()
+        _restart_status, _restart_error = 'running', ''
+        if cfg['http_enabled']:
+            bind_port = 0 if (_STARTUP_PROBE and os.environ.get('EMOS_PROBE_REUSE_BIND') == '1') else cfg['port']
+            server = _BoundedHTTPServer((cfg['http_host'], bind_port), Handler,
+                                       cfg['http_max_connections'], cfg['http_request_timeout'])
+            server.timeout = 1
+            _HTTP_SERVER = server
+            if not _STARTUP_PROBE:
+                print('管理入口：http://%s:%d/admin' % (_CONTAINER_IP, cfg['port']))
+                if generated:
+                    print('首次管理员密码（仅此一次）：%s' % generated)
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, lambda *_: _shutdown.set())
+        _start_core_threads()
+        if len(_CORE_THREADS) != 3 or not all(t.is_alive() for t in _CORE_THREADS):
+            raise EnvConfigError('核心线程未成功启动。')
+        if _STARTUP_PROBE:
+            return
+        # 真配置/数据初始化、监听和线程创建均成功；之后才允许调度和 TG 请求。
+        mark_ready(os.path.abspath(__file__), str(CONFIG.path))
+        _CORE_START_GATE.set()
         while not _shutdown.is_set():
             if _restart_requested.is_set():
                 if restart_deadline is None:
@@ -1504,7 +1710,7 @@ def main():
                         _restart_status = 'restarting'
                         _exec_core(_restart_image)
                         raise EnvConfigError('重启没有完成，已恢复运行。')
-                    except (OSError, EnvConfigError):
+                    except (OSError, EnvConfigError, RuntimeError):
                         _cancel_restart('核心重启未完成，旧核心已恢复运行。请检查更新文件与配置。')
                     restart_deadline = None
                 elif elapsed:
@@ -1519,15 +1725,17 @@ def main():
             else:
                 _shutdown.wait(1)
     finally:
-        _shutdown.set()
-        if _HTTP_SERVER is not None:
-            _HTTP_SERVER.server_close()
+        _request_shutdown()
+        _CORE_START_GATE.set()
+        if server is not None:
+            server.server_close()
         for worker in _CORE_THREADS:
-            worker.join(timeout=_RUNTIME_CONFIG['shutdown_timeout'])
+            worker.join(timeout=2 if _STARTUP_PROBE else _RUNTIME_CONFIG['shutdown_timeout'])
         if _web_service is not None:
-            _web_service.stop()
+            _web_service.stop(timeout=2 if _STARTUP_PROBE else 55)
         close_idle_db()
-        print('emoskata 应用核心已停止。')
+        if not _STARTUP_PROBE:
+            print('emoskata 应用核心已停止。')
 
 
 if __name__ == "__main__":

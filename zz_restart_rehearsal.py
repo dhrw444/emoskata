@@ -1,10 +1,8 @@
 # !/usr/bin/env python3
-"""删除旧入口、上传候选并验证重启及数据的历史手工演练。
+"""入口删除重传、核心重启和数据库保留的手工演练。
 
-固定端口和临时目录，只能串行手动运行；不进入 CI。使用假账号，不动真实配置。
-Runtime: Python 3.10+ / 标准库。
-Run: python3 zz_restart_rehearsal.py（先核对脚本路径和端口）
-"""
+夹具只使用临时或演练数据；本地通过不代表真实官方授权。
+Test: python3 -B zz_restart_rehearsal.py；固定演练目录必须串行使用。。"""
 import json
 import os
 import shutil

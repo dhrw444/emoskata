@@ -28,4 +28,4 @@ if command -v systemctl >/dev/null 2>&1 && [ "$(id -u)" = 0 ]; then
 else
     echo "手动运行：EMOS_ENV_FILE=$DIR/.env python3 $DIR/emoskata.py"
 fi
-echo '管理员只配置 Bot Token；每个用户在自己的 TG Bot 登录流程填写本人 emos 用户 ID。'
+echo '在 .env 或管理员面板配置 Bot Token、唯一 TG ID 和 EMOS_USER_ID；Bot 的 /login 直接给出官方授权链接。'

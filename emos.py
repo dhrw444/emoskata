@@ -1,10 +1,7 @@
-"""emos JSON 客户端：官方身份预检查、余额与签到响应归一。
+"""emos HTTP 客户端、官方身份核验与签到结果归一。
 
-网络失败不重发写请求；blocked 的备用域名行为另见 EmosClient.call。自定义站点不追加官方域。
-未知余额返回 None，错误与正常响应分开；字段契约与公开 Postman 集合核对。
-Runtime: Python 3.10+ / 标准库，由 app 和 bot 调用。
-Test: python3 -B -m unittest test_client
-"""
+自定义站点不追加公共备用域；请求前的撤销守卫由调用方提供。
+Runtime: Python 3.10+，标准库；协议结果不等于本地授权。"""
 import json
 import random
 import re
@@ -219,7 +216,7 @@ class EmosClient:
                 if isinstance(linked, str) and re.fullmatch(r'[0-9]{1,19}', linked):
                     linked = int(linked)
                 if type(linked) is not int or linked != self.expected_telegram_id:
-                    raise EmosError('官方 TG 绑定已取消或改变，请本人重新授权。', kind='invalid')
+                    raise EmosError('官方 TG 绑定已取消或改变，请重新授权。', kind='invalid')
             if 'sign' not in profile:
                 raise EmosError('官方用户资料缺少当天签到信息，本次未执行。')
             today_sign = profile['sign']

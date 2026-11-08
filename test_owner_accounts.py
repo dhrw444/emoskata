@@ -1,9 +1,7 @@
-"""唯一 owner、官方主号证明及全本人账号权限回归。
+"""单用户准入、官方主号证明和全部有效账号范围回归。
 
-仅使用临时目录、伪凭证和本地服务；不把替身成功视为生产授权或容器验收。
-Runtime: Python 3.10+ / 标准库。
-Test: python3 -B -m unittest test_owner_accounts
-"""
+夹具只使用临时或演练数据；本地通过不代表真实官方授权。
+Test: python3 -B -m unittest test_owner_accounts。"""
 import sys
 sys.dont_write_bytecode = True
 

@@ -1,16 +1,14 @@
-"""Telegram 本人私聊入口、官方首号授权、Token 添加与签到队列。
+"""Telegram 私聊路由、官方首号授权、Token 添加与有界任务队列。
 
-菜单 scope 不是验权；消息与回调都核对当前 owner。账号选择在入队时固定并再次校验。
-worker 按需创建，队列有界；消息失败不重复执行已完成的操作。
-Runtime: Python 3.10+ / 标准库，由 app 启动。
-Test: python3 -B -m unittest test_bot test_owner_bot test_queue
-"""
+菜单只负责展示；消息、回调与任务执行分别核对权限和账号选择。
+Runtime: Python 3.10+，标准库；由 app 启动轮询。"""
 
 import base64
 from collections import OrderedDict, deque
 import html
 import json
 import re
+import secrets
 import threading
 import time
 import urllib.error
@@ -18,7 +16,7 @@ import urllib.request
 
 from accounts import DomainError
 from emos import EmosClient, EmosError, pick_content
-from envconfig import configured_owner, owner_permitted
+from envconfig import SCHEMA, configured_owner, owner_permitted
 
 POLL_TIMEOUT = 30
 PAGE_SIZE = 8
@@ -30,13 +28,13 @@ _SECRET = re.compile(
 
 
 def _allowed_users(cfg):
-    """返回唯一本人 ID；缺失、空值和无效配置均无可用操作者。"""
+    """返回配置的唯一 TG ID；缺失、空值和无效配置均无可用操作者。"""
     owner = configured_owner(cfg)
     return {owner} if _positive(owner) else set()
 
 
 def allowed_actor(tg_id, cfg):
-    """仅允许配置中的本人正整数 ID，不兼容空白或多人白名单。"""
+    """仅允许配置的唯一正整数 TG ID，不兼容空白或多人白名单。"""
     return (_positive(tg_id) and bool(_allowed_users(cfg))
             and owner_permitted(cfg, tg_id))
 
@@ -129,7 +127,8 @@ class TG:
         self.token = (token or '').strip()
         self.store = store
         settings = store.cfg_all() if store is not None else {}
-        self.base = settings.get('tg_api_base_url') or 'https://api.telegram.org'
+        self.base = (settings.get('tg_api_base_url')
+                     or SCHEMA['TG_API_BASE_URL'].default)
         self.poll_timeout = int(settings.get('tg_poll_timeout') or POLL_TIMEOUT)
 
     def enabled(self):
@@ -172,6 +171,7 @@ class TG:
         return result
 
     def send(self, chat_id, text, keyboard=None):
+        """按 HTML 分页发送；失败抛 TgError，前面已发出的页不会撤回。"""
         pages = _html_pages(text)
         result = None
         for index, page in enumerate(pages):
@@ -226,6 +226,9 @@ class _Jobs:
         self.accepting = True
 
     def submit(self, key, function, priority=False):
+        """按调用方提供的 key 抑制重复待办；False 表示重复、满容量或拒收。
+
+        去重不等于非幂等操作的恰好一次执行。"""
         key = object() if key is None else key
         with self.condition:
             if self.closed or not self.accepting or key in self.keys or len(self.keys) >= self.capacity:
@@ -265,6 +268,7 @@ class _Jobs:
             self._execute(key, function)
 
     def pause(self):
+        """拒绝新入队；worker 继续消费已经排队和在跑的任务。"""
         with self.condition:
             self.accepting = False
 
@@ -305,39 +309,47 @@ def menu_kb(account=None):
              {"text": "📜 签到记录", "callback_data": "logs:%d:0" % root}],
             [{"text": "🔐 主账号重新授权", "callback_data": "login:%d" % root},
              {"text": "🔑 添加 Token", "callback_data": "token:%d" % root}],
+            [{"text": "🚪 退出当前账号", "callback_data": "logout:%d:one" % root},
+             {"text": "🚪 全部退出", "callback_data": "logout:%d:all" % root}],
             [{"text": "🌐 网页配置", "callback_data": "web:%d" % root},
              {"text": "❓ 帮助", "callback_data": "help"}]]
 
 
-HELP = """<b>🥕 emoskata · 本人多账号签到 Bot</b>
+HELP = """<b>🥕 emoskata · 多账号签到 Bot</b>
 
-/login — 首次填写自己的 emos ID，经 @emospg_bot 官方授权主账号
-<code>/login 主账号emosID</code> — 已有主账号时只重新授权该主账号
-/token — 主账号完成授权后，用本人 emos Token 添加或更新账号
-<code>/token 本人Token</code> — 直接核对并添加，不是 BotFather Token
+/login — 直接跳转 @emospg_bot 官方授权主账号（emos ID 读自 .env 的 EMOS_USER_ID）
+<code>/login 主账号emosID</code> — 临时指定 ID，覆盖 .env；已有主账号时只重新授权该主账号
+/token — 主账号完成授权后，用 emos Token 添加或更新账号
+<code>/token Token</code> — 直接核对并添加，不是 BotFather Token
 /menu — 主菜单
-/sign — 签到全部本人账号，各按自己的普通/随机模式执行
-<code>/sign 任意附言</code> — 当前选中账号本次带附言，其余本人账号按保存模式
-/account 或 /accounts — 查看全部本人账号、余额与切换
-/web — 本人网页，管理账号、签到与通知
-/settings — 当前账号自动签到、时间、模式及本人通知
+/sign — 签到全部账号，各按自己的普通/随机模式执行
+<code>/sign 任意附言</code> — 当前选中账号本次带附言，其余账号按保存模式
+/account 或 /accounts — 查看全部账号、余额与切换
+/web — 配置网页，管理账号、签到与通知
+/settings — 当前账号自动签到、时间、模式及通知
 <code>/time HH:MM</code> — 签到时间，不早于 01:00
-/logs — 全部本人账号的签到记录
-/cancel — 取消授权或待填写输入
+/logs — 全部账号的签到记录
+/logout — 退出当前账号，点击确认后才清除本地 Token
+<code>/logout all</code> — 退出全部账号，必须再次确认
+/cancel — 取消授权、待填写输入或退出确认
 
-只接受配置中的唯一本人 TG 私聊。主账号与 Token 账号的官方 Telegram 绑定均须等于本人。
+退出仅撤销本地密钥并停用签到。账号、萝卜、日志、偏好和主号官方证明保留。
+不代表官方 Token 已失效；主号可 /login 重新官方授权，其他账号可 /token 重登。
+
+只接受配置的 TG 私聊。主账号与 Token 账号的官方 Telegram 绑定都必须是你自己的。
 Token 仅用于官方身份核验与签到；消息会尽力删除，不回显密钥。授权或输入 10 分钟有效。
 跨 TG 共享、关联码和代签入口已关闭；历史账号与记录保留。"""
 
 
 COMMANDS = (
-    ("start", "打开本人签到机器人"), ("menu", "主菜单"),
+    ("start", "打开签到机器人"), ("menu", "主菜单"),
     ("login", "首个账号官方授权／主账号重新授权"),
-    ("token", "用本人 emos Token 添加其他账号"),
-    ("sign", "签到全部本人账号"), ("accounts", "全部账号、余额与切换"),
-    ("settings", "当前账号签到及本人通知设置"), ("time", "修改当前账号签到时间"),
-    ("logs", "全部本人账号签到记录"), ("web", "打开本人配置网页"),
-    ("cancel", "取消输入或授权"), ("help", "帮助")
+    ("token", "用 emos Token 添加其他账号"),
+    ("sign", "签到全部账号"), ("accounts", "全部账号、余额与切换"),
+    ("settings", "当前账号签到与通知设置"), ("time", "修改当前账号签到时间"),
+    ("logs", "全部账号签到记录"), ("web", "打开配置网页"),
+    ("logout", "退出当前账号／logout all 全部退出，需确认"),
+    ("cancel", "取消输入、授权或退出确认"), ("help", "帮助")
 )
 
 
@@ -351,7 +363,7 @@ class Bot:
                         "finish_login", "login_with_token", "owned", "active", "switch", "set_account",
                         "set_preferences", "issue_code", "redeem", "links", "toggle_link",
                         "unlink", "pending_links", "review_link", "withdraw_link", "visible", "logs",
-                        "set_input", "input_state", "clear_input")
+                        "set_input", "input_state", "clear_input", "logout")
 
     def __init__(self, token, store, *, tg=None, client_factory=None, workers=4,
                  max_jobs=32, synchronous=False, retry_base=1, retry_cap=30):
@@ -373,6 +385,7 @@ class Bot:
         self._run_lock = threading.Lock()
         self._recent_callbacks = OrderedDict()
         self._guided = {}
+        self._logout_confirmations = {}
         self.me = None
         self._offset_key = 'tg_update_offset'
         self._offset = self._load_offset()
@@ -387,6 +400,7 @@ class Bot:
         return not self.stop_event.is_set()
 
     def begin_drain(self):
+        """停止接收后续更新并暂停新业务入队；不在本函数等待任务结束。"""
         self.drain_event.set()
         self._jobs.pause()
 
@@ -516,6 +530,9 @@ class Bot:
         return self._control.submit(None, guarded, priority)
 
     def _handle(self, update):
+        """先持久化 offset，再校验和安排更新；恢复时不会重放已确认的 update。
+
+        offset 与业务提交并非同一事务，确认后崩溃可能丢掉尚未完成的动作。"""
         if self.stop_event.is_set() or self.drain_event.is_set() or not isinstance(update, dict):
             return
         uid = update.get("update_id")
@@ -555,7 +572,7 @@ class Bot:
             if not permitted:
                 answer = ("此 Bot 已限定使用者，你的 ID 不在允许名单内。"
                           if _positive(tg_id) and chat_id == tg_id
-                          and chat.get("type") == "private" else "仅限本人私聊操作。")
+                          and chat.get("type") == "private" else "仅限私聊操作。")
             else:
                 answer = "已处理，请刷新菜单。" if duplicate else ""
 
@@ -574,7 +591,7 @@ class Bot:
         login_revision = user_at_arrival.get('login_revision', 0)
         with self._state_lock:
             input_at_arrival = self._guided.get(tg_id)
-        # 只有已验权的本人消息进入密钥处理；所有回传和 token 待填都尽力删除。
+        # 只有已验权的消息进入密钥处理；所有回传和 token 待填都尽力删除。
         sensitive_input = (not callback and not text.startswith('/') and (
             bool(input_at_arrival and input_at_arrival[0] in {'token', 'link'})
             or user_at_arrival.get('input_kind') in {'token', 'link'}))
@@ -597,6 +614,9 @@ class Bot:
             if self.stop_event.is_set() or not allowed_actor(tg_id, self.store.cfg_all()):
                 return
             try:
+                current = self.accounts.user(tg_id) or {}
+                if current.get('login_revision', 0) != login_revision:
+                    raise DomainError('登录或输入会话已变化，排队操作已取消，请重新操作。')
                 self.accounts.ensure_user(tg_id, chat_id)
                 if callback:
                     self._on_callback(tg_id, chat_id, mid, data, root_at_arrival)
@@ -616,6 +636,9 @@ class Bot:
             self._control_call(lambda: self.tg.send(chat_id, "已有操作在处理或队列已满。本次未执行，请稍后重试。"))
 
     def _reply(self, chat_id, text, keyboard=None, msg_id=None):
+        """发送或编辑结果；权限撤销或已停止时不发消息。
+
+        发送失败只记录泛型状态，不再执行已完成的业务。"""
         if self.stop_event.is_set() or not allowed_actor(chat_id, self.store.cfg_all()):
             return
         try:
@@ -626,6 +649,7 @@ class Bot:
             print("[bot] 消息未送达；不重复执行原操作。")
 
     def _active(self, tg_id):
+        """返回当前选择；无选择或权限错误返回 None，不自动回落到主号。"""
         try:
             return self.accounts.active(tg_id, required=False)
         except DomainError:
@@ -647,21 +671,68 @@ class Bot:
         self.accounts.clear_input(tg_id)
         with self._state_lock:
             self._guided.pop(tg_id, None)
+            self._logout_confirmations.pop(tg_id, None)
+
+    def _show_logout(self, tg_id, chat_id, expected, all_accounts=False, msg_id=None):
+        """发退出确认；记下登录版本与时限，账号被重新登录后旧确认自动失效。"""
+        if not allowed_actor(tg_id, self.store.cfg_all()):
+            raise DomainError('只允许配置的 TG 用户操作。')
+        account = self._selection(tg_id, expected)
+        owned = self.accounts.owned(tg_id)
+        if not owned or (not all_accounts and not account):
+            raise DomainError('没有可退出的账号。')
+        nonce = secrets.token_hex(4)
+        user = self.accounts.user(tg_id) or {}
+        scope = 'all' if all_accounts else 'one'
+        with self._state_lock:
+            self._logout_confirmations[tg_id] = (expected, scope, nonce,
+                user.get('login_revision', 0), time.monotonic() + 120)
+        label = '全部 %d 个账号' % len(owned) if all_accounts else '当前账号'
+        return self._reply(chat_id, '<b>🚪 确认退出%s？</b>\n\n'
+                           '确认后清除本地 Token、关闭自动签到并取消待处理授权与输入。\n'
+                           '保留账号、萝卜、日志、偏好和主号官方证明。\n'
+                           '仅本地撤销，不代表官方 Token 失效。确认 2 分钟有效。' % label,
+                           [[{'text': '确认退出' + label,
+                              'callback_data': 'logoutok:%d:%s:%s' % (expected, scope, nonce)}],
+                            [{'text': '取消退出', 'callback_data': 'logoutno:%d:%s' % (expected, nonce)}]],
+                           msg_id)
+
+    def _confirm_logout(self, tg_id, chat_id, expected, scope, nonce, msg_id=None):
+        """核对 nonce、登录版本和时限后执行退出；只撤销凭证，保留账号与日志。"""
+        self._selection(tg_id, expected)
+        with self._state_lock:
+            pending = self._logout_confirmations.get(tg_id)
+        user = self.accounts.user(tg_id) or {}
+        if (not pending or pending[:3] != (expected, scope, nonce)
+                or pending[3] != user.get('login_revision', 0) or pending[4] <= time.monotonic()):
+            raise DomainError('退出确认已过期、取消或登录状态已变化，请重新 /logout。')
+        result = self.accounts.logout(tg_id, all_accounts=scope == 'all', expected_root=expected)
+        with self._state_lock:
+            self._guided.pop(tg_id, None)
+            self._logout_confirmations.pop(tg_id, None)
+        return self._reply(chat_id, '✅ 已本地退出 %d 个账号，清除 %d 个本地 Token。\n'
+                           '账号、萝卜、日志与偏好保留。主号 /login 官方重授权，其他账号 /token 重登。\n'
+                           '没有向官方发起 Token 撤销。' % (result['accounts'], result['tokens_cleared']),
+                           menu_kb(self._active(tg_id)), msg_id)
 
     def _require_primary(self, tg_id):
+        """要求存在仍在登录状态的主账号；退出后未重新授权则拒绝后续操作。"""
         if not allowed_actor(tg_id, self.store.cfg_all()):
-            raise DomainError('只允许配置的本人 TG 用户操作。')
+            raise DomainError('只允许配置的 TG 用户操作。')
         primary = self.accounts.primary_account(tg_id)
-        if primary is None:
-            raise DomainError('请先 /login，经官方 emospg_bot 授权第一个账号。')
+        if primary is None or not primary.get('logged_in', _flag(primary.get('enabled'))):
+            raise DomainError('请先 /login，经官方授权 Bot 重新授权主账号。')
         return primary
 
     def _show(self, chat_id, view, msg_id=None):
         return self._reply(chat_id, view[0], view[1], msg_id)
 
     def _show_login(self, tg_id, chat_id, msg_id=None, expected=None, official_id=None):
+        """优先使用已登记主号 ID，否则读取 EMOS_USER_ID；显式参数只作本次覆盖。
+
+        固定选择后登记待授权请求并返回官方 Bot 链接，不在聊天中索要缺失配置。"""
         if not allowed_actor(tg_id, self.store.cfg_all()):
-            raise DomainError('只允许配置的本人 TG 用户操作。')
+            raise DomainError('只允许配置的 TG 用户操作。')
         account = self._active(tg_id)
         primary = self.accounts.primary_account(tg_id)
         root = account['id'] if account else 0
@@ -673,22 +744,27 @@ class Bot:
                 raise DomainError('已有官方主账号；其他账号请使用 /token 添加。')
             official_id = primary['emos_id']
         if official_id is None:
-            self.accounts.cancel_login(tg_id)
-            self._clear_input(tg_id)
-            self.accounts.set_input(tg_id, 'login', ttl=600)
-            user = self.accounts.user(tg_id)
-            with self._state_lock:
-                self._guided[tg_id] = ('login', root, user['input_until'])
-            return self._reply(chat_id, '<b>🔐 第一个账号：官方 Bot 授权</b>\n\n'
-                               '请发送你自己的 emos 用户 ID，或使用 <code>/login 你的emosID</code>。\n'
-                               '不是 TG 数字 ID，也不是 emos Token。\n'
-                               '在 emos 官网账号卡片复制用户 ID；授权完成后，其他账号使用 /token 添加。',
-                               [[{'text': '在官网查看 emos ID', 'url': 'https://emos.best/'}],
-                                [{'text': '取消输入', 'callback_data': 'cancel'}]], msg_id)
+            # 未显式传参时以 .env 为唯一来源，不再向用户索要 emos 用户 ID。
+            configured = str(self.store.cfg_all().get('emos_user_id') or '').strip()
+            if not configured:
+                self.accounts.cancel_login(tg_id)
+                self._clear_input(tg_id)
+                return self._reply(chat_id, '<b>🔐 第一个账号：官方 Bot 授权</b>\n\n'
+                                   '尚未配置 emos 用户 ID。\n'
+                                   '请在系统配置 <code>.env</code> 填写 <code>EMOS_USER_ID</code>'
+                                   '（emos 官网账号卡片上的用户 ID，不是 Token），保存后直接发送 /login。\n'
+                                   '也可临时使用 <code>/login 你的emosID</code>。',
+                                   [[{'text': '在官网查看 emos ID',
+                                      'url': str(self.store.cfg_all().get('base_url') or SCHEMA['EMOS_BASE_URL'].default).rstrip('/') + '/'}],
+                                    [{'text': '返回菜单', 'callback_data': 'menu'}]], msg_id)
+            official_id = configured
         if (not isinstance(official_id, str) or not re.fullmatch(r'[A-Za-z0-9_]{1,48}', official_id)
                 or re.fullmatch(r'[0-9]+_[A-Za-z0-9_-]{8,}', official_id)):
-            raise DomainError('请输入 emos 用户 ID，不要在 /login 中提交 Token。')
+            raise DomainError('emos 用户 ID 无效：请检查 .env 的 EMOS_USER_ID，不要填 Token。')
         username = self._identity()
+        cfg = self.store.cfg_all()
+        # 缺键的旧配置或测试替身回落到 schema 默认，不在代码里重复写死地址。
+        auth_bot = str(cfg.get('emos_auth_bot') or SCHEMA['EMOS_AUTH_BOT'].default).strip()
         self._selection(tg_id, root)
         payload = 'link_%s-%s' % (official_id, username)
         if len(payload) > 64:
@@ -696,9 +772,11 @@ class Bot:
         self.accounts.begin_login(tg_id, official_id, expected_root=root)
         self._clear_input(tg_id)
         return self._reply(chat_id, '<b>🔐 官方主账号授权</b>\n\n'
-                           'emos ID：<code>%s</code>\n点击 @emospg_bot 同意授权后返回。10 分钟有效。\n'
-                           '回传的账号和 Telegram 绑定均须与本人一致。已有账号和设置保留。' % _esc(official_id),
-                           [[{'text': '通过官方 Bot 授权', 'url': 'https://t.me/emospg_bot?start=' + payload}],
+                           'emos ID：<code>%s</code>\n点击 @%s 同意授权后返回。10 分钟有效。\n'
+                           '回传的账号和 Telegram 绑定都必须是你自己的。已有账号和设置保留。'
+                           % (_esc(official_id), _esc(auth_bot)),
+                           [[{'text': '通过官方 Bot 授权',
+                              'url': 'https://t.me/%s?start=%s' % (auth_bot, payload)}],
                             [{'text': '取消授权', 'callback_data': 'cancel'}]], msg_id)
 
     def _show_web(self, tg_id, chat_id, expected):
@@ -708,8 +786,8 @@ class Bot:
             raise DomainError('网页配置暂未启用，请联系运营者。')
         url = opener(tg_id)
         self._root(tg_id, expected)
-        self._reply(chat_id, '<b>🌐 本人网页配置</b>\n\n'
-                    '可在网页管理全部本人账号、余额、签到和通知。此入口两分钟内有效且只能使用一次。'
+        self._reply(chat_id, '<b>🌐 配置网页</b>\n\n'
+                    '可在网页管理全部账号、余额、签到和通知。此入口两分钟内有效且只能使用一次。'
                     '请勿转发；普通账号无法访问运营者管理页面。',
                     [[{'text': '打开我的配置网页', 'url': url}],
                      [{'text': '返回菜单', 'callback_data': 'menu'}]])
@@ -720,9 +798,9 @@ class Bot:
         if not primary or not account:
             return self._show_login(tg_id, chat_id, msg_id)
         count = len(self.accounts.owned(tg_id))
-        return self._reply(chat_id, '<b>🥕 emoskata · 本人多账号</b>\n\n'
+        return self._reply(chat_id, '<b>🥕 emoskata · 多账号</b>\n\n'
                            '共 %d 个账号。当前设置对象：<b>%s</b>\n官方 ID：<code>%s</code>\n'
-                           '/sign 处理全部有效本人账号；切换仅改变设置对象。' % (
+                           '/sign 处理全部有效账号；切换仅改变设置对象。' % (
                                count, _esc(account.get('name')), _esc(account.get('emos_id'))),
                            menu_kb(account), msg_id)
 
@@ -765,7 +843,7 @@ class Bot:
         return "\n".join(lines), keyboard
 
     def _view_links(self, tg_id, page=0):
-        raise DomainError('跨 TG 共享已关闭；使用 /token 添加本人账号。')
+        raise DomainError('跨 TG 共享已关闭；使用 /token 添加账号。')
 
     def _view_settings(self, tg_id):
         account = self._root(tg_id)
@@ -803,7 +881,7 @@ class Bot:
         rows = self.accounts.logs(tg_id, limit=40)
         items, page, last, nav = self._pagination(rows, page, "logs:%d" % account["id"])
         lines = ["<b>📜 签到记录</b> · %d/%d 页" % (page + 1, last + 1),
-                 "显示全部本人账号；不展示历史跨 TG 共享目标。", ""]
+                 "显示全部账号；不展示历史跨 TG 共享目标。", ""]
         if not rows:
             lines.append("暂无可见记录。")
         for row in items:
@@ -881,7 +959,7 @@ class Bot:
         linked = self.accounts.redeem(tg_id, target, code, expected_root=expected)
         self._clear_input(tg_id)
         self._reply(chat_id, "⏳ 已提交关联申请：<b>%s</b> · 官方 ID <code>%s</code>\n"
-                    "目标本人需打开关联菜单确认。确认前不能代签；不创建反向或递归权限。" %
+                    "目标账号需打开关联菜单确认。确认前不能代签；不创建反向或递归权限。" %
                     (_esc(linked.get("name")), _esc(linked.get("emos_id"))), menu_kb(self._root(tg_id, expected)))
 
     def _guide(self, tg_id, chat_id, kind, expected, msg_id=None):
@@ -896,7 +974,7 @@ class Bot:
                     [[{"text": "取消输入", "callback_data": "cancel"}]], msg_id)
 
     def _guide_token(self, tg_id, chat_id, msg_id=None):
-        """仅官方主号授权后，记录当前选择并等待本人 token。"""
+        """仅官方主号授权后，记录当前选择并等待 token。"""
         self._require_primary(tg_id)
         account = self._root(tg_id)
         self.accounts.cancel_login(tg_id)
@@ -905,9 +983,9 @@ class Bot:
         user = self.accounts.user(tg_id)
         with self._state_lock:
             self._guided[tg_id] = ('token', account['id'], user['input_until'])
-        return self._reply(chat_id, '<b>🔑 添加本人 emos 账号</b>\n\n'
+        return self._reply(chat_id, '<b>🔑 添加 emos 账号</b>\n\n'
                            '发送该账号的官方 emos Token，核对身份后保存。不是 BotFather 密钥。\n'
-                           '账号必须绑定本人 Telegram。输入 10 分钟有效，切换账号后失效。\n'
+                           '账号必须绑定你的 Telegram。输入 10 分钟有效，切换账号后失效。\n'
                            '消息会尽力删除，不回显 Token。/cancel 取消。',
                            [[{'text': '取消输入', 'callback_data': 'cancel'}]], msg_id)
 
@@ -918,6 +996,7 @@ class Bot:
         if not isinstance(token, str) or not re.fullmatch(r'[A-Za-z0-9_-]{8,256}', token):
             raise DomainError('emos Token 需为 8–256 位字母、数字、下划线或连字符。')
         cfg = self.store.cfg_all()
+        revision = (self.accounts.user(tg_id) or {}).get('login_revision', 0)
         base = cfg.get('base_url') or ''
         self._reply(chat_id, '⏳ 正在向官方核对 Token…')
         try:
@@ -930,7 +1009,8 @@ class Bot:
         self._require_primary(tg_id)
         self._selection(tg_id, expected)
         account = self.accounts.login_with_token(tg_id, token, profile, base_url=base,
-                                                  expected_root=expected)
+                                                  expected_root=expected,
+                                                  expected_login_revision=revision)
         self._clear_input(tg_id)
         self._reply(chat_id, '✅ 已添加或更新 <b>%s</b> · 官方 ID <code>%s</code>\n%s' % (
             _esc(account.get('name')), _esc(account.get('emos_id')), _carrot_text(account)),
@@ -972,6 +1052,7 @@ class Bot:
         return self._time(tg_id, chat_id, expected, text)
 
     def _finish_login(self, tg_id, chat_id, token, expected, login_until, login_revision):
+        """处理官方回传 token；核对请求未过期、登录版本未变，再验官方身份落库。"""
         self._selection(tg_id, expected)
         user = self.accounts.user(tg_id) or {}
         requested_id = user.get('login_emos_id')
@@ -1000,12 +1081,13 @@ class Bot:
         if official is None or isinstance(official, bool) or not str(official).strip():
             raise DomainError("官方资料缺少账号 ID，授权未保存。")
         if str(official).strip() != requested_id:
-            raise DomainError('官方回传账号 ID 与本人本次填写的 ID 不一致，账号未保存。')
+            raise DomainError('官方回传账号 ID 与本次填写的 ID 不一致，账号未保存。')
         linked_tg = profile.get("telegram_user_id")
         if linked_tg in (None, ""):
-            self._reply(chat_id, '官方账号尚未绑定 Telegram，当前凭证不能证明是你的本人账号。\n'
-                        '请在 emos 官网完成本人 TG 绑定后重新 /login。账号未保存。',
-                        [[{'text': '在 emos 官网完成本人绑定', 'url': 'https://emos.best/'}]])
+            self._reply(chat_id, '官方账号尚未绑定 Telegram，当前凭证不能证明是你自己的账号。\n'
+                        '请在 emos 官网完成 TG 绑定后重新 /login。账号未保存。',
+                        [[{'text': '在 emos 官网完成绑定',
+                           'url': str(self.store.cfg_all().get('base_url') or SCHEMA['EMOS_BASE_URL'].default).rstrip('/') + '/'}]])
             return
         if isinstance(linked_tg, str) and re.fullmatch(r"[0-9]{1,19}", linked_tg):
             linked_tg = int(linked_tg)
@@ -1025,13 +1107,14 @@ class Bot:
                     (_esc(account.get("name")), _esc(account.get("emos_id"))), menu_kb(account))
 
     def _run_and_report(self, tg_id, chat_id, expected, content=None):
+        """对全部有效账号签到并汇报；提示发出后再次核对选择，防止切换签错账号。"""
         root = self._root(tg_id, expected)
         if not _flag(root.get("enabled")) or root.get("last_status") == "invalid":
             raise DomainError("当前账号已失效，请重新官方登录。")
         if self.stop_event.is_set():
             return
         self._require_primary(tg_id)
-        self._reply(chat_id, "⏳ 正在签到全部有效本人账号…")
+        self._reply(chat_id, "⏳ 正在签到全部有效账号…")
         # 发送提示后再次检查当前账号，避免提示期间切换导致签错。
         self._root(tg_id, expected)
         if self.stop_event.is_set():
@@ -1055,7 +1138,7 @@ class Bot:
         visible = {account["id"] for account in self.accounts.visible(tg_id)}
         rows = [row for row in rows if isinstance(row, dict) and row.get("id") in visible]
         if not rows:
-            self._reply(chat_id, "没有可报告的签到结果，请查看本人账号状态。", menu_kb(root))
+            self._reply(chat_id, "没有可报告的签到结果，请查看账号状态。", menu_kb(root))
             return
         lines = ["<b>🥕 本次签到</b>", "当前：<b>%s</b> · ID <code>%s</code>" %
                  (_esc(root.get("name")), _esc(root.get("emos_id"))), ""]
@@ -1072,8 +1155,9 @@ class Bot:
 
     def _on_command(self, tg_id, chat_id, text, expected, login_until=0, input_state=None,
                     login_revision=0):
+        """解析斜杠命令并分发；expected/login_until 来自落库状态，不信任消息本身。"""
         if not allowed_actor(tg_id, self.store.cfg_all()):
-            raise DomainError("只允许配置的本人 TG 用户操作。")
+            raise DomainError("只允许配置的 TG 用户操作。")
         if not text.startswith("/"):
             return self._guided_text(tg_id, chat_id, text, expected, input_state)
         parts = text.split()
@@ -1082,7 +1166,7 @@ class Bot:
             return
         cmd, args = command[0].lower(), parts[1:]
         if cmd in {"/links", "/link", "/code"}:
-            raise DomainError("跨 TG 共享已关闭；使用 /token 添加本人账号。")
+            raise DomainError("跨 TG 共享已关闭；使用 /token 添加账号。")
         if cmd == "/start" and args:
             payload = args[0]
             if len(args) != 1:
@@ -1093,7 +1177,7 @@ class Bot:
             if payload.startswith("emosLinkRefuse-"):
                 refused = _number(payload[len("emosLinkRefuse-"):])
                 if refused != tg_id:
-                    raise DomainError("拒绝回传的 Telegram ID 与本人不匹配。")
+                    raise DomainError("拒绝回传的 Telegram ID 不匹配。")
                 if (not login_until or not self.accounts.login_pending(tg_id)
                         or (self.accounts.user(tg_id) or {}).get("login_until") != login_until
                         or (self.accounts.user(tg_id) or {}).get('login_revision') != login_revision):
@@ -1110,17 +1194,22 @@ class Bot:
             self.accounts.cancel_login(tg_id)
             self._clear_input(tg_id)
             return self._reply(chat_id, "已取消待填写输入与登录授权。", menu_kb(self._active(tg_id)))
-        if cmd not in {"/start", "/login", "/menu", "/sign", "/account", "/accounts", "/links",
-                       '/code', '/link', '/settings', '/time', '/logs', '/web', '/token'}:
+        if cmd == '/account':
+            cmd = '/accounts'
+        if cmd not in {'/' + name for name, _ in COMMANDS}:
             return self._reply(chat_id, "不支持此命令。请通过 /login 官方授权，使用 /help 查看命令。", menu_kb(self._active(tg_id)))
         self._selection(tg_id, expected)
+        if cmd == '/logout':
+            if args and args != ['all']:
+                raise DomainError('用法：/logout 退出当前账号；/logout all 全部退出。两者均需确认。')
+            return self._show_logout(tg_id, chat_id, expected, all_accounts=bool(args))
         if cmd in ("/start", "/menu"):
             if args:
                 raise DomainError("请直接使用 /menu。")
             return self._show_menu(tg_id, chat_id)
         if cmd == "/login":
             if len(args) > 1:
-                raise DomainError('用法：/login 本人emos用户ID；不能填写账号密钥。')
+                raise DomainError('用法：/login；emos ID 在 .env 的 EMOS_USER_ID 配置，不能填写账号密钥。')
             return self._show_login(tg_id, chat_id, expected=expected,
                                     official_id=args[0] if args else None)
         if cmd in ("/account", "/accounts"):
@@ -1134,7 +1223,7 @@ class Bot:
         self._root(tg_id, expected)
         if cmd == '/web':
             if args:
-                raise DomainError('请直接发送 /web 打开本人配置。')
+                raise DomainError('请直接发送 /web 打开配置。')
             return self._show_web(tg_id, chat_id, expected)
         if cmd == "/sign":
             content = text.split(None, 1)[1] if args else None
@@ -1168,12 +1257,37 @@ class Bot:
             return self._show(chat_id, self._view_logs(tg_id))
 
     def _on_callback(self, tg_id, chat_id, msg_id, data, arrival_root):
+        """处理按钮回调；arrival_root 是点击时选中的账号，与当前不符即拒绝。"""
         if not allowed_actor(tg_id, self.store.cfg_all()):
-            raise DomainError("只允许配置的本人 TG 用户操作。")
+            raise DomainError("只允许配置的 TG 用户操作。")
+        if not isinstance(data, str) or not 1 <= len(data.encode('utf-8')) <= 64:
+            raise DomainError('按钮参数无效，请刷新菜单。')
         parts = data.split(":")
         action = parts[0]
+        if action in {'logout', 'logoutok', 'logoutno'}:
+            lengths = {'logout': 3, 'logoutok': 4, 'logoutno': 3}
+            if len(parts) != lengths[action]:
+                raise DomainError('退出按钮参数无效。')
+            expected = 0 if parts[1] == '0' else _number(parts[1])
+            self._selection(tg_id, expected)
+            self._selection(tg_id, arrival_root)
+            if action == 'logoutno':
+                with self._state_lock:
+                    pending = self._logout_confirmations.get(tg_id)
+                    if not pending or pending[0] != expected or pending[2] != parts[2]:
+                        raise DomainError('退出确认已失效。')
+                    self._logout_confirmations.pop(tg_id, None)
+                return self._reply(chat_id, '已取消退出，账号密钥没有改变。',
+                                   menu_kb(self._active(tg_id)), msg_id)
+            if parts[2] not in ('one', 'all'):
+                raise DomainError('退出范围无效。')
+            if action == 'logout':
+                return self._show_logout(tg_id, chat_id, expected, parts[2] == 'all', msg_id)
+            if not re.fullmatch(r'[0-9a-f]{8}', parts[3]):
+                raise DomainError('退出确认参数无效。')
+            return self._confirm_logout(tg_id, chat_id, expected, parts[2], parts[3], msg_id)
         if action in {"links", "code", "toggle", "unlink", "review", "withdraw"} or data.startswith("guide:link:"):
-            raise DomainError("跨 TG 共享已关闭；使用 /token 添加本人账号。")
+            raise DomainError("跨 TG 共享已关闭；使用 /token 添加账号。")
         if data == "help":
             return self._reply(chat_id, HELP, menu_kb(self._active(tg_id)), msg_id)
         if data == "cancel":
@@ -1236,7 +1350,7 @@ class Bot:
             self._selection(tg_id, arrival_root)
             target = _number(parts[2])
             if target not in {account["id"] for account in self.accounts.owned(tg_id)}:
-                raise DomainError("只能选择本人已登录的账号。")
+                raise DomainError("只能选择已登录的账号。")
             self.accounts.switch(tg_id, target, expected_root=expected)
             self._clear_input(tg_id)
             self.accounts.cancel_login(tg_id)
@@ -1259,7 +1373,7 @@ class Bot:
                 raise DomainError('申请已过期、已处理或不属于当前账号。')
             if action == 'review':
                 if expected != target:
-                    raise DomainError('只有目标本人可以确认或拒绝。')
+                    raise DomainError('只有目标账号可以确认或拒绝。')
                 self.accounts.review_link(tg_id, source, target, parts[4] == '1', expected_root=expected)
             else:
                 self.accounts.withdraw_link(tg_id, source, target, expected_root=expected)

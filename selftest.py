@@ -1,9 +1,6 @@
-"""兼容自检入口，调用项目正式 unittest 发现器。
+"""兼容自检入口，调用正式 unittest 发现器。
 
-不维护第二套官方接口或语法判据；结果以实际 unittest 输出为准。
-Runtime: Python 3.10+ / 标准库。
-Test: python3 -B selftest.py
-"""
+Run: python3 -B selftest.py；运行依赖与正式测试相同。"""
 from pathlib import Path
 import sys
 import unittest

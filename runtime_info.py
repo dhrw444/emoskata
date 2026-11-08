@@ -1,9 +1,7 @@
-"""按需采集进程 CPU、内存、线程和监听地址。
+"""按需读取进程资源和用于展示的本机地址。
 
-不启动监控线程；不可读取的统计返回未知值，采样值不代表生产资源上限。
-Runtime: Python 3.10+ / 标准库，Linux 的 /proc 为可选统计来源。
-Test: python3 -B -m unittest test_update
-"""
+不创建监控线程；CPU 是两次调用间的单核比例，未知统计返回 None。
+Runtime: Python 3.10+，标准库；内存指标依赖 Linux /proc。"""
 import os
 from pathlib import Path
 import socket

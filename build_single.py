@@ -1,15 +1,12 @@
-"""从维护模块生成独立单文件，并保持模块命名空间隔离。
+"""从维护模块生成独立入口，并保持模块命名空间隔离。
 
-构建需要源码；运行生成入口不需要这些 .py 或 Node。内嵌源码在导入后释放。
-Runtime: Python 3.10+ / 标准库。
-Build: python3 -B build_single.py
-Test: python3 -B build_single.py --check
-"""
+生成内容兼容旧版的明文 _SOURCES 校验；运行不需要旁边的模块或 Node。
+Build: python3 -B build_single.py；Test: python3 -B build_single.py --check。"""
 import ast
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-MODULES = ('envconfig', 'runtime_info', 'emos', 'accounts', 'webui', 'bot', 'app')
+MODULES = ('updates', 'envconfig', 'runtime_info', 'emos', 'accounts', 'webui', 'bot', 'app')
 PACKAGE = '_emoskata_embedded'
 
 
@@ -40,14 +37,10 @@ def embedded_source(name):
 def build(write=True):
     sources = {name: embedded_source(name) for name in MODULES}
     bootstrap = '''#!/usr/bin/env python3
-"""emoskata 单文件入口，由 build_single.py 生成。
+"""emoskata 生成入口；只修改维护模块，再运行 build_single.py。
 
-Run: python3 emoskata.py
-Config: .env；Python 3.10+ 标准库。
-稳态一个应用进程；重启前临时运行导入预检子进程。
-只修改分模块源码，再重建并执行 --check；不要手改此文件。
-维护契约与验收边界见 MAINTENANCE.md / VALIDATION.md。
-"""
+Run: python3 emoskata.py；Python 3.10+，仅标准库。
+配置和 SQLite 独立保存；稳态单进程，更新预检临时使用子进程。"""
 import sys as _sys
 import types as _types
 import importlib.util as _import_util
@@ -67,6 +60,10 @@ for _name, _source in _SOURCES.items():
     _sys.modules[_qualified] = _module
     setattr(_package, _name, _module)
     exec(compile(_source, __file__ + ':' + _name, 'exec'), _module.__dict__)
+    if _name == 'updates':
+        # 在配置与数据库模块导入前处理上次未完成的更新。
+        _module.recover_entry(__file__)
+        _module.capture_image(__file__, globals().get('__emos_image__'))
 
 emos = _package.emos
 accounts = _package.accounts
@@ -75,9 +72,11 @@ bot = _package.bot
 app = _package.app
 main = app.main
 
+# 作为模块导入时也释放字典与最后一段源码；不要求启动 main 才清理。
+_SOURCES.clear()
+del _source
+
 if __name__ == '__main__':
-    _SOURCES.clear()
-    del _source
     if _sys.argv[1:] == ['--init-config']:
         print('唯一配置文件 .env 已准备，凭据不回显；数据库在实际启动时初始化。')
     else:

@@ -1,9 +1,7 @@
-"""owner 变更后的网页、通知及调度权限回归。
+"""owner 变更后的个人网页、通知与调度权限回归。
 
-仅使用临时目录、伪凭证和本地服务；不把替身成功视为生产授权或容器验收。
-Runtime: Python 3.10+ / 标准库。
-Test: python3 -B -m unittest test_owner_web
-"""
+夹具只使用临时或演练数据；本地通过不代表真实官方授权。
+Test: python3 -B -m unittest test_owner_web。"""
 import tempfile
 import unittest
 from urllib.parse import parse_qs, urlsplit

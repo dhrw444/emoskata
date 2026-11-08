@@ -1,9 +1,7 @@
-"""JSON 契约、身份、余额、非幂等请求及网络错误回归。
+"""HTTP JSON 契约、身份、余额与非幂等请求回归。
 
-仅使用临时目录、伪凭证和本地服务；不把替身成功视为生产授权或容器验收。
-Runtime: Python 3.10+ / 标准库。
-Test: python3 -B -m unittest test_client
-"""
+夹具只使用临时或演练数据；本地通过不代表真实官方授权。
+Test: python3 -B -m unittest test_client。"""
 import unittest
 from unittest.mock import patch
 

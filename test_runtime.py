@@ -1,9 +1,7 @@
-"""app/accounts/bot/client 本地集成和 .env 配置回归。
+"""应用、账号、Bot 和客户端的本地 HTTP 集成回归。
 
-仅使用临时目录、伪凭证和本地服务；不把替身成功视为生产授权或容器验收。
-Runtime: Python 3.10+ / 标准库。
-Test: python3 -B -m unittest test_runtime
-"""
+夹具只使用临时或演练数据；本地通过不代表真实官方授权。
+Test: python3 -B -m unittest test_runtime。"""
 import contextlib
 import json
 import os
@@ -493,7 +491,7 @@ class RuntimeTests(unittest.TestCase):
             self.seed_http(server)
             a = self.login(101, 'eA', base)
             cfg = self.app.cfg_all()
-            account = {'id': a['id'], 'token': self.tokens[101], 'emos_id': 'eA'}
+            account = self.app._account_record(a['id'])
             for index in range(self.app.LOG_KEEP + 5):
                 self.app._store_result(account, {'status': 'failed', 'message': 'x%d' % index,
                                                  'point': None}, cfg, 'auto')

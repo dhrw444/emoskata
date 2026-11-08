@@ -1,9 +1,7 @@
-"""账号域历史兼容、SQLite 事务、归属和字段投影回归。
+"""账号域归属、历史迁移、字段投影与 SQLite 事务回归。
 
-仅使用临时目录、伪凭证和本地服务；不把替身成功视为生产授权或容器验收。
-Runtime: Python 3.10+ / 标准库。
-Test: python3 -B -m unittest test_accounts
-"""
+夹具只使用临时或演练数据；本地通过不代表真实官方授权。
+Test: python3 -B -m unittest test_accounts。"""
 
 import sys
 sys.dont_write_bytecode = True

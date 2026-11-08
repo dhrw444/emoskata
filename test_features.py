@@ -1,9 +1,7 @@
-"""配置、身份、并发和已关闭共享入口回归。
+"""配置、官方身份、并发状态与关闭共享入口回归。
 
-仅使用临时目录、伪凭证和本地服务；不把替身成功视为生产授权或容器验收。
-Runtime: Python 3.10+ / 标准库。
-Test: python3 -B -m unittest test_features
-"""
+夹具只使用临时或演练数据；本地通过不代表真实官方授权。
+Test: python3 -B -m unittest test_features。"""
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -228,8 +226,11 @@ class OwnerProofTests(unittest.TestCase):
             message(2,'/start emosLinkAgree-11_fixture_A')
             self.assertEqual(self.accounts.owned(101),[])
             self.assertTrue(any('绑定' in text for chat,text,_ in tg.messages if chat==101))
-            self.assertTrue(any(button.get('url')=='https://emos.best/' for _,_,keyboard in tg.messages
-                                for row in keyboard or [] for button in row))
+            # 官网入口跟随 .env 的 EMOS_BASE_URL，不写死站点地址。
+            links = [button.get('url') for _, _, keyboard in tg.messages
+                     for row in keyboard or [] for button in row]
+            self.assertTrue(any(url and url.rstrip('/').count('/') >= 2 and url.endswith('/')
+                                for url in links), links)
             self.assertFalse(any('✅ 已登录' in text for _,text,_ in tg.messages))
             server.identities['11_fixture_A']['telegram_user_id']='101'
             message(3,'/login eA')

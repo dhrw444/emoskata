@@ -1,10 +1,9 @@
-"""HTTP 管理权限与真实单文件首号、Token 和网页流程回归。
+"""管理员 HTTP 权限、单文件命名空间和账号网页完整流程回归。
 
-仅使用临时目录、伪凭证和本地服务；不把替身成功视为生产授权或容器验收。
-Runtime: Python 3.10+ / 标准库。
-Test: python3 -B -m unittest test_deploy
-"""
+夹具只使用临时或演练数据；本地通过不代表真实官方授权。
+Test: python3 -B -m unittest test_deploy。"""
 from contextlib import contextmanager
+import ast
 import importlib.util
 import json
 import os
@@ -192,7 +191,15 @@ class DeployTests(unittest.TestCase):
         self.assertIs(single.bot.DomainError, single.accounts.DomainError)
         self.assertIs(single.app.AccountService, single.accounts.AccountService)
         self.assertEqual(single.emos.EmosClient('11_fixture').bases, list(single.emos.BASES))
-        self.assertNotIn('from accounts import', '\n'.join(single._SOURCES.values()))
+        tree = ast.parse(first)
+        embedded = next(node.value for node in tree.body if isinstance(node, ast.Assign)
+                        and any(isinstance(target, ast.Name) and target.id == '_SOURCES'
+                                for target in node.targets))
+        sources = ast.literal_eval(embedded)
+        self.assertEqual(len(sources), 8)
+        self.assertNotIn('from accounts import', '\n'.join(sources.values()))
+        self.assertEqual(single._SOURCES, {})
+        self.assertNotIn('_source', vars(single))
 
     def test_single_file_official_first_token_second_owner_web_sign(self):
         stage = Path(self.temp.name) / 'single-only'

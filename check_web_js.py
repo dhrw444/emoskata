@@ -1,9 +1,7 @@
-"""把替换占位符后的真实页面脚本交给 Node 语法检查器。
+"""提取渲染后的四段真实网页脚本，交给 Node 检查语法。
 
-Node 只在开发验证时使用，不是 emoskata 运行依赖。
-Runtime: Python 3.10+ / 标准库，检查另需 Node。
-Test: python3 -B check_web_js.py
-"""
+不模拟 JavaScript 解析规则；Node 只用于开发验收，不是服务运行依赖。
+Run: python3 -B check_web_js.py。"""
 import ast
 from html.parser import HTMLParser
 from pathlib import Path

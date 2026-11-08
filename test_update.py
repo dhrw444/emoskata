@@ -1,9 +1,7 @@
-"""无外部包单文件启动、删除重传、exec 和全部持久数据保留回归。
+"""标准库单文件启动、删除重传、exec 与持久数据保留回归。
 
-仅使用临时目录、伪凭证和本地服务；不把替身成功视为生产授权或容器验收。
-Runtime: Python 3.10+ / 标准库。
-Test: python3 -B -m unittest test_update
-"""
+夹具只使用临时或演练数据；本地通过不代表真实官方授权。
+Test: python3 -B -m unittest test_update。"""
 import json
 import os
 from pathlib import Path
@@ -162,7 +160,8 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(request(self.port, '/api/health')[0], 200)
         status, _, data = request(self.port, '/api/restart', {'confirm': True}, self.cookie)
         self.assertEqual(status, 400)
-        self.assertIn('保留运行', data['error'])
+        self.assertIn('已从最近一次成功启动的快照恢复', data['error'])
+        self.assertEqual(self.entry.read_bytes(), (self.config.path.parent / '.emoskata.py.last-good').read_bytes())
         self.assertIsNone(self.process.poll())
         shutil.copyfile(ROOT / 'emoskata.py', self.entry)
         with self.entry.open('ab') as handle:
@@ -241,6 +240,39 @@ class UpdateTests(unittest.TestCase):
             self.assertIn('自检', str(caught.exception))
             self.assertIn('导入即崩', str(caught.exception))
         self.assertFalse(module._shutdown.is_set())
+
+    def test_missing_entry_restores_from_last_good_snapshot(self):
+        # 入口被删且无 pending 事务时，用成功快照原地恢复，不让人手工重传。
+        module = fixture_app(self, self.root / 'fixture', 'restore_app')
+        body = {name: "VALUE = 1\n" for name in
+                ('envconfig', 'runtime_info', 'emos', 'accounts', 'webui', 'bot', 'app')}
+        self.entry.write_text(_single_file(body))
+        with patch.object(module, '__file__', str(self.entry)):
+            image = module._prepare_core()
+            image.close()
+            # 成功快照与更新事务固定在配置目录，入口可在另一个目录。
+            snapshot = module.CONFIG.path.parent / ('.' + self.entry.name + '.last-good')
+            snapshot.write_bytes(self.entry.read_bytes())
+            snapshot.chmod(0o600)
+            original = self.entry.read_bytes()
+            self.entry.unlink()
+            with self.assertRaises(EnvConfigError) as caught:
+                module._prepare_core()
+            self.assertIn('已从最近一次成功启动的快照恢复', str(caught.exception))
+            self.assertTrue(self.entry.exists())
+            self.assertEqual(self.entry.read_bytes(), original)
+            self.assertEqual(self.entry.stat().st_mode & 0o777, 0o600)
+
+    def test_missing_entry_without_snapshot_is_refused_not_invented(self):
+        # 没有快照时必须明确拒绝，不能凭空虚构一个入口。
+        module = fixture_app(self, self.root / 'fixture', 'nosnap_app')
+        with patch.object(module, '__file__', str(self.entry)):
+            self.entry.write_text(_single_file({'app': "VALUE = 1\n"}))
+            self.entry.unlink()
+            with self.assertRaises(EnvConfigError) as caught:
+                module._prepare_core()
+            self.assertIn('没有可用的成功快照', str(caught.exception))
+            self.assertFalse(self.entry.exists())
 
     def test_probe_does_not_consume_the_image_that_execv_needs(self):
         # 导入预检返回时，源码镜像必须仍从第 0 字节可读。

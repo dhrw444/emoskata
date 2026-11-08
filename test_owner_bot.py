@@ -1,9 +1,7 @@
-"""真实账号域驱动的斜杠菜单、按钮和本人输入回归。
+"""真实账号域驱动的私聊菜单、按钮和输入流程回归。
 
-仅使用临时目录、伪凭证和本地服务；不把替身成功视为生产授权或容器验收。
-Runtime: Python 3.10+ / 标准库。
-Test: python3 -B -m unittest test_owner_bot
-"""
+夹具只使用临时或演练数据；本地通过不代表真实官方授权。
+Test: python3 -B -m unittest test_owner_bot。"""
 import tempfile
 import unittest
 
@@ -146,7 +144,7 @@ class OwnerBotTests(unittest.TestCase):
         views = [self.b._view_accounts(101), self.b._view_settings(101), self.b._view_logs(101)]
         keyboards = [bot.menu_kb(primary)] + [keyboard for _, keyboard in views]
         allowed = {'sign', 'accounts', 'settings', 'logs', 'login', 'token', 'web', 'help',
-                   'mode', 'auto', 'guide', 'pref', 'menu', 'switch', 'cancel', 'relogin', 'hide'}
+                   'mode', 'auto', 'guide', 'pref', 'menu', 'switch', 'cancel', 'relogin', 'hide', 'logout'}
         for keyboard in keyboards:
             for row in keyboard:
                 for button in row:

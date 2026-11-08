@@ -1,9 +1,7 @@
-"""旧限流表迁移、过期回收、模块预检与线程收尾回归。
+"""限流表迁移、失败记录回收、模块预检和线程收尾回归。
 
-仅使用临时目录、伪凭证和本地服务；不把替身成功视为生产授权或容器验收。
-Runtime: Python 3.10+ / 标准库。
-Test: python3 -B -m unittest test_quality_runtime
-"""
+夹具只使用临时或演练数据；本地通过不代表真实官方授权。
+Test: python3 -B -m unittest test_quality_runtime。"""
 import os
 import tempfile
 import threading

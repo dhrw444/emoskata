@@ -1,9 +1,7 @@
-"""隔离配置、数据库和应用导入的测试工厂回归。
+"""创建隔离配置、数据库与应用导入，供正式回归测试使用。
 
-仅使用临时目录、伪凭证和本地服务；不把替身成功视为生产授权或容器验收。
-Runtime: Python 3.10+ / 标准库。
-Test: python3 -B -m unittest discover -p "test_*.py"
-"""
+默认夹具显式去掉 owner 键以覆盖历史模式；single_owner=True 覆盖生产权限。
+所有凭据为夹具值，不读取或覆盖实际部署配置。"""
 import importlib.util
 import os
 from pathlib import Path
@@ -12,7 +10,7 @@ from unittest.mock import patch
 from envconfig import ConfigStore, CFG_TO_ENV
 
 ROOT = Path(__file__).resolve().parent
-BUILD_FILES = ('build_single.py', 'envconfig.py', 'runtime_info.py', 'emos.py',
+BUILD_FILES = ('build_single.py', 'updates.py', 'envconfig.py', 'runtime_info.py', 'emos.py',
                'accounts.py', 'webui.py', 'bot.py', 'app.py')
 
 

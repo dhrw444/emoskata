@@ -1,9 +1,7 @@
-"""个人会话、字段投影及旧数据库兼容回归。
+"""个人网页一次性码、会话、任务与旧数据库兼容回归。
 
-仅使用临时目录、伪凭证和本地服务；不把替身成功视为生产授权或容器验收。
-Runtime: Python 3.10+ / 标准库。
-Test: python3 -B -m unittest test_web
-"""
+夹具只使用临时或演练数据；本地通过不代表真实官方授权。
+Test: python3 -B -m unittest test_web。"""
 import contextlib
 import hashlib
 import json
