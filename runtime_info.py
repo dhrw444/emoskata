@@ -1,7 +1,8 @@
-"""按需读取进程资源和用于展示的本机地址。
+"""按需读取进程资源和展示地址。
 
-不创建监控线程；CPU 是两次调用间的单核比例，未知统计返回 None。
-Runtime: Python 3.10+，标准库；内存指标依赖 Linux /proc。"""
+CPU 比例来自两次调用之间的时间增量；不可读指标返回未知，不伪造零值。
+Runtime: Python 3.10+ / 标准库；由管理页面调用。
+"""
 import os
 from pathlib import Path
 import socket
@@ -33,6 +34,7 @@ def container_ip():
 
 def snapshot():
     """按需采样当前进程；不可获取的指标保留未知值，不创建监控循环。
+
     """
     global _LAST
     now, process = time.monotonic(), time.process_time()

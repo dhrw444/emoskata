@@ -1,7 +1,8 @@
-""".env 的 schema、输入校验、原子保存与文件指纹缓存。
+""".env 的 schema、校验、缺项补齐、原子保存和指纹缓存。
 
-环境变量只在首次创建文件时播种；运行中以文件为准，部分字段重启生效。
-Runtime: Python 3.10+，标准库；文件锁使用 POSIX fcntl。"""
+现有文件值优先；首次创建才播种环境值，显式默认值和空凭据也保留。
+Runtime: Python 3.10+ / 标准库，文件锁依赖 POSIX fcntl。
+"""
 from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
@@ -19,7 +20,8 @@ from urllib.parse import urlsplit
 
 
 class EnvConfigError(ValueError):
-    """配置错误容器；本模块构造的错误只报告键或行号，不拼接配置原值。"""
+    """配置错误容器；本模块构造的错误只报告键或行号，不拼接配置原值。
+    """
 
 
 @dataclass(frozen=True)
@@ -236,7 +238,8 @@ def validate_env(values, allow_unset_password=False):
 
 
 def configured_owner(cfg):
-    """读取唯一 TG 用户 ID；缺失、空白或非法均不返回可用身份。"""
+    """读取唯一 TG 用户 ID；缺失、空白或非法均不返回可用身份。
+    """
     if not isinstance(cfg, dict):
         return None
     raw = str(cfg.get('tg_allowed_user_ids') or '').strip()
@@ -247,7 +250,8 @@ def configured_owner(cfg):
 
 
 def owner_permitted(cfg, tg_id):
-    """运行时唯一权限判据；不把账号已登记当作访问授权。"""
+    """运行时唯一权限判据；不把账号已登记当作访问授权。
+    """
     return type(tg_id) is int and tg_id > 0 and configured_owner(cfg) == tg_id
 
 
@@ -263,13 +267,14 @@ def serialize_env(values):
 def _seed_from_environ(environ=None):
     """仅在首次建 .env 时从 SCHEMA 对应环境变量播种。
 
-    取值仍由 validate_env 校验；已存在的文件不会在运行中被环境变量覆盖。
+    已存在的文件不再读取环境值。默认允许为空的字段保留显式空值，
+    防止之后由旧库补回；其余必填字段的空环境值不替换有效默认值。
     """
     environ = os.environ if environ is None else environ
     seeded = {}
     for key in SCHEMA:
         raw = environ.get(key)
-        if raw is not None and raw != '':
+        if raw is not None and (raw != '' or SCHEMA[key].default == ''):
             seeded[key] = raw
     return seeded
 
@@ -300,6 +305,11 @@ def _read(path):
 
 class ConfigStore:
     def __init__(self, path, create=False):
+        """读取配置；create=True 时创建目录和缺失文件，或补齐缺少的 schema 项。
+
+        原有合法值优先，内容齐全且无标准化变化时不重写；缺失管理员密码才生成。
+        provided_keys 区分用户显式提供与自动默认项，供旧库迁移判断。
+        """
         self.path = Path(path).absolute()
         self.lock = threading.RLock()
         self._fingerprint, self._cache, self._revision = None, None, None
@@ -377,6 +387,10 @@ class ConfigStore:
         self._fingerprint = None
 
     def snapshot(self, force=False):
+        """返回独立配置字典与原文件 SHA256；指纹变化或 force 时重新读取。
+
+        不在运行期随意补齐损坏文件；解析与校验失败明确抛错。
+        """
         with self.lock:
             try:
                 info = self.path.stat()
@@ -392,6 +406,10 @@ class ConfigStore:
             return dict(self._cache), self._revision
 
     def update(self, changes, revision=None, clear_secrets=()):
+        """加锁后按当前文件合并、校验、原子保存；revision 不匹配拒绝。
+
+        敏感字段空白保留原值，clear_secrets 才清空；显式保存也记录默认值来源。
+        """
         if not isinstance(changes, dict) or set(changes) - set(SCHEMA):
             raise EnvConfigError('网页含未知配置项。')
         if not isinstance(clear_secrets, (list, tuple)) or any(k not in SCHEMA or not SCHEMA[k].secret or k == 'PANEL_PASSWORD' for k in clear_secrets):
@@ -411,6 +429,9 @@ class ConfigStore:
             changed = [key for key in SCHEMA if new[key] != old[key]]
             if changed:
                 self._atomic(new)
+            # 成功保存即是显式选择，默认值和明确清空也不能再被旧库覆盖。
+            self.provided_keys.update(changes)
+            self.provided_keys.update(clear_secrets)
             _, new_revision = self.snapshot(force=True)
             return {'revision': new_revision, 'changed': changed,
                     'restart_required': [key for key in changed if SCHEMA[key].restart]}
@@ -418,6 +439,7 @@ class ConfigStore:
     def app_config(self):
         # 热路径用文件指纹避免重复解析，返回副本防止调用方改写缓存。
         """按文件指纹复用解析结果；每次仍检测修改，不用 TTL 延迟热配置。
+
         """
         try:
             info = self.path.stat()

@@ -1,7 +1,8 @@
 """提取渲染后的四段真实网页脚本，交给 Node 检查语法。
 
 不模拟 JavaScript 解析规则；Node 只用于开发验收，不是服务运行依赖。
-Run: python3 -B check_web_js.py。"""
+Run: python3 -B check_web_js.py。
+"""
 import ast
 from html.parser import HTMLParser
 from pathlib import Path

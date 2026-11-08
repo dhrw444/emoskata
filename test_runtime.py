@@ -1,7 +1,8 @@
 """应用、账号、Bot 和客户端的本地 HTTP 集成回归。
 
 夹具只使用临时或演练数据；本地通过不代表真实官方授权。
-Test: python3 -B -m unittest test_runtime。"""
+Test: python3 -B -m unittest test_runtime。
+"""
 import contextlib
 import json
 import os
@@ -176,8 +177,8 @@ class RuntimeTests(unittest.TestCase):
         self.app.cfg_all = lambda: dict(original(), tg_allowed_user_ids='101')
         with serve() as (server, base):
             self.seed_http(server)
-            server.identities[self.tokens[202]]['telegram_user_id'] = 101
-            server.identities[self.tokens[303]]['telegram_user_id'] = 101
+            # 第二号绑定另一 TG，第三号未绑定；两者凭各自 Token 管理。
+            server.identities[self.tokens[303]]['telegram_user_id'] = None
             configure(self.app, base_url=base)
             tg = FakeTG()
             instance = bot.Bot('fixture:bot', self.app.Store(), tg=tg, synchronous=True)
@@ -190,7 +191,7 @@ class RuntimeTests(unittest.TestCase):
             self.dispatch(instance, 101, '/token ' + self.tokens[202])
             self.dispatch(instance, 101, '/token ' + self.tokens[303])
             self.assertEqual(len(self.service.owned(101)), 3)
-            self.dispatch(instance, 101, '/sign')
+            self.dispatch(instance, 101, '/signall')
             self.assertEqual(server.signed, {'eA', 'eB', 'eC'})
             before = list(server.hits)
             self.dispatch(instance, 202, '/sign')
@@ -563,10 +564,16 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn(env, SCHEMA)
 
     def test_legacy_settings_table_moves_into_env_file(self):
-        # 模拟旧 settings 配置迁移到 .env。
-        # 当前值为默认值时才满足此迁移条件。
-        self.app.CONFIG.update({}, clear_secrets=['TG_BOT_TOKEN'])
-        configure(self.app, sign_time='08:00', gap_seconds='8')
+        # 只有原配置中缺失的键可从旧 settings 迁移；显式默认值不能被覆盖。
+        from envconfig import ConfigStore
+        values, _ = self.app.CONFIG.snapshot()
+        missing = {'TG_BOT_TOKEN', 'SIGN_TIME', 'GAP_SECONDS'}
+        legacy_env = Path(self.temp.name) / 'legacy-missing.env'
+        legacy_env.write_text(''.join(key + '=' + json.dumps(value) + '\n'
+                                      for key, value in values.items() if key not in missing))
+        legacy_env.chmod(0o600)
+        self.app.CONFIG = ConfigStore(legacy_env, create=True)
+        self.assertTrue(missing.isdisjoint(self.app.CONFIG.provided_keys))
         self.app.set_setting('tg_bot_token', '123456789:legacyfixture')
         self.app.set_setting('sign_time', '07:30')
         self.app.set_setting('gap_seconds', '12')
@@ -593,8 +600,15 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(self.app.CONFIG.snapshot()[0]['TG_BOT_TOKEN'], '999999:fromenvfile')
 
     def test_legacy_import_skips_invalid_value_without_blocking_startup(self):
-        # 旧库里可能是旧格式的 Token。写不进 .env 就明确拒绝，不能让启动失败。
-        self.app.CONFIG.update({}, clear_secrets=['TG_BOT_TOKEN'])
+        # 原配置缺 Token 时才尝试旧值；非法旧值被拒绝，不拖垮启动。
+        from envconfig import ConfigStore
+        values, _ = self.app.CONFIG.snapshot()
+        legacy_env = Path(self.temp.name) / 'legacy-invalid.env'
+        legacy_env.write_text(''.join(key + '=' + json.dumps(value) + '\n'
+                                      for key, value in values.items() if key != 'TG_BOT_TOKEN'))
+        legacy_env.chmod(0o600)
+        self.app.CONFIG = ConfigStore(legacy_env, create=True)
+        self.assertNotIn('TG_BOT_TOKEN', self.app.CONFIG.provided_keys)
         self.app.set_setting('tg_bot_token', 'not-a-valid-token')
         state = self.app.import_legacy_config()
         self.assertIn('TG_BOT_TOKEN', state['rejected'])

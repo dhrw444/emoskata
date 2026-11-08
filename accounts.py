@@ -1,7 +1,8 @@
-"""账号身份、官方主号证明、当前选择和 SQLite 域事务。
+"""账号身份、主号证明、当前选择和 SQLite 域事务。
 
-业务查询在事务内外复核配置的 TG ID；历史共享表保留，生产入口关闭。
-主号证明不等于有效登录；网络核验由调用方执行，本模块负责落库约束。"""
+本地 owner 是操作者，不代表额外账号的远端 TG 绑定；证明与有效登录分别判断。
+Test: python3 -B -m unittest test_accounts test_owner_accounts test_multi_accounts。
+"""
 
 import hashlib
 import secrets
@@ -17,7 +18,8 @@ from envconfig import configured_owner as _configured_owner
 
 
 class DomainError(Exception):
-    """面向个人页面和 Bot 的领域错误；拼接动态文本时仍由调用者脱敏。"""
+    """面向个人页面和 Bot 的领域错误；拼接动态文本时仍由调用者脱敏。
+    """
 
 
 _ACCOUNT_FIELDS = (
@@ -136,6 +138,7 @@ class AccountService:
     @contextmanager
     def _access(self, tg_id, write=False, links=False):
         """在数据库访问前后复核 owner，配置变化使写事务回滚。
+
         """
         owner = self._actor(tg_id)
         if links and owner is not None:
@@ -159,7 +162,8 @@ class AccountService:
     def primary_account(self, tg_id) -> Optional[dict]:
         """返回已登记官方主号的脱敏视图；logged_in 单独表示本地有效登录。
 
-        退出后证明仍保留，因此返回非 None 不能当作已登录。"""
+        退出后证明仍保留，因此返回非 None 不能当作已登录。
+        """
         tg_id = _positive_id(tg_id)
         try:
             with self._access(tg_id) as (conn, _):
@@ -169,7 +173,8 @@ class AccountService:
             return None
 
     def has_primary_account(self, tg_id) -> bool:
-        """检查保留的官方主号是否仍有本地有效凭据；不发起网络验证。"""
+        """检查保留的官方主号是否仍有本地有效凭据；不发起网络验证。
+        """
         primary = self.primary_account(tg_id)
         return bool(primary and primary['logged_in'])
 
@@ -180,6 +185,8 @@ class AccountService:
         return primary
 
     def _require_primary(self, conn, tg_id):
+        """要求已登记主号仍有有效本地凭据；保留的证明本身不代表登录。
+        """
         primary = self._primary(conn, tg_id)
         if primary is None or not _account(primary)['logged_in']:
             raise DomainError('请先通过官方 emospg_bot 重新授权主账号；主号需有效本地凭证')
@@ -190,7 +197,8 @@ class AccountService:
         # 不用 executescript，避免提交调用者正在持有的迁移事务。
         """在调用方事务内迁移表和索引；要求外键已在事务开始前开启。
 
-        重复官方 ID 只撤销多余行的身份绑定，保留密钥和历史；不兼容索引中止迁移。"""
+        重复官方 ID 只撤销多余行的身份绑定，保留密钥和历史；不兼容索引中止迁移。
+        """
         conn.execute("PRAGMA foreign_keys=ON")
         if conn.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
             raise DomainError("数据库连接必须在事务开始前启用外键")
@@ -315,7 +323,8 @@ class AccountService:
         return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now))
 
     def _ensure(self, conn, tg_id):
-        """保证 tg_users 行存在；后续 UPDATE 才有作用对象，否则静默改 0 行。"""
+        """保证 tg_users 行存在；后续 UPDATE 才有作用对象，否则静默改 0 行。
+        """
         conn.execute(
             "INSERT INTO tg_users(tg_id,chat_id,created) VALUES(?,?,?) "
             "ON CONFLICT(tg_id) DO UPDATE SET chat_id=excluded.chat_id",
@@ -345,7 +354,8 @@ class AccountService:
             return _user(row) if row is not None else None
 
     def begin_login(self, tg_id, official_id, expected_root=None) -> dict:
-        """登记一次待完成的官方授权，10 分钟内有效；登录版本加一，作废更早的请求。"""
+        """登记一次待完成的官方授权，10 分钟内有效；登录版本加一，作废更早的请求。
+        """
         tg_id, official_id = _positive_id(tg_id), _official_id(official_id)
         with self._access(tg_id, write=True) as (conn, owner):
             if owner is not None:
@@ -358,12 +368,14 @@ class AccountService:
             return _user(conn.execute('SELECT * FROM tg_users WHERE tg_id=?', (tg_id,)).fetchone())
 
     def login_pending(self, tg_id) -> bool:
-        """是否仍有未过期的待授权请求；回传 token 时据此判断请求真实性。"""
+        """是否仍有未过期的待授权请求；回传 token 时据此判断请求真实性。
+        """
         row = self.user(tg_id)
         return bool(row and row["login_until"] > self._now())
 
     def cancel_login(self, tg_id) -> None:
-        """撤销待授权请求；登录版本加一，使已发出的回传失效。"""
+        """撤销待授权请求；登录版本加一，使已发出的回传失效。
+        """
         tg_id = _positive_id(tg_id)
         with self._access(tg_id, write=True) as (conn, owner):
             conn.execute("UPDATE tg_users SET login_until=0,login_emos_id='',"
@@ -371,7 +383,8 @@ class AccountService:
 
     def finish_login(self, tg_id, token, profile, base_url='', expected_root=None,
                      expected_login_until=None, expected_login_revision=None) -> dict:
-        """落库官方回传账号；校验 TG 绑定、请求未过期、登录版本未变后才写入。"""
+        """落库官方回传账号；校验 TG 绑定、请求未过期、登录版本未变后才写入。
+        """
         tg_id = _positive_id(tg_id)
         if not isinstance(profile, Mapping):
             raise DomainError("登录资料无效，请重新授权")
@@ -455,10 +468,11 @@ class AccountService:
 
     def login_with_token(self, tg_id, token, profile, base_url='', expected_root=None,
                          expected_login_revision=None) -> dict:
-        """用调用者向官方核验的 profile 添加或更新同 TG 绑定的账号。
+        """用调用者向官方核验的 Token 添加或更新独立 emos 账号。
 
-        单人模式必须已有官方主账号证明；token 路径永不建立或替换 primary。
-        expected_root 可在网络验证结束后的写事务内再次校验选中账号。
+        tg_id 是本 Bot 的操作者和本地列表归属，不是该 emos 账号的 TG 绑定。
+        单人模式须有已登录的官方主号；此路径不建立或替换 primary。
+        expected_root 和登录代际在网络核验后的写事务内再次检查。
         """
         tg_id = _positive_id(tg_id)
         if not isinstance(profile, Mapping):
@@ -467,13 +481,6 @@ class AccountService:
         if official is None or (isinstance(official, str) and not official.strip()):
             official = profile.get("_user_id")
         official = _official_id(official)
-        telegram_id = profile.get("telegram_user_id")
-        if telegram_id in (None, ""):
-            raise DomainError("官方账号尚未绑定 Telegram。请在 emos 官网绑定 TG 后重试；账号未保存")
-        if isinstance(telegram_id, str) and telegram_id.isascii() and telegram_id.isdigit():
-            telegram_id = int(telegram_id) if len(telegram_id) <= 19 else 0
-        if type(telegram_id) is not int or telegram_id != tg_id:
-            raise DomainError("该密钥属于另一个 Telegram 用户，不能加入你的账号列表")
         if not isinstance(token, str) or not token.strip() or len(token) > 8192:
             raise DomainError("登录凭证无效，请重新获取")
         token = token.strip()
@@ -845,9 +852,11 @@ class AccountService:
             conn.execute('DELETE FROM link_requests WHERE source_id=? AND target_id=?',(source_id,target_id))
 
     def run_scope(self, tg_id, include_links=True) -> dict:
-        """返回当前根与允许执行的账号 ID；无有效根时抛 DomainError。
+        """返回当前根与允许执行的 ID；无有效根则抛错。
 
-        单人模式默认覆盖所有有效自有账号，include_links=False 只返回当前根。"""
+        单人模式 include_links=False 仅当前号，True 是同一操作者的全部有效号。
+        历史共享授权仅为旧数据兼容，不对单人入口开放。
+        """
         tg_id = _positive_id(tg_id)
         root_sql = _ROOT + " AND a.enabled=1 AND TRIM(COALESCE(a.token,''))<>'' " \
                            "AND COALESCE(a.last_status,'')<>'invalid' " \
@@ -887,7 +896,8 @@ class AccountService:
     def can_run(self, tg_id, root_id, target_id) -> bool:
         """复核当前选择、根与目标的有效本地凭据以及可见授权。
 
-        单人模式限同一 owner；历史模式允许已授权的一跳，不发起官方请求。"""
+        单人模式限同一 owner；历史模式允许已授权的一跳，不发起官方请求。
+        """
         try:
             tg_id, root_id, target_id = map(_positive_id, (tg_id, root_id, target_id))
             with self._access(tg_id) as (conn, owner):
@@ -987,7 +997,8 @@ class AccountService:
         return result
 
     def set_input(self, tg_id, kind, ttl=600) -> None:
-        """进入等待输入状态并记录类型；只有匹配类型才被消费。"""
+        """进入等待输入状态并记录类型；只有匹配类型才被消费。
+        """
         tg_id = _positive_id(tg_id)
         if kind not in ("link", "time", "login", "token") or not isinstance(kind, str):
             raise DomainError("输入会话类型无效")
@@ -1022,7 +1033,8 @@ class AccountService:
             return ''
 
     def clear_input(self, tg_id) -> None:
-        """退出等待输入；取消、超时和完成时都要调用，避免残留状态吃掉下一条消息。"""
+        """退出等待输入；取消、超时和完成时都要调用，避免残留状态吃掉下一条消息。
+        """
         tg_id = _positive_id(tg_id)
         with self._access(tg_id, write=True) as (conn, owner):
             conn.execute("UPDATE tg_users SET input_kind='',input_until=0 WHERE tg_id=?", (tg_id,))

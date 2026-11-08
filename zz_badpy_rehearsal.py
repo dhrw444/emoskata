@@ -2,7 +2,8 @@
 """语法错误候选被拒绝而旧核心继续服务的手工演练。
 
 夹具只使用临时或演练数据；本地通过不代表真实官方授权。
-Test: python3 -B zz_badpy_rehearsal.py；固定演练目录必须串行使用。。"""
+Test: python3 -B zz_badpy_rehearsal.py；固定演练目录必须串行使用。。
+"""
 
 import json
 import os

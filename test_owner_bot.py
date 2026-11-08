@@ -1,7 +1,8 @@
 """真实账号域驱动的私聊菜单、按钮和输入流程回归。
 
 夹具只使用临时或演练数据；本地通过不代表真实官方授权。
-Test: python3 -B -m unittest test_owner_bot。"""
+Test: python3 -B -m unittest test_owner_bot。
+"""
 import tempfile
 import unittest
 
@@ -20,8 +21,8 @@ class OwnerBotTests(unittest.TestCase):
         self.tg = FakeTG()
         self.profiles = {
             'primary_token_123': {'user_id': 'ePrimary', 'telegram_user_id': 101, '_carrot': 50},
-            'extra_token_12345': {'user_id': 'eExtra', 'telegram_user_id': 101, '_carrot': 777},
-            'third_token_12345': {'user_id': 'eThird', 'telegram_user_id': 101, '_carrot': None},
+            'extra_token_12345': {'user_id': 'eExtra', 'telegram_user_id': 202, '_carrot': 777},
+            'third_token_12345': {'user_id': 'eThird', 'telegram_user_id': None, '_carrot': None},
         }
         self.requests = []
         test = self
@@ -67,6 +68,34 @@ class OwnerBotTests(unittest.TestCase):
         self.assertEqual(self.requests, [])
         self.assertIsNone(self.app.Store().accounts.primary_account(101))
         self.assertIn('官方', self.text())
+
+    def test_token_prompt_and_saved_message_are_brief(self):
+        self.primary()
+        self.tg.actions.clear()
+        before = len(self.requests)
+        self.message('/token')
+        messages = [a for a in self.tg.actions if a[0] in {'send', 'edit'}]
+        self.assertEqual([a[2] for a in messages], ['发送该账号的 emos Token。'])
+        self.assertEqual(len(self.requests), before)
+        self.assertEqual(messages[0][3], [[{'text': '取消', 'callback_data': 'cancel'}]])
+        self.tg.actions.clear()
+        self.message('extra_token_12345')
+        messages = [a for a in self.tg.actions if a[0] in {'send', 'edit'}]
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(messages[0][2], '⏳ 正在验证…')
+        self.assertTrue(messages[1][2].startswith('✅ 已保存 '))
+        self.assertEqual(len(messages[1][2].splitlines()), 2)
+        self.assertIn('777', messages[1][2])
+        self.assertNotIn('extra_token_12345', self.text())
+        buttons = [button for row in messages[1][3] for button in row]
+        self.assertEqual([button['text'] for button in buttons], ['继续添加', '菜单'])
+        self.assertEqual(self.app.Store().accounts.input_state(101), '')
+        self.tg.actions.clear()
+        self.callback(buttons[0]['callback_data'])
+        self.assertEqual(self.app.Store().accounts.input_state(101), 'token')
+        self.assertEqual(self.text(), '发送该账号的 emos Token。')
+        self.message('/cancel')
+        self.assertEqual(self.app.Store().accounts.input_state(101), '')
 
     def test_inline_and_guided_tokens_add_real_domain_accounts(self):
         primary = self.primary()
@@ -143,7 +172,7 @@ class OwnerBotTests(unittest.TestCase):
         self.app.Store().accounts.switch(101, primary['id'])
         views = [self.b._view_accounts(101), self.b._view_settings(101), self.b._view_logs(101)]
         keyboards = [bot.menu_kb(primary)] + [keyboard for _, keyboard in views]
-        allowed = {'sign', 'accounts', 'settings', 'logs', 'login', 'token', 'web', 'help',
+        allowed = {'sign', 'signall', 'accounts', 'settings', 'logs', 'login', 'token', 'web', 'help',
                    'mode', 'auto', 'guide', 'pref', 'menu', 'switch', 'cancel', 'relogin', 'hide', 'logout'}
         for keyboard in keyboards:
             for row in keyboard:
@@ -161,7 +190,7 @@ class OwnerBotTests(unittest.TestCase):
                      'settings:%d' % root, 'logs:%d:0' % root, 'mode:%d:random' % root,
                      'mode:%d:normal' % root, 'auto:%d' % root, 'pref:notify_success',
                      'guide:time:%d' % root, 'token:%d' % root, 'cancel',
-                     'login:%d' % root, 'cancel', 'sign:%d' % root]:
+                     'login:%d' % root, 'cancel', 'sign:%d' % root, 'signall:%d' % root]:
             self.tg.actions.clear()
             self.callback(data)
             self.assertNotIn('按钮已失效或参数无效', self.text(), data)

@@ -1,7 +1,8 @@
 """外置配置恢复、并发上传、登录代际、快照及停机唤醒回归。
 
 夹具只使用临时或演练数据；本地通过不代表真实官方授权。
-Test: python3 -B -m unittest test_handover_runtime。"""
+Test: python3 -B -m unittest test_handover_runtime。
+"""
 import queue
 from pathlib import Path
 import tempfile

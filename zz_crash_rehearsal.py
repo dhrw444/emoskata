@@ -2,7 +2,8 @@
 """导入期异常候选被拒绝的手工演练。
 
 夹具只使用临时或演练数据；本地通过不代表真实官方授权。
-Test: python3 -B zz_crash_rehearsal.py；固定演练目录必须串行使用。。"""
+Test: python3 -B zz_crash_rehearsal.py；固定演练目录必须串行使用。。
+"""
 
 import ast
 import json

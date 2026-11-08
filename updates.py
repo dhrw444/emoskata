@@ -1,7 +1,8 @@
-"""同 PID 的更新事务、成功源码快照与启动失败恢复。
+"""同 PID 更新事务、成功源码快照和启动失败恢复。
 
-配置读取前 recover_entry，再 capture_image；应用就绪后 mark_ready。
-exec_update 只在主线程排空旧任务后调用；没有常驻 watchdog。"""
+配置导入前恢复 pending，再固定源码；就绪后提交，不运行常驻 watchdog。
+Runtime: Python 3.10+ / 标准库；由生成入口与 app 调用。
+"""
 
 # 公共实现同时内嵌进 -c bootstrap；恢复绝不导入磁盘上的 updates.py。
 _COMMON_SOURCE = r'''
@@ -486,7 +487,8 @@ def capture_image(entry, source=None):
 
 
 def mark_ready(entry, config_path):
-    """仅在实际初始化、bind 和核心线程启动成功后原子提交当前内存源码。"""
+    """仅在实际初始化、bind 和核心线程启动成功后原子提交当前内存源码。
+    """
     try:
         entry, config = _absolute(entry), _absolute(config_path)
         if entry not in _IMAGES:

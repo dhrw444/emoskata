@@ -1,7 +1,8 @@
 """标准库单文件启动、删除重传、exec 与持久数据保留回归。
 
 夹具只使用临时或演练数据；本地通过不代表真实官方授权。
-Test: python3 -B -m unittest test_update。"""
+Test: python3 -B -m unittest test_update。
+"""
 import json
 import os
 from pathlib import Path

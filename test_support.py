@@ -1,7 +1,8 @@
 """创建隔离配置、数据库与应用导入，供正式回归测试使用。
 
 默认夹具显式去掉 owner 键以覆盖历史模式；single_owner=True 覆盖生产权限。
-所有凭据为夹具值，不读取或覆盖实际部署配置。"""
+所有凭据为夹具值，不读取或覆盖实际部署配置。
+"""
 import importlib.util
 import os
 from pathlib import Path

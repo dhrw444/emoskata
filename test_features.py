@@ -1,7 +1,8 @@
 """配置、官方身份、并发状态与关闭共享入口回归。
 
 夹具只使用临时或演练数据；本地通过不代表真实官方授权。
-Test: python3 -B -m unittest test_features。"""
+Test: python3 -B -m unittest test_features。
+"""
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -195,7 +196,7 @@ class OwnerProofTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(prefix='emos-owner-proof-')
         self.addCleanup(self.tmp.cleanup)
-        self.app=fixture_app(self,self.tmp.name,'owner_proof_app')
+        self.app=fixture_app(self,self.tmp.name,'owner_proof_app',single_owner=True)
         self.app.init_db()
         self.addCleanup(self.app.close_idle_db)
         self.accounts=self.app.Store().accounts
@@ -237,7 +238,9 @@ class OwnerProofTests(unittest.TestCase):
             message(4,'/start emosLinkAgree-11_fixture_A')
             self.assertEqual(self.accounts.active(101)['emos_id'],'eA')
 
-    def test_official_binding_change_prevents_put_and_disables_until_relogin(self):
+    def test_official_primary_binding_change_prevents_put_and_disables_until_relogin(self):
+        original = self.app.cfg_all
+        self.app.cfg_all = lambda: dict(original(), tg_allowed_user_ids='101')
         with serve() as (server,base):
             self.accounts.begin_login(101, 'eA')
             self.accounts.finish_login(101,'11_fixture_A',{'user_id':'eA','telegram_user_id':101},base)

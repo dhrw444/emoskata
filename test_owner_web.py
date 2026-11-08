@@ -1,7 +1,8 @@
 """owner 变更后的个人网页、通知与调度权限回归。
 
 夹具只使用临时或演练数据；本地通过不代表真实官方授权。
-Test: python3 -B -m unittest test_owner_web。"""
+Test: python3 -B -m unittest test_owner_web。
+"""
 import tempfile
 import unittest
 from urllib.parse import parse_qs, urlsplit
@@ -26,7 +27,7 @@ class OwnerWebTests(unittest.TestCase):
         self.primary = self.service.finish_login(101, 'primary_token_123', {
             'user_id': 'ePrimary', 'telegram_user_id': 101, '_carrot': 40})
         self.extra = self.service.login_with_token(101, 'extra_token_12345', {
-            'user_id': 'eExtra', 'telegram_user_id': 101, '_carrot': 777})
+            'user_id': 'eExtra', 'telegram_user_id': 202, '_carrot': 777})
         self.web = self.app.personal_web()
         self.addCleanup(self.web.stop)
 
@@ -83,7 +84,7 @@ class OwnerWebTests(unittest.TestCase):
         with serve() as (server, base):
             server.identities = {
                 'primary_token_123': {'user_id': 'ePrimary', 'telegram_user_id': 101},
-                'extra_token_12345': {'user_id': 'eExtra', 'telegram_user_id': 101},
+                'extra_token_12345': {'user_id': 'eExtra', 'telegram_user_id': 202},
                 'foreign_token_123': {'user_id': 'eForeign', 'telegram_user_id': 202}}
             with self.app.write_db() as conn:
                 conn.execute('UPDATE accounts SET base_url=?,sign_time=?', (base, '01:00'))

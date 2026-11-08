@@ -1,7 +1,8 @@
 """管理员 HTTP 权限、单文件命名空间和账号网页完整流程回归。
 
 夹具只使用临时或演练数据；本地通过不代表真实官方授权。
-Test: python3 -B -m unittest test_deploy。"""
+Test: python3 -B -m unittest test_deploy。
+"""
 from contextlib import contextmanager
 import ast
 import importlib.util
@@ -216,7 +217,7 @@ class DeployTests(unittest.TestCase):
         with serve() as (server, base):
             configure(single.app, base_url=base)
             server.identities = {'11_singleA': {'user_id': 'eA', 'telegram_user_id': 101, 'carrot': 41},
-                                 '11_singleB': {'user_id': 'eB', 'telegram_user_id': 101, 'carrot': 777}}
+                                 '11_singleB': {'user_id': 'eB', 'telegram_user_id': 202, 'carrot': 777}}
             tg = FakeTG()
             instance = single.bot.Bot('fixture:bot', single.app.Store(), tg=tg, synchronous=True)
             instance._accept_me(tg.get_me())
@@ -230,10 +231,14 @@ class DeployTests(unittest.TestCase):
                 service = single.app.Store().accounts
                 self.assertEqual(len(service.owned(101)), 2)
                 self.assertEqual(service.primary_account(101)['emos_id'], 'eA')
+                self.assertEqual(service.active(101)['emos_id'], 'eB')
                 command(4, 101, '/sign')
+                self.assertEqual(server.signed, {'eB'})
+                server.signed.clear()
+                command(5, 101, '/signall')
                 self.assertEqual(server.signed, {'eA', 'eB'})
                 before = list(server.hits)
-                command(5, 202, '/sign')
+                command(6, 202, '/sign')
                 self.assertEqual(before, server.hits)
                 configure(single.app, web_base_url='http://127.0.0.1:8080')
                 web = single.app.personal_web()
@@ -248,7 +253,13 @@ class DeployTests(unittest.TestCase):
                 self.assertEqual(state['links'], {'incoming': [], 'outgoing': []})
                 server.signed.clear()
                 started = web.start_sign(101, {'account_id': state['active']['id'],
-                    'request_id': 'fixture_single_web_0001'})
+                    'request_id': 'fixture_single_web_one_0001'})
+                web.queue.join()
+                self.assertEqual(len(web.job(101, started['job_id'])['rows']), 1)
+                self.assertEqual(server.signed, {'eB'})
+                server.signed.clear()
+                started = web.start_sign(101, {'account_id': state['active']['id'],
+                    'request_id': 'fixture_single_web_all_0001', 'all_accounts': True})
                 web.queue.join()
                 self.assertEqual(len(web.job(101, started['job_id'])['rows']), 2)
                 self.assertEqual(server.signed, {'eA', 'eB'})

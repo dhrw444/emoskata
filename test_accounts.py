@@ -1,7 +1,8 @@
 """账号域归属、历史迁移、字段投影与 SQLite 事务回归。
 
 夹具只使用临时或演练数据；本地通过不代表真实官方授权。
-Test: python3 -B -m unittest test_accounts。"""
+Test: python3 -B -m unittest test_accounts。
+"""
 
 import sys
 sys.dont_write_bytecode = True
@@ -797,19 +798,19 @@ class AccountCase(unittest.TestCase):
         self.service.login_with_token(101, 'abcdefgh12345678', again, 'https://emos.best')
         self.assertEqual(self.service.active(101)['carrot'], 128)
 
-    def test_token_login_rejects_foreign_telegram_binding(self):
-        # 别人的 token 不能加进自己的列表：官方绑定的 TG 必须是本人。
-        profile = {'user_id': 'eOther', '_user_id': 'eOther', '_display': '别人',
+    def test_token_login_accepts_independent_telegram_binding(self):
+        profile = {'user_id': 'eOther', '_user_id': 'eOther', '_display': '独立账号',
                    'telegram_user_id': 202, '_carrot': 1}
-        with self.assertRaises(DomainError) as caught:
-            self.service.login_with_token(101, 'abcdefgh12345678', profile, 'https://emos.best')
-        self.assertIn('另一个 Telegram', str(caught.exception))
+        account = self.service.login_with_token(101, 'abcdefgh12345678', profile, 'https://emos.best')
+        self.assertEqual(account['emos_id'], 'eOther')
+        self.assertEqual([row['emos_id'] for row in self.service.owned(101)], ['eOther'])
+        self.assertEqual(self.service.owned(202), [])
 
-    def test_token_login_rejects_account_without_telegram_binding(self):
+    def test_token_login_accepts_account_without_telegram_binding(self):
         profile = {'user_id': 'eNoTg', '_user_id': 'eNoTg', '_display': '未绑', '_carrot': 1}
-        with self.assertRaises(DomainError) as caught:
-            self.service.login_with_token(101, 'abcdefgh12345678', profile, 'https://emos.best')
-        self.assertIn('尚未绑定', str(caught.exception))
+        account = self.service.login_with_token(101, 'abcdefgh12345678', profile, 'https://emos.best')
+        self.assertEqual(account['emos_id'], 'eNoTg')
+        self.assertEqual(self.service.active(101)['id'], account['id'])
 
     def test_token_login_cannot_take_over_another_owners_account(self):
         profile = {'user_id': 'eMine', '_user_id': 'eMine', '_display': '我的',
@@ -989,7 +990,8 @@ class MigrationCase(unittest.TestCase):
 
 
 def probes():
-    """先输出不含密钥的实际观测，再运行 unittest 断言。"""
+    """先输出不含密钥的实际观测，再运行 unittest 断言。
+    """
     with tempfile.TemporaryDirectory(prefix="emoskata-account-probe-") as temp:
         store = TempStore(Path(temp) / "probe.sqlite3")
         service = AccountService(store.db, store.write, store.cfg)

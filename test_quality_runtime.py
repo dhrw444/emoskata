@@ -1,7 +1,8 @@
 """限流表迁移、失败记录回收、模块预检和线程收尾回归。
 
 夹具只使用临时或演练数据；本地通过不代表真实官方授权。
-Test: python3 -B -m unittest test_quality_runtime。"""
+Test: python3 -B -m unittest test_quality_runtime。
+"""
 import os
 import tempfile
 import threading

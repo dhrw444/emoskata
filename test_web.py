@@ -1,7 +1,8 @@
 """个人网页一次性码、会话、任务与旧数据库兼容回归。
 
 夹具只使用临时或演练数据；本地通过不代表真实官方授权。
-Test: python3 -B -m unittest test_web。"""
+Test: python3 -B -m unittest test_web。
+"""
 import contextlib
 import hashlib
 import json
@@ -290,7 +291,7 @@ class WebTests(unittest.TestCase):
                     {'id': self.ids['B'], 'emos_id': 'eB', 'name': 'Private_B', 'status': 'failed',
                      'message': 'B_PRIVATE_FAILED_DETAIL', 'carrot': None}]
         self.service.run_user = run
-        posted = self.service.start_sign(101, {'account_id': self.ids['A'], 'request_id': 'fixture_request_0001'})
+        posted = self.service.start_sign(101, {'account_id': self.ids['A'], 'request_id': 'fixture_request_0001', 'all_accounts': True})
         result = self.wait_job(posted['job_id'])
         self.assertEqual(result['status'], 'done')
         self.assertEqual(result['rows'][0]['message'], 'A own detail')
@@ -300,6 +301,26 @@ class WebTests(unittest.TestCase):
             self.service.job(202, posted['job_id'])
         self.accounts.unlink(202, self.ids['A'], self.ids['B'])
         self.assertEqual([row['emos_id'] for row in self.service.job(101, posted['job_id'])['rows']], ['eA'])
+
+    def test_sign_scope_is_boolean_and_replay_cannot_change_it(self):
+        calls = []
+        self.service.run_user = lambda actor, **options: calls.append(options) or []
+        data = {'account_id': self.ids['A'], 'request_id': 'scope_replay_fixture_001'}
+        for invalid in ('all', 1, None, []):
+            with self.subTest(value=invalid), self.assertRaises(DomainError):
+                self.service.start_sign(101, dict(data, all_accounts=invalid))
+        self.assertEqual(calls, [])
+        first = self.service.start_sign(101, data)
+        job = self.wait_job(first['job_id'])
+        self.assertFalse(job['all_accounts'])
+        self.assertEqual(calls, [{'include_links': False, 'expected_root': self.ids['A']}])
+        with self.assertRaises(DomainError):
+            self.service.start_sign(101, dict(data, all_accounts=True))
+        second = self.service.start_sign(101, dict(data, request_id='scope_replay_fixture_002', all_accounts=True))
+        job = self.wait_job(second['job_id'])
+        self.assertTrue(job['all_accounts'])
+        self.assertEqual(calls[-1], {'include_links': True, 'expected_root': self.ids['A']})
+        self.assertNotEqual(first['job_id'], second['job_id'])
 
     def test_double_sign_request_replay_uses_same_job_not_new_run(self):
         calls = []
@@ -353,7 +374,7 @@ class WebTests(unittest.TestCase):
             post(303, 'review', {'account_id': self.ids['C'], 'source_id': self.ids['B'],
                                  'target_id': self.ids['C'], 'approve': True})
             with patch.object(self.app._shutdown, 'wait', return_value=False):
-                started = post(101, 'sign', {'account_id': self.ids['A'], 'request_id': 'fixture_http_sign_0001'})
+                started = post(101, 'sign', {'account_id': self.ids['A'], 'request_id': 'fixture_http_sign_0001', 'all_accounts': True})
                 self.service.queue.join()
                 result = self.request(server, '/api/web/job?job_id=' + started['job_id'], cookie='wsid=' + a['sid'])
                 self.assertEqual(result[0], 200)

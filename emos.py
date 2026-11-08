@@ -1,7 +1,8 @@
-"""emos HTTP 客户端、官方身份核验与签到结果归一。
+"""emos JSON 请求、Token 身份核验与签到结果归一。
 
-自定义站点不追加公共备用域；请求前的撤销守卫由调用方提供。
-Runtime: Python 3.10+，标准库；协议结果不等于本地授权。"""
+自定义域不追加公共域；请求守卫核对撤销状态，非幂等请求不保证恰好一次。
+Test: python3 -B -m unittest test_client。
+"""
 import json
 import random
 import re
@@ -189,7 +190,8 @@ class EmosClient:
         return result
 
     def check(self):
-        """读取官方登录状态 is_sign，不用于判定今天是否已经签到。"""
+        """读取官方登录状态 is_sign，不用于判定今天是否已经签到。
+        """
         status, body = self.call('GET', '/api/sign/check')
         if status != 200 or not isinstance(body.get('is_sign'), bool):
             raise EmosError('登录状态响应不完整。', status)
@@ -198,7 +200,8 @@ class EmosClient:
         return body['is_sign'], body
 
     def do_sign(self, content=''):
-        """发送已选定的 content query；空文本表示不带附言的普通签到。"""
+        """发送已选定的 content query；空文本表示不带附言的普通签到。
+        """
         return self.call('PUT', '/api/user/sign', {'content': content} if content else None)
 
     def sign_once(self, content='', mode='normal'):

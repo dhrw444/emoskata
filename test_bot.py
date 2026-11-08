@@ -1,7 +1,8 @@
 """Bot 路由、消息失败、任务队列、菜单和替身签名回归。
 
 夹具只使用临时或演练数据；本地通过不代表真实官方授权。
-Test: python3 -B -m unittest test_bot。"""
+Test: python3 -B -m unittest test_bot。
+"""
 
 from collections import deque
 from contextlib import redirect_stdout
@@ -108,7 +109,8 @@ class FakeAccounts:
 
     def login_with_token(self, tg_id, token, profile, base_url="", expected_root=None,
                          expected_login_revision=None):
-        """只用于 Bot 交互测试；真实域权限由 test_owner_accounts 覆盖。"""
+        """只用于 Bot 交互测试；真实域权限由 test_owner_accounts 覆盖。
+        """
         if not self.primary_account(tg_id):
             raise DomainError('请先官方授权主账号')
         selected = self.active(tg_id, required=False)
@@ -119,10 +121,6 @@ class FakeAccounts:
         official = profile.get("user_id") or profile.get("_user_id")
         if not official:
             raise DomainError("缺少官方 ID")
-        if profile.get("telegram_user_id") in (None, ""):
-            raise DomainError("官方账号尚未绑定 Telegram")
-        if int(profile["telegram_user_id"]) != tg_id:
-            raise DomainError("该密钥属于另一个 Telegram 用户，不能加入你的账号列表")
         aid = next((aid for aid, row in self.rows.items() if row["emos_id"] == str(official)), None)
         if aid is not None and self.owners[aid] != tg_id:
             raise DomainError("该官方账号已归属其他用户，不能加入")
@@ -822,15 +820,19 @@ class BotTests(unittest.TestCase):
         self.assertEqual(self.store.accounts.grants, before)
         self.assertIn('跨 TG 共享', self.text())
 
-    def test_sign_covers_all_owner_accounts_not_shared_targets(self):
+    def test_sign_current_and_all_have_distinct_scopes(self):
         a = self.own(); second = self.own(101, 'eSecond')
         target = self.own(202, 'eB')
         self.store.accounts.switch(101, a['id'])
         self.store.accounts.grants[a['id'], target['id']] = True
         self.message('/sign')
-        self.assertEqual(self.store.runs, [(101, True, a['id'], [a['id'], second['id']])])
+        self.assertEqual(self.store.runs[-1], (101, False, a['id'], [a['id']]))
         self.message('/sign 今天也在')
         self.assertEqual(self.store.run_contents[-1], '今天也在')
+        self.assertEqual(self.store.runs[-1], (101, False, a['id'], [a['id']]))
+        self.message('/signall')
+        self.assertEqual(self.store.runs[-1], (101, True, a['id'], [a['id'], second['id']]))
+        self.assertIsNone(self.store.run_contents[-1])
 
     def test_revoke_during_sign_removes_target_report(self):
         a = self.own()

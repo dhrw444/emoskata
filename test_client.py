@@ -1,7 +1,8 @@
 """HTTP JSON 契约、身份、余额与非幂等请求回归。
 
 夹具只使用临时或演练数据；本地通过不代表真实官方授权。
-Test: python3 -B -m unittest test_client。"""
+Test: python3 -B -m unittest test_client。
+"""
 import unittest
 from unittest.mock import patch
 

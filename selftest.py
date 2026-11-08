@@ -1,6 +1,7 @@
 """兼容自检入口，调用正式 unittest 发现器。
 
-Run: python3 -B selftest.py；运行依赖与正式测试相同。"""
+Run: python3 -B selftest.py；运行依赖与正式测试相同。
+"""
 from pathlib import Path
 import sys
 import unittest

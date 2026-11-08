@@ -2,7 +2,8 @@
 """入口删除重传、核心重启和数据库保留的手工演练。
 
 夹具只使用临时或演练数据；本地通过不代表真实官方授权。
-Test: python3 -B zz_restart_rehearsal.py；固定演练目录必须串行使用。。"""
+Test: python3 -B zz_restart_rehearsal.py；固定演练目录必须串行使用。。
+"""
 import json
 import os
 import shutil
@@ -20,7 +21,8 @@ MARKER = 'RESTART_MARKER_EVIDENCE.txt'
 
 
 def env_port(root):
-    """从已生成的 .env 读取端口；该文件存在后进程 PORT 不覆盖它。"""
+    """从已生成的 .env 读取端口；该文件存在后进程 PORT 不覆盖它。
+    """
     path = os.path.join(root, '.env')
     if not os.path.exists(path):
         return 8080
@@ -67,7 +69,8 @@ def wait_health(seconds=90):
 
 
 def snapshot_db(root):
-    """快照账号身份、余额和用户选择；日志条数仅供观察，不作为等值判据。"""
+    """快照账号身份、余额和用户选择；日志条数仅供观察，不作为等值判据。
+    """
     conn = sqlite3.connect(os.path.join(root, 'data', 'data.db'))
     conn.row_factory = sqlite3.Row
     try:

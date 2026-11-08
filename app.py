@@ -1,8 +1,8 @@
-"""SQLite、调度、通知、管理员 HTTP 与应用核心生命周期。
+"""持久数据、HTTP、调度、通知和单进程核心生命周期。
 
-配置和数据路径在启动时固定；更新先隔离预检，再排空任务并在同 PID 切换。
-Run: python3 emoskata.py；分模块运行用 python3 app.py。
-Runtime: Python 3.10+，标准库，POSIX。"""
+配置与 SQLite 独立于程序；先隔离预检并排空，更新就绪前失败恢复快照。
+Run: python3 app.py，或使用生成入口 emoskata.py；仅标准库。
+"""
 
 import hashlib
 import html
@@ -72,7 +72,8 @@ _notification_wakeup = threading.Event()
 def request_restart():
     """在锁内固定并预检候选字节，成功后进入排空状态。
 
-    已有重启或正在停机返回 False；候选失败抛配置错误，旧核心继续运行。"""
+    已有重启或正在停机返回 False；候选失败抛配置错误，旧核心继续运行。
+    """
     global _restart_status, _restart_error, _restart_image
     with _restart_lock:
         if _restart_requested.is_set() or _shutdown.is_set():
@@ -103,7 +104,8 @@ LOG_KEEP = 200
 
 
 class DatabaseBusy(sqlite3.OperationalError):
-    """数据库达到容量或正在收尾；不暴露 SQL、凭据和底层异常。"""
+    """数据库达到容量或正在收尾；不暴露 SQL、凭据和底层异常。
+    """
 
 
 def _close_physical(connection):
@@ -228,7 +230,8 @@ def db():
 
 
 def close_idle_db():
-    """同步关闭空闲和隔离连接，关闭完成前暂停新的预约。"""
+    """同步关闭空闲和隔离连接，关闭完成前暂停新的预约。
+    """
     global _db_closing, _db_purging
     with _db_available:
         while _db_purging:
@@ -265,7 +268,8 @@ def _seal_db_pool(sealed):
 def write_db():
     """串行持有 BEGIN IMMEDIATE 写事务；退出时提交或回滚，并归还连接租约。
 
-    事务中的其他查询必须复用 conn，不能再次 db()。"""
+    事务中的其他查询必须复用 conn，不能再次 db()。
+    """
     with _write_lock:
         with db() as conn:
             conn.execute('BEGIN IMMEDIATE')
@@ -275,7 +279,8 @@ def write_db():
 def init_db():
     """在一个写事务内补齐 schema、索引和限流记录；不清空账号及签到历史。
 
-    迁移不兼容时抛错；目录及数据库权限的 chmod 为尽力执行。"""
+    迁移不兼容时抛错；目录及数据库权限的 chmod 为尽力执行。
+    """
     with write_db() as conn:
         for statement in (
             'CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value TEXT)',
@@ -335,23 +340,20 @@ LEGACY_SETTING_KEYS = (
 
 
 def import_legacy_config():
-    """一次性把旧 settings 配置导入 .env。
+    """一次性导入旧 settings，仅补用户未提供的字段。
 
-    只导入当前等于默认值的字段；无法区分用户显式设置的默认值。
-    明文密码仅可在首次建文件时继承；非法旧值逐项拒绝，不修改已有账号与日志。
+    .env 中的显式默认值和空密钥同样优先，不用数值猜配置来源。
+    密码及进程环境只由 ConfigStore 首次建文件处理；非法旧值逐项拒绝。
     """
     state = {'imported': [], 'untouched': [], 'rejected': [], 'password_inherited': False}
     if get_setting('legacy_config_imported') == '1':
         return state
     current, _ = CONFIG.snapshot()
     changes = {}
-    if CONFIG.created:
-        inherited = (os.environ.get('PANEL_PASSWORD') or '').strip()
-        if len(inherited) >= 8:
-            changes['PANEL_PASSWORD'] = inherited
     for legacy, key in LEGACY_SETTING_KEYS:
         value = (get_setting(legacy) or '').strip()
-        if not value or value == SCHEMA[key].default or current.get(key) != SCHEMA[key].default:
+        if (key in CONFIG.provided_keys or not value or value == SCHEMA[key].default
+                or current.get(key) != SCHEMA[key].default):
             continue
         changes[key] = value
     for key, value in changes.items():
@@ -430,7 +432,8 @@ def verify_password(pw):
 def init_password():
     """把当前配置密码同步为 scrypt 校验值；密码变化时清除管理员会话。
 
-    只有首次创建配置才返回用于一次性展示的密码。"""
+    只有首次创建配置才返回用于一次性展示的密码。
+    """
     source = CONFIG.password()
     if not verify_password(source):
         with write_db() as conn:
@@ -487,7 +490,8 @@ def rl_blocked(ip):
 
 
 def _purge_login_failures(conn, now):
-    """回收过期锁定和超过保留窗口的零散错误；仍有效的锁定不删除。"""
+    """回收过期锁定和超过保留窗口的零散错误；仍有效的锁定不删除。
+    """
     conn.execute('DELETE FROM login_fail WHERE (until>0 AND until<=?) '
                  'OR (until=0 AND updated_at<=?)', (now, now - LOGIN_FAIL_TTL))
 
@@ -600,7 +604,8 @@ def _deliver_notification(task):
 def _request_shutdown():
     """设置停机标记，并给通知队列送入一次唤醒。
 
-    信号处理器只设标记；这里由正常收尾路径调用，避免信号中重入队列锁。"""
+    信号处理器只设标记；这里由正常收尾路径调用，避免信号中重入队列锁。
+    """
     _shutdown.set()
     if _notification_wakeup.is_set():
         return
@@ -612,7 +617,8 @@ def _request_shutdown():
 
 
 def notification_loop():
-    """等待通知而不定时空转；None 只用于停机唤醒，任务计数始终归还。"""
+    """等待通知而不定时空转；None 只用于停机唤醒，任务计数始终归还。
+    """
     while not _shutdown.is_set():
         task = _notifications.get()
         try:
@@ -626,7 +632,8 @@ def notification_loop():
 
 def _account_record(account_id):
     with db() as conn:
-        row = conn.execute('SELECT a.*,u.login_revision AS owner_login_revision '
+        row = conn.execute('SELECT a.*,u.login_revision AS owner_login_revision, '
+                           'u.primary_account_id AS owner_primary_account_id '
                            'FROM accounts a LEFT JOIN tg_users u ON u.tg_id=a.owner_tg_id '
                            'WHERE a.id=?', (account_id,)).fetchone()
     return dict(row) if row else None
@@ -640,7 +647,8 @@ def _next_retry(count):
 def _store_result(account, result, cfg, trigger):
     """在写事务中核对凭据、归属和登录代际，再写结果与有限日志。
 
-    过期快照返回 None；invalid 停用账号，未知余额不覆盖已有余额。"""
+    过期快照返回 None；invalid 停用账号，未知余额不覆盖已有余额。
+    """
     now = now_local(cfg)
     today, stamp = now.strftime('%Y-%m-%d'), now.strftime('%Y-%m-%d %H:%M:%S')
     status = result['status']
@@ -700,7 +708,8 @@ def _store_result(account, result, cfg, trigger):
 
 
 def _auto_permission(owner, source_id, target_id, cfg):
-    """自动签到前的即时授权复核；主账号失效或归属改变即拒绝，不依赖启动时的快照。"""
+    """自动签到前的即时授权复核；主账号失效或归属改变即拒绝，不依赖启动时的快照。
+    """
     live = cfg_all()
     if 'tg_allowed_user_ids' in live:
         if (not owner_permitted(live, owner) or source_id != target_id
@@ -731,7 +740,8 @@ def _auto_permission(owner, source_id, target_id, cfg):
 def _run_ids(cfg, account_ids, trigger='manual', actor=None, root_id=None, scopes=None, content=None):
     """串行执行账号列表；请求前复核权限，写回时再核对账号快照。
 
-    已有执行返回 None。撤销可拦截后续请求和旧结果，不能撤回已发送的 HTTP。"""
+    已有执行返回 None。撤销可拦截后续请求和旧结果，不能撤回已发送的 HTTP。
+    """
     if not _run_lock.acquire(blocking=False):
         return None
     rows, unavailable = [], set()
@@ -777,7 +787,9 @@ def _run_ids(cfg, account_ids, trigger='manual', actor=None, root_id=None, scope
                     client = EmosClient(account['token'], endpoint, timeout=cfg['emos_timeout'])
                     client.before_request = allowed
                     client.expected_user_id = account['emos_id']
-                    client.expected_telegram_id = account['owner_tg_id']
+                    # owner_tg_id 是本地管理人；仅官方首号的远端 TG 绑定要求一致。
+                    if account['id'] == account.get('owner_primary_account_id'):
+                        client.expected_telegram_id = account['owner_tg_id']
                     override = content if actor is not None and account_id == root_id else None
                     result = client.sign_once(override or '', mode=account['sign_mode'])
                 except EmosError as error:
@@ -818,7 +830,8 @@ def run_user(tg_id, include_links=True, expected_root=None, content=None):
 def _eligible(account, now, cfg, automatic):
     """本地调度候选判据：启用、有凭据、当天未完成且退避允许。
 
-    automatic=True 才检查自动开关和时间；网络身份和授权另行核验。"""
+    automatic=True 才检查自动开关和时间；网络身份和授权另行核验。
+    """
     today = now.strftime('%Y-%m-%d')
     if (not account['enabled'] or not str(account['token'] or '').strip()
             or account['last_day'] == today):
@@ -932,7 +945,8 @@ PAGE = '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name
 # HTTP 入口
 
 def _cookie_value(handler, name):
-    """读取请求中的第一个同名 Cookie；缺失返回空字符串。"""
+    """读取请求中的第一个同名 Cookie；缺失返回空字符串。
+    """
     raw = handler.headers.get('Cookie') or ''
     for part in raw.split(';'):
         key, _, value = part.strip().partition('=')
@@ -1407,7 +1421,8 @@ def _probe_core(image, entry, module_dir=None):
 
     配置和 SQLite 都使用副本；业务线程停在门闩，不进入 Bot、调度或通知。
     候选沿用当前端口时改绑临时端口，真实切换仍要重新绑定目标端口。
-    失败抛配置错误；不返回镜像，也不是任意候选代码的安全沙箱。"""
+    失败抛配置错误；不返回镜像，也不是任意候选代码的安全沙箱。
+    """
     import shutil
     import subprocess
     import tempfile
@@ -1477,7 +1492,8 @@ def _prepare_core():
     """固定候选字节并完成语法及隔离启动预检，返回游标为零的临时镜像。
 
     只有入口本身缺失时尝试恢复成功快照，并要求再次重启；依赖缺失不覆盖入口。
-    异常关闭镜像。接受后再删或重传入口不改变本次使用的字节。"""
+    异常关闭镜像。接受后再删或重传入口不改变本次使用的字节。
+    """
     import ast
     import tempfile
     entry = os.path.abspath(__file__)
@@ -1529,11 +1545,13 @@ def _prepare_core():
 
 
 def _restore_last_good(entry):
-    """只恢复缺失入口；快照定位与排他写入由 updates 统一维护。"""
+    """只恢复缺失入口；快照定位与排他写入由 updates 统一维护。
+    """
     return restore_missing_entry(entry, str(CONFIG.path))
 
 def _exec_core(image=None):
-    """切换已验证字节；启动失败时由更新事务恢复旧代码、配置和数据库。"""
+    """切换已验证字节；启动失败时由更新事务恢复旧代码、配置和数据库。
+    """
     image = image or _prepare_core()
     cfg = CONFIG.app_config()
     selected = Path(cfg['data_dir']).expanduser()
@@ -1545,7 +1563,8 @@ def _exec_core(image=None):
 def _drain_core(timeout=0):
     """开始拒收新业务，检查队列、请求、连接和网络任务是否都已归还。
 
-    这是一次即时判定，不等待；main 负责重试和截止时间。"""
+    这是一次即时判定，不等待；main 负责重试和截止时间。
+    """
     if _web_service is not None:
         _web_service.begin_drain()
         with _web_service.lock:
@@ -1609,7 +1628,8 @@ def _resume_core():
 def _stop_core(timeout):
     """通知核心退出并等待线程、连接收尾；返回是否允许安全 exec。
 
-    没有收完返回 False，调用方取消更新并恢复旧核心。"""
+    没有收完返回 False，调用方取消更新并恢复旧核心。
+    """
     deadline = time.monotonic() + max(0, timeout)
     _request_shutdown()
     _CORE_START_GATE.set()
@@ -1631,7 +1651,8 @@ def _stop_core(timeout):
 
 
 def _cancel_restart(message, status='failed'):
-    """拒绝重启时统一回滚状态，避免界面显示"正在重启"但实际没动。"""
+    """拒绝重启时统一回滚状态，避免界面显示"正在重启"但实际没动。
+    """
     global _restart_status, _restart_error, _restart_image
     _restart_status, _restart_error = status, message
     if _restart_image is not None:
@@ -1648,7 +1669,8 @@ _restart_image = None
 def main():
     """初始化持久化、监听和核心线程；就绪提交后才释放业务门闩。
 
-    预检模式在就绪点返回；正常模式处理停机与同 PID 更新，finally 收尾自己创建的资源。"""
+    预检模式在就绪点返回；正常模式处理停机与同 PID 更新，finally 收尾自己创建的资源。
+    """
     global _HTTP_SERVER, _restart_status, _restart_error
     _CORE_START_GATE.clear()
     _HTTP_SERVER = None

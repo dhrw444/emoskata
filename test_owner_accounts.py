@@ -1,7 +1,8 @@
 """单用户准入、官方主号证明和全部有效账号范围回归。
 
 夹具只使用临时或演练数据；本地通过不代表真实官方授权。
-Test: python3 -B -m unittest test_owner_accounts。"""
+Test: python3 -B -m unittest test_owner_accounts。
+"""
 import sys
 sys.dont_write_bytecode = True
 
@@ -290,18 +291,23 @@ class OwnerAccountCase(unittest.TestCase):
         self.store.config['tg_allowed_user_ids'] = str(OWNER)
         self.assertEqual(self.snapshot(), before)
 
-    def test_same_tg_required_for_tokens_and_legacy_other_owner_cannot_be_taken(self):
-        self.official()
+    def test_independent_tokens_keep_local_owner_and_cannot_take_existing_local_account(self):
+        primary = self.official()
         foreign = self.foreign()
+        for index, tg_id in enumerate((None, '', OTHER, '202')):
+            official = 'EXTRA-%d' % index
+            with self.subTest(tg_id=tg_id):
+                added = self.service.login_with_token(OWNER, 'fake-extra-%d' % index,
+                                                      self.profile(official, tg_id))
+                self.assertEqual(added['emos_id'], official)
+                self.assertEqual(self.service.primary_account(OWNER)['id'], primary['id'])
+                self.assertEqual(self.rows('SELECT owner_tg_id FROM accounts WHERE id=?',
+                                          (added['id'],))[0]['owner_tg_id'], OWNER)
         before = self.snapshot()
-        for tg_id in (None, '', True, OTHER, '202', '101.0'):
-            with self.subTest(tg_id=tg_id), self.assertRaises(DomainError):
-                self.service.login_with_token(OWNER, 'fake-foreign', self.profile('NEW', tg_id))
         with self.assertRaises(DomainError):
-            self.service.login_with_token(OWNER, foreign['token'], self.profile('FOREIGN'))
+            self.service.login_with_token(OWNER, foreign['token'], self.profile('FOREIGN', OTHER))
         self.assertEqual(self.snapshot(), before)
-        added = self.service.login_with_token(OWNER, 'fake-owner-string', self.profile('STRING-TG', '101'))
-        self.assertEqual(added['emos_id'], 'STRING-TG')
+        self.assertEqual(len(self.service.owned(OWNER)), 5)
         self.service.set_input(OWNER, 'token', ttl=600)
         self.assertEqual(self.service.input_state(OWNER), 'token')
         self.service.clear_input(OWNER)

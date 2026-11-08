@@ -1,7 +1,8 @@
-"""个人网页会话、一次性入口、账号视图与有界签到任务队列。
+"""个人网页会话、一次性入口、账号视图和按需签到任务。
 
-HTTP 监听由 app 管理；会话存 SQLite，任务和退出确认只在当前进程内有效。
-Runtime: Python 3.10+，标准库；由 app 提供数据库与路由。"""
+监听由 app 持有；有效会话在 SQLite，任务和确认在内存，范围入队后固定。
+Test: python3 -B -m unittest test_web test_owner_web test_multi_accounts。
+"""
 import hashlib
 import hmac
 import json
@@ -51,7 +52,8 @@ def web_origin(value):
 
 
 def _digest(value):
-    """生成网页一次性码或 sid 的库内摘要；不负责 emos Token 的存储方式。"""
+    """生成网页一次性码或 sid 的库内摘要；不负责 emos Token 的存储方式。
+    """
     return hashlib.sha256(value.encode('ascii')).hexdigest()
 
 
@@ -66,7 +68,8 @@ def _local_id(value, allow_zero=False):
 
 
 def _only(body, allowed):
-    """拒绝白名单外字段，避免客户端悄悄改到不该改的列。"""
+    """拒绝白名单外字段，避免客户端悄悄改到不该改的列。
+    """
     if not isinstance(body, dict) or set(body) - set(allowed):
         raise DomainError('请求字段无效。')
 
@@ -84,7 +87,8 @@ class WebService:
         self.stopping = threading.Event()
 
     def _owner(self, tg_id, conn=None):
-        """要求该 TG ID 已通过官方授权并仍有有效主账号；conn 可复用调用方事务。"""
+        """要求该 TG ID 已通过官方授权并仍有有效主账号；conn 可复用调用方事务。
+        """
         cfg = self.cfg()
         if 'tg_allowed_user_ids' in cfg:
             if not owner_permitted(cfg, tg_id):
@@ -104,6 +108,8 @@ class WebService:
 
     @staticmethod
     def init_schema(conn):
+        """在调用方事务中创建缺失的入口码与会话表，不清空已有有效会话。
+        """
         conn.execute('CREATE TABLE IF NOT EXISTS web_auth_codes ('
                      'code_hash TEXT PRIMARY KEY,tg_id INTEGER NOT NULL REFERENCES tg_users(tg_id) '
                      'ON DELETE CASCADE,expires_at INTEGER NOT NULL)')
@@ -114,7 +120,8 @@ class WebService:
                      'csrf_token TEXT NOT NULL)')
 
     def issue_url(self, tg_id):
-        """生成一次性网页入口码；库内只存码的摘要，原码放在 URL fragment。"""
+        """生成一次性网页入口码；库内只存码的摘要，原码放在 URL fragment。
+        """
         self._owner(tg_id)
         base = web_origin(self.cfg().get('web_base_url') or '')
         if not self.accounts.owned(tg_id):
@@ -131,7 +138,8 @@ class WebService:
         return base + '/web/auth#code=' + code
 
     def exchange(self, code):
-        """一次性入口码换会话；码删除与发会话在同一写事务里，重放拿不到第二次。"""
+        """一次性入口码换会话；码删除与发会话在同一写事务里，重放拿不到第二次。
+        """
         if not _secret(code):
             raise DomainError('网页入口无效、已过期或已使用，请在 Bot 重新打开。')
         now = int(time.time())
@@ -158,7 +166,8 @@ class WebService:
         return {'sid': sid, 'csrf_token': csrf, 'tg_id': tg_id}
 
     def authenticate(self, sid):
-        """校验会话并复核账号归属；主账号失效后旧会话立即作废。"""
+        """校验会话并复核账号归属；主账号失效后旧会话立即作废。
+        """
         if not _secret(sid):
             return None
         now = int(time.time())
@@ -178,13 +187,15 @@ class WebService:
 
     def logout(self, sid):
         """仅撤销个人网页会话；不删除 emos Token，不退出账号登录。
+
         """
         if _secret(sid):
             with self.write() as conn:
                 conn.execute('DELETE FROM web_sessions WHERE sid_hash=?', (_digest(sid),))
 
     def authorize(self, sid, csrf=None, mutating=False):
-        """会话 + CSRF 校验；mutating 为真时缺 token 一律拒绝。"""
+        """会话 + CSRF 校验；mutating 为真时缺 token 一律拒绝。
+        """
         session = self.authenticate(sid)
         if session is None:
             raise DomainError('网页会话已失效，请从 Bot 重新打开。')
@@ -227,7 +238,8 @@ class WebService:
         return result
 
     def action(self, tg_id, action, body):
-        """分发网页动作；调用方已验过会话，这里再验账号归属。"""
+        """分发网页动作；调用方已验过会话，这里再验账号归属。
+        """
         owner_mode = self._owner(tg_id)
         if owner_mode and action in {'code', 'link', 'toggle', 'unlink', 'review', 'withdraw'}:
             raise DomainError('跨 TG 共享已关闭；从 Bot 用 /token 添加账号。')
@@ -292,7 +304,8 @@ class WebService:
     def _account_logout(self, tg_id, root, body):
         """签发短时确认凭据；执行请求必须带回同一凭据、选择和登录代际。
 
-        确认后调用域事务撤销本地密钥，取消排队任务；不向官方撤销 Token。"""
+        确认后调用域事务撤销本地密钥，取消排队任务；不向官方撤销 Token。
+        """
         all_accounts = body.get('all_accounts', False)
         if type(all_accounts) is not bool:
             raise DomainError('退出范围必须为布尔值。')
@@ -336,15 +349,18 @@ class WebService:
                 self.requests.pop(key, None)
 
     def start_sign(self, tg_id, body):
-        """入队前固定当前选择，worker 执行前再次核对权限。
+        """入队前固定当前账号和签到范围；默认仅当前号，重复请求不得改变范围。
         """
         self._owner(tg_id)
-        _only(body, ('account_id', 'request_id'))
+        _only(body, ('account_id', 'request_id', 'all_accounts'))
+        all_accounts = body.get('all_accounts', False)
+        if type(all_accounts) is not bool:
+            raise DomainError('签到范围必须为布尔值。')
         root = _local_id(body.get('account_id'))
         request_id = body.get('request_id')
         if not isinstance(request_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{16,80}', request_id):
             raise DomainError('签到请求编号无效，请刷新页面。')
-        scope = self.accounts.run_scope(tg_id, True)
+        scope = self.accounts.run_scope(tg_id, all_accounts)
         if scope['root_id'] != root:
             raise DomainError('当前账号已切换，本次签到未开始。')
         with self.lock:
@@ -353,18 +369,18 @@ class WebService:
             self._cleanup_jobs()
             known = self.requests.get((tg_id, request_id))
             if known:
-                if self.jobs[known]['root_id'] != root:
-                    raise DomainError('请求编号与来源账号不匹配。')
+                if self.jobs[known]['root_id'] != root or self.jobs[known].get('all_accounts', False) != all_accounts:
+                    raise DomainError('请求编号与账号或签到范围不匹配。')
                 return {'ok': True, 'job_id': known}
             if tg_id in self.pending:
                 previous = self.pending[tg_id]
-                if self.jobs[previous]['root_id'] != root:
-                    raise DomainError('前一个账号仍有签到任务，请等待完成再操作。')
+                if self.jobs[previous]['root_id'] != root or self.jobs[previous].get('all_accounts', False) != all_accounts:
+                    raise DomainError('另一个账号或范围正在签到，请等待完成。')
                 return {'ok': True, 'job_id': previous}
             if len(self.pending) >= 32 or len(self.jobs) >= 512:
                 raise DomainError('签到任务已满，请稍后重试。')
             job_id = secrets.token_urlsafe(18)
-            self.jobs[job_id] = {'tg_id': tg_id, 'root_id': root, 'status': 'queued',
+            self.jobs[job_id] = {'tg_id': tg_id, 'root_id': root, 'all_accounts': all_accounts, 'status': 'queued',
                                  'login_revision': (self.accounts.user(tg_id) or {}).get('login_revision', 0),
                                  'rows': [], 'message': '', 'expires': time.monotonic() + WEB_JOB_TTL}
             self.requests[tg_id, request_id] = job_id
@@ -378,7 +394,8 @@ class WebService:
     def _worker(self):
         """按需执行队列，空队列时退出；运行前核对 owner、选择和登录代际。
 
-        结果写到内存任务记录。异常转换成公开状态，不暴露原始异常或保证任务跨重启恢复。"""
+        结果写到内存任务记录。异常转换成公开状态，不暴露原始异常或保证任务跨重启恢复。
+        """
         while not self.stopping.is_set():
             try:
                 job_id = self.queue.get_nowait()
@@ -399,7 +416,7 @@ class WebService:
                     self.queue.task_done()
                     continue
                 job['status'] = 'running'
-                actor, root = job['tg_id'], job['root_id']
+                actor, root, all_accounts = job['tg_id'], job['root_id'], job.get('all_accounts', False)
             try:
                 self._owner(actor)
                 current = self.accounts.user(actor) or {}
@@ -408,7 +425,7 @@ class WebService:
                     raise DomainError('账号登录状态已变化，排队任务已撤销。')
                 if not self.accounts.can_run(actor, root, root):
                     raise DomainError('账号已退出或当前选择已变化。')
-                rows = self.run_user(actor, include_links=True, expected_root=root)
+                rows = self.run_user(actor, include_links=all_accounts, expected_root=root)
                 status = 'busy' if rows is None else 'done'
                 message = '另一个签到任务正在运行，请稍后重新签到。' if rows is None else ''
                 if rows is not None and not isinstance(rows, list):
@@ -442,17 +459,20 @@ class WebService:
         fields = ('id', 'emos_id', 'name', 'status', 'message', 'carrot', 'balance')
         rows = []
         for row in job['rows']:
-            if not isinstance(row, dict) or row.get('id') not in visible:
+            if (not isinstance(row, dict) or row.get('id') not in visible
+                    or not job.get('all_accounts', False) and row.get('id') != job['root_id']):
                 continue
             entry = {key: row.get(key) for key in fields}
             if row['id'] not in own_ids:
                 entry['message'] = status_text(row.get('status'), own=False,
                                                fallback='代签状态已更新')
             rows.append(entry)
-        return {'ok': True, 'status': job['status'], 'message': job['message'], 'rows': rows}
+        return {'ok': True, 'status': job['status'], 'message': job['message'],
+                'all_accounts': job.get('all_accounts', False), 'rows': rows}
 
     def begin_drain(self):
-        """只停止接受新任务；已排队和在跑任务由调用方检查并等待。"""
+        """只停止接受新任务；已排队和在跑任务由调用方检查并等待。
+        """
         with self.lock:
             self.accepting = False
 
@@ -464,7 +484,8 @@ class WebService:
     def stop(self, timeout=55):
         """撤销尚未运行的任务，设置停止标记并有限等待当前 worker。
 
-        本服务不拥有 HTTP 监听；超时后在跑线程仍可能存活，由 app 决定能否 exec。"""
+        本服务不拥有 HTTP 监听；超时后在跑线程仍可能存活，由 app 决定能否 exec。
+        """
         self.stopping.set()
         while True:
             try:
@@ -498,7 +519,7 @@ button.secondary{background:#2b3646;color:var(--ink)}button.danger{background:#5
 _DASHBOARD_HTML = '''
 <header><div><h1>🥕 我的签到配置</h1><p class="muted">首个账号通过官方 Bot 授权，其他账号用 emos Token 添加。这里显示全部账号。</p></div><button id="logout" class="secondary">退出网页</button></header>
 <div id="flash" role="status" aria-live="polite"></div>
-<section><h2>当前账号</h2><label for="accounts">选择已登录账号</label><select id="accounts"></select><p id="identity" class="muted"></p><div class="row"><button id="sign">签到全部账号</button><button id="refresh" class="secondary">刷新状态</button></div><div class="row"><button id="account-logout" class="danger">退出当前账号</button><button id="accounts-logout-all" class="danger">全部账号退出</button></div><p class="muted">账号退出需再次确认：只清除本地 Token 并关闭签到，保留账号、萝卜、日志与偏好；不代表官方 Token 失效。「退出网页」只关闭网页会话。</p><div id="result" role="status"></div></section>
+<section><h2>当前账号</h2><label for="accounts">选择已登录账号</label><select id="accounts"></select><p id="identity" class="muted"></p><div class="row"><button id="sign">签到当前账号</button><button id="sign-all" class="secondary">签到全部账号</button><button id="refresh" class="secondary">刷新状态</button></div><div class="row"><button id="account-logout" class="danger">退出当前账号</button><button id="accounts-logout-all" class="danger">全部账号退出</button></div><p class="muted">账号退出需再次确认：只清除本地 Token 并关闭签到，保留账号、萝卜、日志与偏好；不代表官方 Token 失效。「退出网页」只关闭网页会话。</p><div id="result" role="status"></div></section>
 <div class="grid"><section><h2>我的签到设置</h2><p class="muted">此处仅改变当前账号。</p><label class="check"><input id="auto" type="checkbox">自动签到</label><label for="time">签到时间（00:xx 自动调整到 01:xx）</label><input id="time" type="time" value="08:00"><p id="timezone" class="muted"></p><label for="sign-mode">签到模式</label><select id="sign-mode"><option value="normal">普通签到（不带附言）</option><option value="random">随机字签到（自动带附言）</option></select><p class="muted">奖励由官方决定。每个账号保留自己的选择，关联方不能修改。</p><button id="save-settings">保存签到设置</button></section>
 <section><h2>我的通知</h2><label class="check"><input id="n-success" type="checkbox">签到成功通知</label><label class="check"><input id="n-fail" type="checkbox">签到失败通知</label><label class="check"><input id="n-already" type="checkbox">已签到通知</label><button id="save-preferences">保存通知设置</button><p class="muted">发送到你的 TG 私聊。</p></section></div>
 <section><h2>关联账号 · 我代签（已停用）</h2><p class="muted">目标必须已在同一个 Bot 登录。官方账号 ID 用来定位，目标的一次性码用来申请；目标账号二次确认后授权。</p><form id="link-form"><div class="row"><div><label for="target">目标官方账号 ID</label><input id="target" autocomplete="off" placeholder="eXXXXXXXXs" maxlength="256" required></div><div><label for="link-code">目标的一次性关联码</label><input id="link-code" type="password" autocomplete="off" maxlength="256" required></div></div><button type="submit">添加关联</button></form><div id="outgoing"></div></section>
@@ -531,7 +552,7 @@ function renderTargets(){const output=$('targets');output.replaceChildren();if(!
 async function loadLogs(){const data=await api('logs');const output=$('logs');output.replaceChildren();if(!data.rows.length){output.append(node('p','暂无可见签到记录。','muted'));return;}for(const row of data.rows){const entry=node('div',undefined,'entry');entry.append(node('strong',row.name+' · '+row.emos_id));entry.append(node('p',row.ts+' · '+(labels[row.status]||row.status)+(row.carrot==null?'':' · 萝卜 '+row.carrot),'muted'));entry.append(node('div',row.message));output.append(entry);}}
 async function load(){const data=await api('me');if(data.single_owner){for(const id of ['link-form','issue-code','pending-incoming','pending-outgoing']){const element=$(id);if(element)element.closest('section').hidden=true;}}const changed=state&&state.active&&(!data.active||data.active.id!==state.active.id);state=data;csrf=data.csrf_token;if(changed){hideCode();requestKey=null;if(jobTimer)clearTimeout(jobTimer);$('result').textContent='已切换账号，旧任务结果不再展示。';}const selector=$('accounts');selector.replaceChildren();for(const row of data.owned){const option=node('option',row.name+' · '+row.emos_id);option.value=row.id;option.selected=Boolean(data.active&&row.id===data.active.id);selector.append(option);}if(!data.active){selector.prepend(node('option','请选择账号'));$('identity').textContent='没有已选择的账号。';}else{$('identity').textContent=data.active.name+' · 官方 ID '+data.active.emos_id+' · '+(data.active.enabled?'有效':'需重新登录')+' · 可用余额 '+(Number.isInteger(data.active.carrot)?data.active.carrot:'未知');$('auto').checked=Boolean(data.active.auto_sign);$('time').value=data.active.sign_time||data.default_sign_time||'08:00';$('sign-mode').value=data.active.sign_mode||'normal';}$('timezone').textContent='时区：'+data.timezone;$('n-success').checked=Boolean(data.preferences.notify_success);$('n-fail').checked=Boolean(data.preferences.notify_fail);$('n-already').checked=Boolean(data.preferences.notify_already);renderLinks(data.links.outgoing,'outgoing',false);renderLinks(data.links.incoming,'incoming',true);renderPending();renderTargets();await loadLogs();}
 function newKey(){return Array.from(crypto.getRandomValues(new Uint8Array(24)),n=>n.toString(16).padStart(2,'0')).join('');}
-async function pollJob(id,expected){try{if(!state||!state.active||state.active.id!==expected)return;const value=await api('job?job_id='+encodeURIComponent(id));if(value.status==='queued'||value.status==='running'){$('result').textContent=value.status==='queued'?'签到已排队…':'正在签到全部账号…';jobTimer=setTimeout(()=>pollJob(id,expected),2500);return;}requestKey=null;$('result').textContent=value.message||value.rows.map(row=>(labels[row.status]||row.status)+' · '+row.name+' ('+row.emos_id+')'+(row.carrot==null?'':' · 萝卜 '+row.carrot)+'\n'+row.message).join('\n\n')||'没有可显示的结果。';await load();}catch(error){flash(error.message||'查询任务失败。可刷新日志查看结果。');}}
+async function pollJob(id,expected){try{if(!state||!state.active||state.active.id!==expected)return;const value=await api('job?job_id='+encodeURIComponent(id));if(value.status==='queued'||value.status==='running'){$('result').textContent=value.status==='queued'?'签到已排队…':value.all_accounts?'正在签到全部账号…':'正在签到当前账号…';jobTimer=setTimeout(()=>pollJob(id,expected),2500);return;}requestKey=null;$('result').textContent=value.message||value.rows.map(row=>(labels[row.status]||row.status)+' · '+row.name+' ('+row.emos_id+')'+(row.carrot==null?'':' · 萝卜 '+row.carrot)+'\n'+row.message).join('\n\n')||'没有可显示的结果。';await load();}catch(error){flash(error.message||'查询任务失败。可刷新日志查看结果。');}}
 $('accounts').onchange=()=>operation(async()=>{const current=state&&state.active?state.active.id:0;const target=Number($('accounts').value);await api('switch',{account_id:current,target_id:target});hideCode();await load();});
 $('save-settings').onclick=()=>operation(async()=>{await api('settings',{account_id:root(),auto_sign:$('auto').checked,sign_time:$('time').value,sign_mode:$('sign-mode').value});await load();flash('签到设置已保存。');});
 $('save-preferences').onclick=()=>operation(async()=>{await api('preferences',{notify_success:$('n-success').checked,notify_fail:$('n-fail').checked,notify_already:$('n-already').checked});await load();flash('通知设置已保存。');});
@@ -539,7 +560,9 @@ $('link-form').onsubmit=event=>{event.preventDefault();operation(async()=>{try{a
 $('issue-code').onclick=()=>operation(async()=>{issued=await api('code',{account_id:root()});$('issued').textContent='官方账号 ID：'+issued.target_emos_id+'\n一次性关联码：'+issued.code;$('codebox').hidden=false;});
 $('hide-code').onclick=hideCode;
 $('copy-code').onclick=()=>operation(async()=>{if(!issued)throw Error('请先生成有效凭证。');await navigator.clipboard.writeText(issued.target_emos_id+' '+issued.code);flash('已复制 ID 和关联码，请只交给你同意的代签方。');});
-$('sign').onclick=()=>operation(async()=>{const expected=root();if(!requestKey||requestKey.root!==expected)requestKey={root:expected,key:newKey()};const result=await api('sign',{account_id:expected,request_id:requestKey.key});if(jobTimer)clearTimeout(jobTimer);await pollJob(result.job_id,expected);});
+async function startSign(allAccounts){const expected=root();if(!requestKey||requestKey.root!==expected||requestKey.all!==allAccounts)requestKey={root:expected,all:allAccounts,key:newKey()};const result=await api('sign',{account_id:expected,request_id:requestKey.key,all_accounts:allAccounts});if(jobTimer)clearTimeout(jobTimer);await pollJob(result.job_id,expected);}
+$('sign').onclick=()=>operation(()=>startSign(false));
+$('sign-all').onclick=()=>operation(()=>startSign(true));
 $('refresh').onclick=()=>operation(load);
 async function logoutAccounts(allAccounts){const expected=root();const prepared=await api('account-logout',{account_id:expected,all_accounts:allAccounts});const label=allAccounts?'全部 '+prepared.accounts+' 个账号':'当前账号';if(!confirm('确认退出'+label+'？\n清除本地 Token、关闭签到并取消授权与输入。\n账号、萝卜、日志与偏好保留。不代表官方 Token 失效。'))return;const result=await api('account-logout',{account_id:expected,all_accounts:allAccounts,confirmation:prepared.confirmation});hideCode();requestKey=null;if(jobTimer)clearTimeout(jobTimer);$('result').textContent='已本地退出 '+result.accounts+' 个账号。主号 /login 官方重授权，其他账号 /token 重登。';flash('本地密钥已清除；没有向官方发起 Token 撤销。');location.replace('/web/login');}
 $('account-logout').onclick=()=>operation(()=>logoutAccounts(false));

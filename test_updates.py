@@ -1,7 +1,8 @@
 """更新事务的同 PID 恢复、WAL 快照和状态校验回归。
 
 夹具只使用临时或演练数据；本地通过不代表真实官方授权。
-Test: python3 -B -m unittest test_updates。"""
+Test: python3 -B -m unittest test_updates。
+"""
 import json
 import os
 from pathlib import Path

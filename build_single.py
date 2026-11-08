@@ -1,7 +1,8 @@
-"""从维护模块生成独立入口，并保持模块命名空间隔离。
+"""从维护源码生成一个包含八个隔离模块的 Python 入口。
 
-生成内容兼容旧版的明文 _SOURCES 校验；运行不需要旁边的模块或 Node。
-Build: python3 -B build_single.py；Test: python3 -B build_single.py --check。"""
+运行时不提取或依赖旁边的 py；旧版明文 _SOURCES 更新格式保持兼容。
+Build: python3 -B build_single.py；Test: python3 -B build_single.py --check。
+"""
 import ast
 from pathlib import Path
 
@@ -11,6 +12,10 @@ PACKAGE = '_emoskata_embedded'
 
 
 def embedded_source(name):
+    """改写本地 from-import 到内嵌命名空间，返回已编译校验的源码。
+
+    只转换维护模块引用；动态源码与第三方依赖不在此函数推断。
+    """
     source = (ROOT / (name + '.py')).read_text(encoding='utf-8')
     lines = source.splitlines(keepends=True)
     replacements = []
@@ -35,6 +40,10 @@ def embedded_source(name):
 
 
 def build(write=True):
+    """生成八模块与引导模板；write=False 只返回源码，不改入口文件。
+
+    部署上传生成入口后须重启才能加载新代码，不覆盖配置或旁边的维护文件。
+    """
     sources = {name: embedded_source(name) for name in MODULES}
     bootstrap = '''#!/usr/bin/env python3
 """emoskata 生成入口；只修改维护模块，再运行 build_single.py。

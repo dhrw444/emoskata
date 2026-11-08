@@ -1,7 +1,8 @@
 """Bot 与网页队列的去重、拒收、排空与停止回归。
 
 夹具只使用临时或演练数据；本地通过不代表真实官方授权。
-Test: python3 -B -m unittest test_queue。"""
+Test: python3 -B -m unittest test_queue。
+"""
 import tempfile
 import threading
 import time
