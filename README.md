@@ -12,12 +12,13 @@ Python 3.10+，零第三方 Python 依赖。可以只上传生成的 `emoskata.p
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `PANEL_PASSWORD` | 首次随机生成 | 管理员密码，至少 6 字符 |
+| `PANEL_PASSWORD` | 首次随机生成 | 管理员密码，至少 8 字符 |
 | `HTTP_ENABLED` | `1` | `0` 关闭网页面板，只留 Bot 与调度（此时必须配 `TG_BOT_TOKEN`） |
 | `HTTP_HOST` | `0.0.0.0` | 监听地址 |
 | `PORT` | `8080` | 监听端口 |
 | `DATA_DIR` | `./data` | SQLite 数据目录 |
 | `TG_BOT_TOKEN` | 空 | BotFather 签发的 Token |
+| `TG_ALLOWED_USER_IDS` | 空 | 只允许这些 TG 用户 ID 使用 Bot，逗号分隔。**留空 = 任何人搜到都能用**，自己用请填上自己的 ID |
 | `TG_API_BASE_URL` | `https://api.telegram.org` | Telegram API 地址 |
 | `EMOS_BASE_URL` | `https://emos.best` | emos API 地址；自定义站不向公共站降级 |
 | `WEB_BASE_URL` | 空 | 个人网页公开地址（反代时填） |

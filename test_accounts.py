@@ -747,6 +747,75 @@ class AccountCase(unittest.TestCase):
         self.assertEqual(self.store.writes, before)
 
 
+    def test_admin_overview_sees_all_accounts_with_balances_but_users_do_not(self):
+        # 管理页要能一次看全所有账号和萝卜；普通用户仍只能看到自己visible的。
+        prof = {'_user_id': 'eA1', '_display': '甲', 'telegram_user_id': 101, '_carrot': 256}
+        self.service.login_with_token(101, 'abcdefgh12345678', prof, 'https://emos.best')
+        prof2 = {'_user_id': 'eB2', '_display': '乙', 'telegram_user_id': 202, '_carrot': 7}
+        self.service.login_with_token(202, 'abcdefgh87654321', prof2, 'https://emos.best')
+
+        overview = {row['emos_id']: row for row in self.service.admin_overview()}
+        self.assertEqual(set(overview), {'eA1', 'eB2'})
+        self.assertEqual(overview['eA1']['carrot'], 256)
+        self.assertEqual(overview['eB2']['carrot'], 7)
+        self.assertEqual(overview['eB2']['owner_tg_id'], 202)
+        # 普通视角互不可见
+        self.assertEqual([r['emos_id'] for r in self.service.visible(101)], ['eA1'])
+        self.assertEqual([r['emos_id'] for r in self.service.visible(202)], ['eB2'])
+        # 密钥永远不出现在任何返回里
+        for row in overview.values():
+            self.assertNotIn('token', row)
+
+    def test_login_with_token_creates_user_row_on_first_use(self):
+        # 第一次用 token 登录的人还没有 tg_users 行。只 UPDATE 会作用在 0 行上，
+        # 之后 active() 会报「请先登录」——账号明明加进去了却用不了。
+        profile = {'user_id': 'eFirst', '_user_id': 'eFirst', '_display': '首个',
+                   'telegram_user_id': 101, '_carrot': 5}
+        self.service.login_with_token(101, 'abcdefgh12345678', profile, 'https://emos.best')
+        active = self.service.active(101)
+        self.assertEqual(active['emos_id'], 'eFirst')
+        self.assertEqual(self.service.user(101)['active_account_id'], active['id'])
+
+    def test_login_with_token_stores_official_carrot_balance(self):
+        profile = {'user_id': 'eCarrot', '_user_id': 'eCarrot', '_display': '萝卜',
+                   'telegram_user_id': 101, '_carrot': 128}
+        row = self.service.login_with_token(101, 'abcdefgh12345678', profile, 'https://emos.best')
+        self.assertEqual(row['carrot'], 128)
+        self.assertTrue(row['carrot_at'])
+        self.assertEqual(self.service.active(101)['carrot'], 128)
+
+    def test_carrot_unknown_does_not_wipe_the_stored_balance(self):
+        # 读不到余额（None）时不能把已有数字清成 0 —— 那是丢账。
+        profile = {'user_id': 'eKeep', '_user_id': 'eKeep', '_display': '保持',
+                   'telegram_user_id': 101, '_carrot': 128}
+        self.service.login_with_token(101, 'abcdefgh12345678', profile, 'https://emos.best')
+        again = dict(profile, _carrot=None)
+        self.service.login_with_token(101, 'abcdefgh12345678', again, 'https://emos.best')
+        self.assertEqual(self.service.active(101)['carrot'], 128)
+
+    def test_token_login_rejects_foreign_telegram_binding(self):
+        # 别人的 token 不能加进自己的列表：官方绑定的 TG 必须是本人。
+        profile = {'user_id': 'eOther', '_user_id': 'eOther', '_display': '别人',
+                   'telegram_user_id': 202, '_carrot': 1}
+        with self.assertRaises(DomainError) as caught:
+            self.service.login_with_token(101, 'abcdefgh12345678', profile, 'https://emos.best')
+        self.assertIn('另一个 Telegram', str(caught.exception))
+
+    def test_token_login_rejects_account_without_telegram_binding(self):
+        profile = {'user_id': 'eNoTg', '_user_id': 'eNoTg', '_display': '未绑', '_carrot': 1}
+        with self.assertRaises(DomainError) as caught:
+            self.service.login_with_token(101, 'abcdefgh12345678', profile, 'https://emos.best')
+        self.assertIn('尚未绑定', str(caught.exception))
+
+    def test_token_login_cannot_take_over_another_owners_account(self):
+        profile = {'user_id': 'eMine', '_user_id': 'eMine', '_display': '我的',
+                   'telegram_user_id': 101, '_carrot': 1}
+        self.service.login_with_token(101, 'abcdefgh12345678', profile, 'https://emos.best')
+        stolen = dict(profile, telegram_user_id=202)
+        with self.assertRaises(DomainError):
+            self.service.login_with_token(202, 'abcdefgh12345678', stolen, 'https://emos.best')
+
+
 class MigrationCase(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="emoskata-migration-test-")

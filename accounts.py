@@ -28,7 +28,7 @@ class DomainError(Exception):
 _ACCOUNT_FIELDS = (
     "id", "emos_id", "name", "enabled", "auto_sign", "sign_time", "sign_mode",
     "last_status", "last_msg", "last_carrot", "last_run", "last_day",
-    "retry_count", "next_run_at", "created",
+    "retry_count", "next_run_at", "created", "carrot", "carrot_at",
 )
 _USER_FIELDS = (
     "tg_id", "chat_id", "active_account_id", "login_until", "login_emos_id", "login_revision", "input_kind",
@@ -136,6 +136,7 @@ class AccountService:
             ("emos_id", "TEXT"), ("owner_tg_id", "INTEGER"),
             ("base_url", "TEXT DEFAULT ''"), ("auto_sign", "INTEGER DEFAULT 1"),
             ("sign_time", "TEXT DEFAULT ''"), ("sign_mode", "TEXT NOT NULL DEFAULT 'normal'"),
+            ("carrot", "INTEGER"), ("carrot_at", "INTEGER DEFAULT 0"),
         )
         for column, ddl in additions:
             if column not in columns:
@@ -350,6 +351,82 @@ class AccountService:
             if "retry_day" in columns:
                 conn.execute("UPDATE accounts SET retry_day='' WHERE id=? AND owner_tg_id=?",
                              (account_id, tg_id))
+            conn.execute("UPDATE tg_users SET active_account_id=?,login_until=0,login_emos_id='',"
+                         "login_revision=login_revision+1 WHERE tg_id=?", (account_id, tg_id))
+            return _account(conn.execute("SELECT * FROM accounts WHERE id=?",
+                                         (account_id,)).fetchone())
+
+    def login_with_token(self, tg_id, token, profile, base_url='') -> dict:
+        """用官方 token 直接添加/更新账号。
+
+        与 finish_login 的区别只在「怎么证明这凭证是你的」：这里凭证本身随请求发出，
+        官方会用它返回这个账号的 user_id 和 telegram_user_id，所以照样要求
+        官方 TG 绑定 == 当前 TG 用户。少了「先发起登录再回传」这一步，也就没有
+        10 分钟窗口，因此不需要 login_until。
+
+        已经归属别的用户的账号一律拒绝：凭一个 token 就能接管别人的账号是提权。
+        """
+        tg_id = _positive_id(tg_id)
+        if not isinstance(profile, Mapping):
+            raise DomainError("登录资料无效，请重新授权")
+        official = profile.get("user_id")
+        if official is None or (isinstance(official, str) and not official.strip()):
+            official = profile.get("_user_id")
+        official = _official_id(official)
+        telegram_id = profile.get("telegram_user_id")
+        if telegram_id in (None, ""):
+            raise DomainError("官方账号尚未绑定 Telegram。请在 emos 官网绑定本人 TG 后重试；账号未保存")
+        if isinstance(telegram_id, str) and telegram_id.isascii() and telegram_id.isdigit():
+            telegram_id = int(telegram_id) if len(telegram_id) <= 19 else 0
+        if type(telegram_id) is not int or telegram_id != tg_id:
+            raise DomainError("该密钥属于另一个 Telegram 用户，不能加入你的账号列表")
+        if not isinstance(token, str) or not token.strip() or len(token) > 8192:
+            raise DomainError("登录凭证无效，请重新获取")
+        token = token.strip()
+        if any(ord(c) < 32 or ord(c) == 127 for c in token):
+            raise DomainError("登录凭证无效，请重新获取")
+        if not isinstance(base_url, str) or len(base_url) > 2048:
+            raise DomainError("账号站点设置无效")
+        name = str(profile.get("_display") or profile.get("username")
+                   or profile.get("name") or official).strip()[:80] or official
+        balance = profile.get("_carrot")
+        with self._write() as conn:
+            now = self._now()
+            row = conn.execute("SELECT * FROM accounts WHERE emos_id=?", (official,)).fetchone()
+            matches = conn.execute("SELECT * FROM accounts WHERE token=? ORDER BY id",
+                                   (token,)).fetchall()
+            if row is not None and row["owner_tg_id"] not in (None, tg_id):
+                raise DomainError("该官方账号已归属其他用户，不能加入")
+            for match in matches:
+                if match["owner_tg_id"] not in (None, tg_id):
+                    raise DomainError("该密钥已归属其他用户，不能加入")
+                if match["emos_id"] not in (None, "", official):
+                    raise DomainError("密钥与已登记的官方账号 ID 不一致")
+            if row is None and matches:
+                row = matches[0]
+            if row is None:
+                cur = conn.execute(
+                    "INSERT INTO accounts(name,token,emos_id,owner_tg_id,base_url,carrot,carrot_at,created) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    (name, token, official, tg_id, base_url.strip(), balance,
+                     int(time.time()), self._created(now)))
+                account_id = cur.lastrowid
+            else:
+                account_id = row["id"]
+                conn.execute(
+                    "UPDATE accounts SET name=?,token=?,emos_id=?,owner_tg_id=?,base_url=?,"
+                    "enabled=1,last_status='',last_msg='',retry_count=0,next_run_at=0,"
+                    "carrot=COALESCE(?,carrot),carrot_at=? "
+                    "WHERE id=? AND (owner_tg_id IS NULL OR owner_tg_id=?)",
+                    (name, token, official, tg_id, base_url.strip(), balance,
+                     int(time.time()), account_id, tg_id))
+            columns = {item[1] for item in conn.execute("PRAGMA table_info(accounts)")}
+            if "retry_day" in columns:
+                conn.execute("UPDATE accounts SET retry_day='' WHERE id=? AND owner_tg_id=?",
+                             (account_id, tg_id))
+            # 必须先建 tg_users 行：第一次用 token 登录的人还没有记录，
+            # 只 UPDATE 会作用在 0 行上，之后 active() 会报「请先登录」。
+            self._ensure(conn, tg_id)
             conn.execute("UPDATE tg_users SET active_account_id=?,login_until=0,login_emos_id='',"
                          "login_revision=login_revision+1 WHERE tg_id=?", (account_id, tg_id))
             return _account(conn.execute("SELECT * FROM accounts WHERE id=?",
@@ -667,6 +744,24 @@ class AccountService:
                 ))
             """, (target_id, tg_id, root_id, tg_id)).fetchone()
         return row is not None
+
+    def admin_overview(self) -> list:
+        """管理页用的全账号总览（不区分归属），含官方萝卜余额与归属人。
+
+        只有管理员页面调用：它过了 PANEL_PASSWORD，本来就等于最高权限。
+        普通用户走 visible()，仍然只看得到自己关联得到的账号。
+        """
+        with closing(self._db()) as conn:
+            rows = conn.execute(
+                "SELECT * FROM accounts WHERE emos_id IS NOT NULL AND emos_id<>'' "
+                "ORDER BY owner_tg_id, id").fetchall()
+            result = []
+            for row in rows:
+                item = _account(row)
+                # 归属人只给管理员看：_account 不返回它是为了普通用户之间互不可见。
+                item['owner_tg_id'] = row['owner_tg_id']
+                result.append(item)
+            return result
 
     def visible(self, tg_id) -> list:
         tg_id = _positive_id(tg_id)

@@ -98,6 +98,26 @@ class FakeAccounts:
         self.cancel_login(tg_id)
         return row
 
+    def login_with_token(self, tg_id, token, profile, base_url=""):
+        """/token 直连路径的替身。语义与生产一致：官方 TG 绑定必须等于当前用户。"""
+        if not isinstance(profile, dict):
+            raise DomainError("登录资料无效，请重新授权")
+        official = profile.get("user_id") or profile.get("_user_id")
+        if not official:
+            raise DomainError("缺少官方 ID")
+        if profile.get("telegram_user_id") in (None, ""):
+            raise DomainError("官方账号尚未绑定 Telegram")
+        if int(profile["telegram_user_id"]) != tg_id:
+            raise DomainError("该密钥属于另一个 Telegram 用户，不能加入你的账号列表")
+        aid = next((aid for aid, row in self.rows.items() if row["emos_id"] == str(official)), None)
+        if aid is not None and self.owners[aid] != tg_id:
+            raise DomainError("该官方账号已归属其他用户，不能加入")
+        self.calls.append(("login_with_token", tg_id, base_url))
+        row = self.add(tg_id, str(official), profile.get("_display")) if aid is None else dict(self.rows[aid])
+        self.tokens[row["id"]] = token
+        self.users[tg_id]["active_account_id"] = row["id"]
+        return row
+
     def owned(self, tg_id):
         return [dict(row) for aid, row in self.rows.items() if self.owners[aid] == tg_id]
 
@@ -246,6 +266,9 @@ class FakeAccounts:
 
     def can_run(self, tg_id, root_id, target_id):
         return self.active(tg_id)["id"] == root_id and target_id in self.run_scope(tg_id)["account_ids"]
+
+    def admin_overview(self):
+        return list(self.rows.values())
 
     def visible(self, tg_id):
         aid = self.active(tg_id)["id"]
@@ -404,6 +427,49 @@ class BotTests(unittest.TestCase):
         self.bots = []
         self.uid = 0
         self.b = self.make_bot()
+
+    def test_allowed_users_empty_means_unrestricted(self):
+        # 不填 = 与旧行为一致，谁都能用
+        self.store.config.pop('tg_allowed_user_ids', None)
+        self.assertEqual(bot._allowed_users(self.store.cfg_all()), set())
+        self.assertTrue(bot.allowed_actor(101, self.store.cfg_all()))
+
+    def test_allowed_users_parses_comma_and_space(self):
+        self.store.config['tg_allowed_user_ids'] = '101, 202'
+        self.assertEqual(bot._allowed_users(self.store.cfg_all()), {101, 202})
+        self.store.config['tg_allowed_user_ids'] = '101 202'
+        self.assertEqual(bot._allowed_users(self.store.cfg_all()), {101, 202})
+
+    def test_allowed_users_parse_error_fails_closed(self):
+        # 配置写坏时不能退化成「谁都能用」——那是把锁砸了
+        self.store.config['tg_allowed_user_ids'] = '101,abc'
+        self.assertFalse(bot.allowed_actor(101, self.store.cfg_all()))
+        self.assertFalse(bot.allowed_actor(202, self.store.cfg_all()))
+
+    def test_allowlist_blocks_user_outside_list(self):
+        self.store.config['tg_allowed_user_ids'] = '101'
+        self.message('/start', actor=202)
+        self.assertNotIn('主菜单', self.text())
+        # 名单外的人一条消息都不该发出去，也不该建任何用户状态
+        self.assertFalse([a for a in self.tg.actions if 'menu' in str(a)])
+        self.assertNotIn(202, self.store.accounts.users)
+
+    def test_allowlist_lets_listed_user_through(self):
+        self.store.config['tg_allowed_user_ids'] = '101'
+        self.message('/start', actor=101)
+        # 新用户先进登录页，这已经证明名单内的人被放行了（名单外的人连这个都收不到）
+        self.assertIn('本人官方登录', self.text())
+        self.assertIn(101, self.store.accounts.users)
+
+    def test_allowlist_blocks_callbacks_too(self):
+        self.store.config['tg_allowed_user_ids'] = '101'
+        self.store.accounts.rows[1] = {'id': 1, 'emos_id': 'eA', 'name': 'A', 'enabled': 1,
+                                       'owner_tg_id': 101, 'auto_sign': 1, 'sign_time': '08:00'}
+        self.callback('menu', actor=202)
+        self.assertNotIn('主菜单', self.text())
+        answers = [a for a in self.tg.actions if a[0] == 'answer']
+        self.assertTrue(answers, '被拒绝的回调必须给出原因')
+        self.assertIn('允许名单', answers[-1][2])
 
     def make_bot(self, synchronous=True, **kwargs):
         instance = bot.Bot("fake-bot-token", self.store, tg=self.tg, client_factory=self.factory,

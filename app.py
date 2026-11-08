@@ -23,7 +23,8 @@ import signal
 import sys
 from pathlib import Path
 
-from envconfig import ConfigStore, EnvConfigError, CFG_TO_ENV, config_path, FIXED_ZONE_OFFSETS
+from envconfig import (ConfigStore, EnvConfigError, CFG_TO_ENV, SCHEMA, config_path,
+                       FIXED_ZONE_OFFSETS)
 from runtime_info import container_ip, snapshot as resource_snapshot
 from emos import EmosClient, EmosError, clamp_sign_time, pick_content
 from accounts import AccountService, DomainError
@@ -188,6 +189,53 @@ def cfg_all():
     # 解析结果按 .env 的 stat 指纹缓存（见 ConfigStore.app_config），
     # 每次调用仍会 stat 一次：这是「改了配置立刻生效」的代价，不能省。
     return CONFIG.app_config()
+
+
+# 旧版把系统配置存在 SQLite 的 settings 表里，新版只认 .env。只换 py 不搬配置，
+# Bot Token 会静默失效、管理员密码会变成新生成的随机值。这里做一次性导入。
+# 注意：只写「.env 里还是默认值」的项，用户在 .env 里配置过的一律不覆盖。
+LEGACY_SETTING_KEYS = (
+    ('base_url', 'EMOS_BASE_URL'),
+    ('sign_time', 'SIGN_TIME'),
+    ('timezone', 'SIGN_TIMEZONE'),
+    ('gap_seconds', 'GAP_SECONDS'),
+    ('tg_bot_token', 'TG_BOT_TOKEN'),
+)
+
+
+def import_legacy_config():
+    """把旧版 settings 表里的系统配置搬进 .env。
+
+    旧版管理员密码来自进程环境变量 PANEL_PASSWORD，库里只有 scrypt 哈希、无法反推。
+    因此只在「.env 是这一次刚建出来的」时，把环境变量里的原密码写进去，
+    这样升级后原密码继续可用。.env 已存在时一律以 .env 为准。
+    """
+    state = {'imported': [], 'untouched': [], 'rejected': [], 'password_inherited': False}
+    if get_setting('legacy_config_imported') == '1':
+        return state
+    current, _ = CONFIG.snapshot()
+    changes = {}
+    if CONFIG.created:
+        inherited = (os.environ.get('PANEL_PASSWORD') or '').strip()
+        if len(inherited) >= 8:
+            changes['PANEL_PASSWORD'] = inherited
+    for legacy, key in LEGACY_SETTING_KEYS:
+        value = (get_setting(legacy) or '').strip()
+        if not value or value == SCHEMA[key].default or current.get(key) != SCHEMA[key].default:
+            continue
+        changes[key] = value
+    for key, value in changes.items():
+        try:
+            CONFIG.update({key: value})
+        except EnvConfigError:
+            state['rejected'].append(key)   # 单个旧值不合法不该拖垮启动
+        else:
+            state['imported'].append(key)
+    state['untouched'] = [key for _, key in LEGACY_SETTING_KEYS
+                          if key not in changes and key not in state['rejected']]
+    state['password_inherited'] = 'PANEL_PASSWORD' in state['imported']
+    set_setting('legacy_config_imported', '1')
+    return state
 
 
 _web_service = None
@@ -456,12 +504,24 @@ def _store_result(account, result, cfg, trigger):
         conn.execute('DELETE FROM logs WHERE account_id=? AND id <= '
                      '(SELECT id FROM logs WHERE account_id=? ORDER BY id DESC LIMIT 1 OFFSET ?)',
                      (account['id'], account['id'], LOG_KEEP))
-        conn.execute('UPDATE accounts SET last_status=?,last_msg=?,last_carrot=?,last_run=?,last_day=?,'
-                     'retry_count=?,next_run_at=?,retry_day=?,enabled=? WHERE id=?',
-                     (status, result['message'], result.get('point'), stamp, done_day,
-                      retries, next_at, today, enabled, account['id']))
+        # carrot 是官方账号的可用余额（/api/user 的 carrot），只有真的问到才更新；
+        # last_carrot 是「本次签到得到多少」，两者不是一回事。
+        balance = result.get('carrot')
+        if balance is None:
+            conn.execute('UPDATE accounts SET last_status=?,last_msg=?,last_carrot=?,last_run=?,'
+                         'last_day=?,retry_count=?,next_run_at=?,retry_day=?,enabled=? WHERE id=?',
+                         (status, result['message'], result.get('point'), stamp, done_day,
+                          retries, next_at, today, enabled, account['id']))
+        else:
+            conn.execute('UPDATE accounts SET last_status=?,last_msg=?,last_carrot=?,last_run=?,'
+                         'last_day=?,retry_count=?,next_run_at=?,retry_day=?,enabled=?,'
+                         'carrot=?,carrot_at=? WHERE id=?',
+                         (status, result['message'], result.get('point'), stamp, done_day,
+                          retries, next_at, today, enabled, balance,
+                          int(time.time()), account['id']))
     row = {'id': account['id'], 'emos_id': account['emos_id'], 'name': safe_name,
-           'status': status, 'message': result['message'], 'carrot': result.get('point')}
+           'status': status, 'message': result['message'], 'carrot': result.get('point'),
+           'balance': result.get('carrot')}
     if trigger != 'user' or status == 'invalid':
         _queue_result(row, cfg)
     return row
@@ -896,8 +956,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/api/accounts':
             with db() as conn:
                 rows = [dict(r) for r in conn.execute(
-                    'SELECT id,name,emos_id,enabled,auto_sign,sign_time,last_status,last_msg,'
-                    'last_carrot,last_run,last_day,created FROM accounts ORDER BY id').fetchall()]
+                    'SELECT id,name,emos_id,enabled,auto_sign,sign_time,sign_mode,owner_tg_id,'
+                    'last_status,last_msg,last_carrot,last_run,last_day,carrot,carrot_at,created '
+                    'FROM accounts ORDER BY id').fetchall()]
             return self._send(200, rows)
 
         if path == "/api/logs":
@@ -1265,7 +1326,17 @@ def main():
     global _HTTP_SERVER, _restart_status, _restart_error
     cfg = cfg_all()
     init_db()
+    legacy = import_legacy_config()
+    if legacy['imported']:
+        print('[config] 已把旧版系统配置搬进 .env：%s' % ', '.join(legacy['imported']))
+        cfg = cfg_all()
+    if legacy['rejected']:
+        print('[config] 旧版配置项不合法、已忽略（请在网页重新填写）：%s'
+              % ', '.join(legacy['rejected']))
     generated = init_password() if cfg['http_enabled'] else None
+    if legacy['password_inherited']:
+        # 密码是延续旧版的，用户本来就知道，没必要再往日志里写一遍。
+        generated = None
     if not cfg['http_enabled'] and not cfg['tg_bot_token']:
         raise EnvConfigError('纯 Bot 模式需要在 .env 填入 TG_BOT_TOKEN。')
     _shutdown.clear()

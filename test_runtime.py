@@ -10,6 +10,8 @@ import tempfile
 import threading
 import time
 import unittest
+
+import envconfig
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
@@ -526,6 +528,83 @@ class RuntimeTests(unittest.TestCase):
                 'SELECT COUNT(*) FROM accounts WHERE owner_tg_id IS NOT NULL').fetchone()[0], 0)
             self.assertIn('ux_accounts_emos_id', [row[1] for row in
                                                   conn.execute('PRAGMA index_list(accounts)')])
+
+    def test_first_boot_inherits_explicit_env_values(self):
+        # docker-compose 里写 TG_ALLOWED_USER_IDS=我的ID 必须真的生效。
+        # 之前首次生成 .env 完全不看环境变量，白名单静默为空 —— Bot 对所有人开放。
+        from envconfig import _seed_from_environ, template_values
+        seeded = _seed_from_environ({'TG_ALLOWED_USER_IDS': '101,202',
+                                     'PORT': '9000', 'NOT_A_KEY': 'x'})
+        self.assertEqual(seeded, {'TG_ALLOWED_USER_IDS': '101,202', 'PORT': '9000'})
+        values = template_values(**seeded)
+        self.assertEqual(values['TG_ALLOWED_USER_IDS'], '101,202')
+        self.assertEqual(values['PORT'], '9000')
+        # 空值不等于显式配置，不能被继承成空串以外的东西
+        self.assertNotIn('TG_BOT_TOKEN', seeded)
+        with self.assertRaises(envconfig.EnvConfigError):
+            template_values(NOT_A_KEY='x')
+
+    def test_allowlist_config_rejects_malformed_ids(self):
+        # 白名单写错绝不能变成「谁都放行」：非法值必须在写入时就报错。
+        from envconfig import SCHEMA, validate_env
+        base = {key: field.default for key, field in SCHEMA.items()}
+        base['PANEL_PASSWORD'] = 'abcdefgh'
+        for bad in ('0', '-5', 'abc', '101;202', '9999999999999999999999'):
+            with self.assertRaises(envconfig.EnvConfigError, msg=bad):
+                validate_env(dict(base, TG_ALLOWED_USER_IDS=bad))
+        ok = validate_env(dict(base, TG_ALLOWED_USER_IDS='101 202'))
+        self.assertEqual(ok['TG_ALLOWED_USER_IDS'], '101,202')
+
+    def test_every_env_setting_is_reachable_from_the_web_panel(self):
+        # 新增配置项时最容易漏 CFG_TO_ENV：直写 .env 能用，但网页一提交就报
+        # 「未知配置项」—— 只有走网页的人会撞上。这里用 SCHEMA 的 ENV 名做对账。
+        from envconfig import CFG_TO_ENV, SCHEMA
+        mapped_env = set(CFG_TO_ENV.values())
+        unknown = sorted(env for env in mapped_env if env not in SCHEMA)
+        self.assertEqual(unknown, [], 'CFG_TO_ENV 指向了 SCHEMA 里不存在的环境变量')
+        self.assertIn('TG_ALLOWED_USER_IDS', mapped_env)
+        for env in mapped_env:
+            self.assertIn(env, SCHEMA)
+
+    def test_legacy_settings_table_moves_into_env_file(self):
+        # dd21d35 把系统配置存在 settings 表；现有版本只认 .env。
+        # 只换 py 会把 Bot Token 静默丢掉，所以升级时必须搬一次。
+        # 先把这几项清回默认值——那才是「旧部署刚换 py」的样子。
+        self.app.CONFIG.update({}, clear_secrets=['TG_BOT_TOKEN'])
+        configure(self.app, sign_time='08:00', gap_seconds='8')
+        self.app.set_setting('tg_bot_token', '123456789:legacyfixture')
+        self.app.set_setting('sign_time', '07:30')
+        self.app.set_setting('gap_seconds', '12')
+        state = self.app.import_legacy_config()
+        for key in ('TG_BOT_TOKEN', 'SIGN_TIME', 'GAP_SECONDS'):
+            self.assertIn(key, state['imported'])
+        env, _ = self.app.CONFIG.snapshot()
+        self.assertEqual(env['TG_BOT_TOKEN'], '123456789:legacyfixture')
+        self.assertEqual(env['SIGN_TIME'], '07:30')
+        self.assertEqual(env['GAP_SECONDS'], '12')
+        # 迁移只能跑一次：之后再跑不应改动 .env
+        before = self.app.CONFIG.snapshot()[1]
+        again = self.app.import_legacy_config()
+        self.assertEqual((again['imported'], again['rejected']), ([], []))
+        self.assertEqual(self.app.CONFIG.snapshot()[1], before)
+
+    def test_legacy_import_never_overrides_values_already_in_env(self):
+        # 用户在 .env 里填过的值优先；旧库里过时的值不能盖掉它。
+        configure(self.app, tg_bot_token='999999:fromenvfile')
+        self.app.set_setting('tg_bot_token', '123456789:stalelegacy')
+        state = self.app.import_legacy_config()
+        self.assertNotIn('TG_BOT_TOKEN', state['imported'])
+        self.assertIn('TG_BOT_TOKEN', state['untouched'])
+        self.assertEqual(self.app.CONFIG.snapshot()[0]['TG_BOT_TOKEN'], '999999:fromenvfile')
+
+    def test_legacy_import_skips_invalid_value_without_blocking_startup(self):
+        # 旧库里可能是旧格式的 Token。写不进 .env 就明确拒绝，不能让启动失败。
+        self.app.CONFIG.update({}, clear_secrets=['TG_BOT_TOKEN'])
+        self.app.set_setting('tg_bot_token', 'not-a-valid-token')
+        state = self.app.import_legacy_config()
+        self.assertIn('TG_BOT_TOKEN', state['rejected'])
+        self.assertEqual(self.app.cfg_all()['tg_bot_token'],
+                         self.app.CONFIG.snapshot()[0]['TG_BOT_TOKEN'])
 
 
 if __name__ == '__main__':

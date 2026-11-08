@@ -52,6 +52,8 @@ SCHEMA = {
     'RETRY_DELAYS': Field('300,900,2700', '失败退避（秒）', '1–5 档递增，每档至少 300 秒；当天耗尽后停止。', 'delays'),
     'BOT_WORKERS': Field('2', 'Bot 操作线程数', '默认 2；1 更省内存，最多 8。', 'int', 1, 8, restart=True),
     'BOT_MAX_JOBS': Field('16', 'Bot 待办上限', '包含正在运行任务；达到上限后明确拒绝新操作。', 'int', 4, 128, restart=True),
+    'TG_ALLOWED_USER_IDS': Field('', '仅允许这些 TG 用户（ID，逗号分隔）',
+                                 '留空 = 任何人搜到 Bot 都能用；自己用请填自己的数字 ID。', 'ids'),
     'TG_POLL_TIMEOUT': Field('45', 'TG 长轮询等待（秒）', '延长空闲等待减少连接与 CPU；范围 10–50。', 'int', 10, 50, restart=True),
     'SCHEDULER_INTERVAL': Field('60', '本地调度检查（秒）', '只检查本地数据库，不轮询官方接口。', 'int', 15, 300),
     'HTTP_REQUEST_TIMEOUT': Field('15', '网页请求超时（秒）', '防止空连接永久占用线程。', 'int', 3, 60, restart=True),
@@ -63,6 +65,7 @@ SCHEMA = {
 _RETIRED_KEYS = frozenset({'EMOS_APP_USER_ID', 'SIGN_CONTENT'})
 CFG_TO_ENV = {
     'tg_bot_token': 'TG_BOT_TOKEN', 'tg_api_base_url': 'TG_API_BASE_URL',
+    'tg_allowed_user_ids': 'TG_ALLOWED_USER_IDS',
     'base_url': 'EMOS_BASE_URL',
     'web_base_url': 'WEB_BASE_URL', 'public_base': 'PUBLIC_BASE',
     'sign_time': 'SIGN_TIME', 'timezone': 'SIGN_TIMEZONE',
@@ -191,6 +194,15 @@ def validate_env(values, allow_unset_password=False):
             except (ImportError, KeyError, ValueError):
                 if value not in FIXED_ZONE_OFFSETS:
                     raise EnvConfigError('SIGN_TIMEZONE 不可用，请安装 tzdata 或选常用固定时区。') from None
+        elif field.kind == 'ids':
+            # 只收数字 TG 用户 ID，最多 20 个；写错就拒绝，不能静默变成「谁都能用」。
+            pieces = [piece for piece in re.split(r'[,\s]+', value) if piece]
+            if len(pieces) > 20:
+                raise EnvConfigError('%s 最多 20 个用户 ID。' % key)
+            for piece in pieces:
+                if not re.fullmatch(r'[1-9][0-9]{0,19}', piece):
+                    raise EnvConfigError('%s 只能填正整数 TG 用户 ID，多个用逗号分隔。' % key)
+            value = ','.join(pieces)
         elif field.kind == 'delays':
             pieces = value.split(',')
             if not 1 <= len(pieces) <= 5 or any(not p.strip().isdigit() for p in pieces):
@@ -223,9 +235,27 @@ def serialize_env(values):
     return '\n'.join(lines) + '\n'
 
 
-def template_values(password=None):
+def _seed_from_environ(environ=None):
+    """首次生成 .env 时，从进程环境变量里取显式给出的配置值。
+
+    只认 SCHEMA 里存在的键；值仍要过 validate_env，写错就整条报错而不是静默忽略。
+    """
+    environ = os.environ if environ is None else environ
+    seeded = {}
+    for key in SCHEMA:
+        raw = environ.get(key)
+        if raw is not None and raw != '':
+            seeded[key] = raw
+    return seeded
+
+
+def template_values(password=None, **overrides):
     values = {key: field.default for key, field in SCHEMA.items()}
     values['PANEL_PASSWORD'] = password or secrets.token_urlsafe(24)
+    unknown = set(overrides) - set(SCHEMA)
+    if unknown:
+        raise EnvConfigError('未知配置项：' + ', '.join(sorted(unknown)))
+    values.update(overrides)
     return validate_env(values)
 
 
@@ -255,8 +285,13 @@ class ConfigStore:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self._writer():
                 if not self.path.exists():
-                    self.provided_keys = set()
-                    self._atomic(template_values())
+                    # 首次生成 .env 时继承进程环境变量里的显式取值。
+                    # 不继承的话，docker-compose 里写 TG_ALLOWED_USER_IDS=你的ID
+                    # 会静默失效、Bot 对所有人开放 —— 用户以为锁上了，实际没锁。
+                    # 这些值会被写进 .env，之后 .env 仍是唯一来源。
+                    seeded = {key: value for key, value in _seed_from_environ().items()}
+                    self.provided_keys = set(seeded)
+                    self._atomic(template_values(**seeded))
                     self.created = True
                 else:
                     info = self.path.lstat()

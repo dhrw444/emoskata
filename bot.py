@@ -27,6 +27,41 @@ _SECRET = re.compile(
     r"\b\d+_[A-Za-z0-9_-]{6,}", re.I)
 
 
+def _allowed_users(cfg):
+    """返回允许使用 Bot 的 TG 用户集合；空集合表示不限制。
+
+    配置层已校验成「正整数，逗号分隔」，这里只做容错解析：
+    配置读坏时不能变成「谁都能用」，所以含非法项时整条拒绝更安全。
+    """
+    raw = str(cfg.get('tg_allowed_user_ids') or '').strip()
+    if not raw:
+        return set()
+    allowed = set()
+    for part in raw.replace(' ', ',').split(','):
+        if not part:
+            continue
+        if not part.isdigit():
+            return {'invalid'}
+        allowed.add(int(part))
+    return allowed
+
+
+def allowed_actor(tg_id, cfg):
+    """Bot 是否允许这个 TG 用户操作。留空 = 不限制；填了即白名单。"""
+    allowed = _allowed_users(cfg)
+    if not allowed:
+        return True
+    return int(tg_id) in allowed
+
+
+def _carrot_text(account):
+    """胡萝卜余额。读不到就说读不到，不能拿 0 冒充。"""
+    balance = account.get("carrot")
+    if balance is None:
+        return "\U0001F955 余额未知"
+    return "\U0001F955 %s" % balance
+
+
 def _safe(value, limit=600):
     return _SECRET.sub("［密钥已隐藏］", str(value if value is not None else ""))[:limit]
 
@@ -506,7 +541,8 @@ class Bot:
         if sensitive_text and isinstance(mid, int):
             self._control_call(lambda: self.tg.delete(chat_id, mid), priority=True)
         permitted = (_positive(tg_id) and chat.get("type") == "private" and chat_id == tg_id
-                     and actor.get("is_bot") is not True)
+                     and actor.get("is_bot") is not True
+                     and allowed_actor(tg_id, self.store.cfg_all()))
         if callback:
             cb_id = callback.get("id")
             if not isinstance(cb_id, str) or not cb_id or len(cb_id) > 256:
@@ -517,8 +553,13 @@ class Bot:
                 self._recent_callbacks[cb_id] = None
                 while len(self._recent_callbacks) > 2048:
                     self._recent_callbacks.popitem(last=False)
-            answer = ("仅限本人私聊操作。" if not permitted else
-                      "已处理，请刷新菜单。" if duplicate else "")
+            if not permitted:
+                answer = ("此 Bot 已限定使用者，你的 ID 不在允许名单内。"
+                          if _positive(tg_id) and chat_id == tg_id
+                          and chat.get("type") == "private" else "仅限本人私聊操作。")
+            else:
+                answer = "已处理，请刷新菜单。" if duplicate else ""
+
             self._control_call(lambda: self.tg.answer(cb_id, answer), priority=True)
             if not permitted or duplicate:
                 return
@@ -691,11 +732,12 @@ class Bot:
         for account in items:
             selected = active and account["id"] == active["id"]
             name = account.get("name") or "未命名"
-            lines.append("%s <b>%s</b> · ID <code>%s</code>\n%s · 自动签到%s · %s" % (
+            lines.append("%s <b>%s</b> · ID <code>%s</code>\n%s · 自动签到%s · %s · %s" % (
                 "▶️" if selected else "👤", _esc(name), _esc(account.get("emos_id")),
                 "有效" if _flag(account.get("enabled")) else "失效，请重新授权",
                 "开" if _flag(account.get("auto_sign")) else "关",
-                _esc(account.get("sign_time") or "默认时间")))
+                _esc(account.get("sign_time") or "默认时间"),
+                _carrot_text(account)))
             keyboard.append([{"text": ("✓ " if selected else "切换至 ") + _safe(name, 30),
                               "callback_data": "switch:%d:%d" % (root, account["id"])}])
         if nav:
@@ -881,6 +923,46 @@ class Bot:
         self._reply(chat_id, text + "\n输入 10 分钟有效，切换账号后失效。/cancel 取消。",
                     [[{"text": "取消输入", "callback_data": "cancel"}]], msg_id)
 
+    def _guide_token(self, tg_id, chat_id, msg_id=None):
+        """进入「粘贴密钥」引导。密钥是敏感文本，走单独标记，不落输入历史。"""
+        user = self.accounts.ensure_user(tg_id, chat_id)
+        self.accounts.set_input(tg_id, 'token', ttl=600)
+        user = self.accounts.user(tg_id) or user
+        with self._state_lock:
+            self._guided[tg_id] = ('token', 0, user['input_until'])
+        self._reply(chat_id, '<b>🔑 用密钥添加账号</b>\n\n'
+                    '请直接发送 emos 官方账号密钥（一长串字母数字）。\n'
+                    '密钥只用于向官方 /api/user 核对身份，核对通过才保存。\n'
+                    '官方账号必须已绑定<b>你本人</b>的 Telegram；别人的密钥加不进来。\n'
+                    '输入 10 分钟有效。/cancel 取消。',
+                    [[{'text': '取消输入', 'callback_data': 'cancel'}]], msg_id)
+
+    def _add_by_token(self, tg_id, chat_id, token, expected):
+        """用官方 token 直接验证并添加账号（不经过官方 Bot 回传）。"""
+        self._selection(tg_id, expected)
+        if not re.fullmatch(r'[A-Za-z0-9_\-]{8,8192}', token or ''):
+            raise DomainError('密钥格式不对：应为 8 位以上的字母、数字、下划线或连字符。')
+        cfg = self.store.cfg_all()
+        base = cfg.get('base_url') or ''
+        self._reply(chat_id, '⏳ 正在向官方核对密钥…')
+        try:
+            client = self.client_factory(token, base)
+            if hasattr(client, 'timeout'):
+                client.timeout = int(cfg.get('emos_timeout') or 20)
+            profile = client.profile()
+        except EmosError:
+            raise DomainError('官方未认可这个密钥，或网络暂时不可用。请核对后重试。') from None
+        except Exception:
+            raise DomainError('官方验证暂不可用，请稍后再试。') from None
+        account = self.accounts.login_with_token(tg_id, token, profile, base_url=base)
+        self._clear_input(tg_id)
+        balance = profile.get('_carrot')
+        tail = '' if balance is None else '\n🥕 当前余额 %s' % _esc(balance, 40)
+        self._reply(chat_id, '✅ 已加入 <b>%s</b> · 官方 ID <code>%s</code>%s' % (
+            _esc(account.get('name')), _esc(account.get('emos_id')), tail), menu_kb(account))
+        # 用户发来的密钥消息尽量删掉，别留在聊天记录里。
+        self._clear_input(tg_id)
+
     def _time(self, tg_id, chat_id, expected, value):
         self._root(tg_id, expected)
         if not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", str(value)):
@@ -903,6 +985,10 @@ class Bot:
             self._selection(tg_id, expected)
             self._selection(tg_id, state[1])
             return self._show_login(tg_id, chat_id, expected=expected, official_id=text.strip())
+        if kind == 'token':
+            self._selection(tg_id, expected)
+            self._selection(tg_id, state[1])
+            return self._add_by_token(tg_id, chat_id, text.strip(), expected)
         self._root(tg_id, expected)
         self._root(tg_id, state[1])
         if kind == "link":
@@ -1002,9 +1088,12 @@ class Bot:
         for row in rows:
             icon = {"signed": "✅", "already": "⚪", "network": "🌐"}.get(row.get("status"), "❌")
             carrot = " +%s" % _esc(row["carrot"], 40) if row.get("carrot") is not None else ""
-            lines.append("%s <b>%s</b> · <code>%s</code>%s\n%s" % (
+            balance = row.get("balance")
+            # 本次得到和账户余额分开写：一个数说这两件事会让人对不上账。
+            tail = "" if balance is None else "\n🥕 余额 %s" % _esc(balance, 40)
+            lines.append("%s <b>%s</b> · <code>%s</code>%s\n%s%s" % (
                 icon, _esc(row.get("name") or "未命名", 120), _esc(row.get("emos_id"), 128), carrot,
-                _esc(row.get("message") or "—", 400)))
+                _esc(row.get("message") or "—", 400), tail))
         self._reply(chat_id, "\n".join(lines), menu_kb(root))
 
     def _on_command(self, tg_id, chat_id, text, expected, login_until=0, input_state=None,
@@ -1045,7 +1134,7 @@ class Bot:
             self._clear_input(tg_id)
             return self._reply(chat_id, "已取消待填写输入与登录授权。", menu_kb(self._active(tg_id)))
         if cmd not in {"/start", "/login", "/menu", "/sign", "/account", "/accounts", "/links",
-                       '/code', '/link', '/settings', '/time', '/logs', '/web'}:
+                       '/code', '/link', '/settings', '/time', '/logs', '/web', '/token'}:
             return self._reply(chat_id, "不支持此命令。请通过 /login 官方授权，使用 /help 查看命令。", menu_kb(self._active(tg_id)))
         self._selection(tg_id, expected)
         if cmd in ("/start", "/menu"):
@@ -1059,6 +1148,12 @@ class Bot:
                                     official_id=args[0] if args else None)
         if cmd in ("/account", "/accounts"):
             return self._show(chat_id, self._view_accounts(tg_id))
+        if cmd == "/token":
+            if len(args) > 1:
+                raise DomainError("用法：/token 密钥；或直接 /token 进入填写。")
+            if args:
+                return self._add_by_token(tg_id, chat_id, args[0], expected)
+            return self._guide_token(tg_id, chat_id)
         self._root(tg_id, expected)
         if cmd == '/web':
             if args:

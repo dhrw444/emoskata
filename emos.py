@@ -69,6 +69,20 @@ class _NoCredentialRedirect(urllib.request.HTTPRedirectHandler):
         raise EmosError('接口发生重定向，已停止请求以保护密钥。', code, kind='blocked')
 
 
+def _carrot_of(profile):
+    """官方 /api/user 的 carrot 字段是可用萝卜余额。
+
+    官方只说它是 int。缺失或类型不对时返回 None 而不是 0 —— 把「读不到」
+    显示成「0 个萝卜」会让人误以为账号被清了。
+    """
+    value = profile.get('carrot')
+    if type(value) is int:
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
 def _already_message(body):
     text = str(body.get('message') or '').strip().lower().rstrip('。.!！')
     return text in ('重复签到', '已签到', '已经签到', '已签过', '今日已签到',
@@ -169,6 +183,7 @@ class EmosClient:
         result = dict(profile)
         result['_user_id'] = uid
         result['_display'] = str(profile.get('username') or profile.get('name') or uid)
+        result['_carrot'] = _carrot_of(profile)
         return result
 
     def check(self):
@@ -186,11 +201,12 @@ class EmosClient:
 
     def sign_once(self, content='', mode='normal'):
         result = {'status': 'failed', 'message': '', 'point': None, 'days': None,
-                  'rank': None, 'name': '', 'retry_after': 0}
+                  'rank': None, 'name': '', 'retry_after': 0, 'carrot': None}
         try:
             content = pick_content(content, mode)
             profile = self.profile()
             result['name'] = profile['_display']
+            result['carrot'] = profile.get('_carrot')
             if self.expected_user_id and profile['_user_id'] != str(self.expected_user_id):
                 raise EmosError('当前密钥的官方账号 ID 与登记账号不一致，请重新授权。', kind='invalid')
             if self.expected_telegram_id is not None:
