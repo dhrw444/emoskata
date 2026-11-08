@@ -309,6 +309,28 @@ class AccountCase(unittest.TestCase):
         row = self.query("SELECT owner_tg_id,auto_sign FROM accounts")[0]
         self.assertEqual(row, {"owner_tg_id": 101, "auto_sign": 1})
 
+    def test_set_account_sign_mode_whitelist_and_persistence(self):
+        # Bot 面板与网页都靠这条规则，test_bot 用的是替身，所以生产规则必须在这里测。
+        a = self.login(101, "A")
+        self.assertEqual(a["sign_mode"], "normal")
+        self.assertEqual(self.service.set_account(101, sign_mode="random")["sign_mode"], "random")
+        self.assertEqual(self.query("SELECT sign_mode FROM accounts WHERE id=?", (a["id"],))[0],
+                         {"sign_mode": "random"})
+        for bad in ("weird", "", None, "RANDOM", 1, True):
+            with self.subTest(bad=bad), self.assertRaises(DomainError):
+                self.service.set_account(101, sign_mode=bad)
+        self.assertEqual(self.query("SELECT sign_mode FROM accounts WHERE id=?", (a["id"],))[0],
+                         {"sign_mode": "random"})
+        with self.assertRaises(DomainError):
+            self.service.set_account(101, unknown_field=1)
+        # 没归属人的账号不能被改
+        self.store.next_write = lambda conn: conn.execute(
+            "UPDATE accounts SET owner_tg_id=202 WHERE id=?", (a["id"],))
+        with self.assertRaises(DomainError):
+            self.service.set_account(101, sign_mode="normal")
+        self.assertEqual(self.query("SELECT sign_mode FROM accounts WHERE id=?", (a["id"],))[0],
+                         {"sign_mode": "random"})
+
     def test_preferences_whitelist_normalizes_all_flags_and_isolates_users(self):
         self.service.ensure_user(202)
         user = self.service.set_preferences(101, notify_success=False, notify_fail="1", notify_already=1)

@@ -14,12 +14,19 @@
 10. **签到请求不再换域名重发**：`PUT /api/user/sign` 不是幂等请求，网络中断时请求可能已经到达官方并签到成功，换域名重发等于二次签到尝试（官方明确禁止接口轮询）。现在只有网关拦截（403/HTML，确定未执行）才换备用域名；网络错误直接报 `network`，交给本地退避。
 11. **`sign: {}` 不再当成已签**：官方只写「当天未签到时返回 null」。空对象不是已签证据，当成已签会让当天调度全程跳过，白丢一天。
 12. **`重复签到` 判定归一**：429 判定与「已签到」判定共用 `_already_message()`，带句号、尾随空格、全角空格、近义写法的都能识别，不再被误判成限流。
+13. **空轮询退避**：`getUpdates` 立即返回空（本地 Bot API、反代提前收连接、网络抖动）时，原来固定 `wait(0.1)` 会退化成 9.25 次/秒短轮询（实测 3.10% CPU）。现在连续空返回 >3 次就指数退避到 3 秒；正常长轮询链路不受影响（实测 0.05 次/秒、0.15% CPU）。
+14. **签到时间钳制去重**：`accounts._clamp_time` 改为复用 `emos.clamp_sign_time`，删掉第二份实现。
+15. **状态文案单一来源**：`webui` 的「状态→中文」原本在服务端两处 + 内嵌 JS 一处各写一遍且已经不一致，现统一为模块级 `_STATUS_TEXT`/`_OTHER_TEXT` + `status_text()`，JS 通过 `__STATUS_JS__` 注入同一份数据。
+16. **状态文案注入纳入检查**：`check_web_js.py` 改为检查**渲染后**的脚本（占位符未替换时 `const labels=__STATUS_JS__` 语法合法但运行必崩，原来的 `node --check` 抓不到）。
+17. **生产规则补真测试**：`test_bot` 用的 `FakeAccounts` 自己复刻了 `sign_mode` 校验，导致生产规则零覆盖（变异测试证实：删掉 `accounts.py` 的校验，`test_bot`/`test_accounts` 全绿）。新增 `test_accounts.AccountCase.test_set_account_sign_mode_whitelist_and_persistence`，用变异测试确认能抓到删除。
+18. **单文件漂移门禁**：`build_single.py --check` 只比较不写，CI 用它拦住「磁盘模块改了但 `emoskata.py` 没重建」（Docker 只拷 `emoskata.py`，这种漂移会让镜像跑旧代码）。实测把 `emos.py` 改回旧写法后 `--check` 返回 exit=1。
 
 ## 主审实际执行
 
 ```sh
-python3 -B -m unittest discover -s . -p 'test_*.py'   # 207 项，OK
-python3 -B build_single.py                            # 247373 字节，7 个隔离模块
+python3 -B -m unittest discover -s . -p 'test_*.py'   # 208 项，OK
+python3 -B build_single.py                            # 249465 字节，7 个隔离模块
+python3 -B build_single.py --check                    # 单文件与磁盘模块一致（CI 门禁）
 python3 -B check_web_js.py                            # 内嵌 JS 语法通过
 python3 -m pyflakes *.py                              # 无输出
 sh -n install.sh && sh -n prepare_docker.sh

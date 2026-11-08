@@ -36,7 +36,7 @@ def embedded_source(name):
     return result
 
 
-def main():
+def build(write=True):
     sources = {name: embedded_source(name) for name in MODULES}
     bootstrap = '''#!/usr/bin/env python3
 """emoskata: Telegram-first signing and one-use account association.
@@ -81,11 +81,20 @@ if __name__ == '__main__':
 '''
     output = bootstrap.replace('__SOURCES__', repr(sources))
     compile(output, 'emoskata.py', 'exec')
-    target = ROOT / 'emoskata.py'
-    target.write_text(output, encoding='utf-8')
-    print('Generated %s: %d bytes, %d isolated modules.' %
-          (target.name, len(output.encode('utf-8')), len(sources)))
+    if write:
+        (ROOT / 'emoskata.py').write_text(output, encoding='utf-8')
+        print('Generated emoskata.py: %d bytes, %d isolated modules.' %
+              (len(output.encode('utf-8')), len(sources)))
+    return output
 
 
 if __name__ == '__main__':
-    main()
+    if '--check' in __import__('sys').argv[1:]:
+        # Docker 只拷 emoskata.py。磁盘模块改了却没重建，镜像跑的就是旧代码。
+        output = build(write=False)
+        current = (ROOT / 'emoskata.py').read_text(encoding='utf-8')
+        if current != output:
+            raise SystemExit('emoskata.py 落后于磁盘模块：请运行 python3 build_single.py 后提交。')
+        print('emoskata.py 与磁盘模块一致。')
+    else:
+        build()

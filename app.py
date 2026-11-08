@@ -185,6 +185,8 @@ def set_setting(key, value):
 
 
 def cfg_all():
+    # 解析结果按 .env 的 stat 指纹缓存（见 ConfigStore.app_config），
+    # 每次调用仍会 stat 一次：这是「改了配置立刻生效」的代价，不能省。
     return CONFIG.app_config()
 
 

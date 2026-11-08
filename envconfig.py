@@ -60,7 +60,6 @@ SCHEMA = {
     'WEB_SESSION_HOURS': Field('168', '个人网页会话（小时）', '只代表本人，不获得其他账号登录权限。', 'int', 1, 168),
     'SHUTDOWN_TIMEOUT': Field('90', '软重启收尾上限（秒）', '停止接新任务并等待网络任务结束；未收尾不会强行 exec。', 'int', 30, 300),
 }
-ENV_KEYS = frozenset(SCHEMA)
 _RETIRED_KEYS = frozenset({'EMOS_APP_USER_ID', 'SIGN_CONTENT'})
 CFG_TO_ENV = {
     'tg_bot_token': 'TG_BOT_TOKEN', 'tg_api_base_url': 'TG_API_BASE_URL',

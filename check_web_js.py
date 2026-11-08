@@ -7,6 +7,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parent
@@ -35,6 +36,7 @@ class Scripts(HTMLParser):
 
 def script_sources():
     result = {}
+    import json as _json
     for filename, wanted in (('app.py', {'PAGE', 'LOGIN_PAGE'}),
                              ('webui.py', {'_AUTH_JS', '_DASHBOARD_JS'})):
         tree = ast.parse((ROOT / filename).read_text())
@@ -53,6 +55,16 @@ def script_sources():
                             result[target.id + '_' + str(index)] = script
     if len(result) != 4:
         raise ValueError('未取得全部四段真实网页脚本，检查页面结构。')
+    # 页面里的状态文案是渲染时注入的；直接检查带占位符的源码会漏掉真实运行时错误
+    # （`const labels=__STATUS_JS__` 语法合法，运行时才 ReferenceError）。
+    if '__STATUS_JS__' in result.get('_DASHBOARD_JS', ''):
+        sys.path.insert(0, str(ROOT))
+        import webui
+        result['_DASHBOARD_JS'] = result['_DASHBOARD_JS'].replace(
+            '__STATUS_JS__',
+            _json.dumps(webui._STATUS_TEXT, ensure_ascii=False, sort_keys=True))
+    if '__STATUS_JS__' in result.get('_DASHBOARD_JS', ''):
+        raise ValueError('状态文案占位符未被替换，页面脚本会引用未定义变量。')
     return result
 
 

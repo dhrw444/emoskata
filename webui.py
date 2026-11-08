@@ -3,6 +3,7 @@ Build: python3 build_single.py | Run: python3 app.py | Test: python3 -B -m unitt
 """
 import hashlib
 import hmac
+import json
 import queue
 import re
 import secrets
@@ -406,7 +407,7 @@ _AUTH_JS = '''
 _DASHBOARD_JS = r'''
 const $=id=>document.getElementById(id);
 let state=null,csrf='',jobTimer=null,issued=null,requestKey=null;
-const labels={signed:'签到成功',already:'今日已签到',network:'网络异常',blocked:'接口访问受阻',rate:'接口限流',invalid:'需重新登录',failed:'签到失败',config:'配置错误',rejected:'官方拒绝',revoked:'授权已撤销'};
+const labels=__STATUS_JS__;
 function flash(text){$('flash').textContent=text||'';}
 function node(tag,text,className){const value=document.createElement(tag);if(text!==undefined)value.textContent=String(text);if(className)value.className=className;return value;}
 function hideCode(){issued=null;$('issued').textContent='';$('expires').textContent='';$('codebox').hidden=true;}
@@ -443,7 +444,10 @@ def render_page(kind, nonce):
     elif kind == 'login':
         body, script, title = _LOGIN_HTML, '', '个人配置入口'
     elif kind == 'dashboard':
-        body, script, title = _DASHBOARD_HTML, _DASHBOARD_JS, '我的签到配置'
+        body, title = _DASHBOARD_HTML, '我的签到配置'
+        script = _DASHBOARD_JS.replace('__STATUS_JS__',
+                                       json.dumps(_STATUS_TEXT, ensure_ascii=False,
+                                                  sort_keys=True))
     else:
         raise ValueError('invalid page')
     page = ('<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'

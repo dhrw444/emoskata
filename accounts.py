@@ -18,6 +18,8 @@ from collections.abc import Mapping
 from contextlib import closing
 from typing import Optional
 
+from emos import clamp_sign_time as _clamp_time
+
 
 class DomainError(Exception):
     """A credential-free Chinese error suitable for the Bot UI."""
@@ -95,17 +97,6 @@ def _user(row):
     for key in _PREFERENCES:
         result[key] = _stored_flag(result[key])
     return result
-
-
-def _clamp_time(value):
-    # Match the existing emos.clamp_sign_time: 00:30 becomes 01:30.
-    try:
-        hour, minute = [int(part) for part in str(value).split(":")[:2]]
-    except (TypeError, ValueError):
-        return "08:00"
-    hour = min(max(hour, 1), 23)
-    minute = min(max(minute, 0), 59)
-    return "%02d:%02d" % (hour, minute)
 
 
 class AccountService:

@@ -433,6 +433,7 @@ class Bot:
             except Exception:
                 pass
             delay = self.retry_base
+            empty_runs = 0
             while not self.stop_event.is_set() and not self.drain_event.is_set():
                 try:
                     response = self.tg._api('getUpdates', {
@@ -449,7 +450,16 @@ class Bot:
                         self._handle(update)
                     delay = self.retry_base
                     if not updates:
-                        self.stop_event.wait(0.1)
+                        # 正常长轮询会阻塞 poll_timeout 才返回空；立刻返回说明服务端
+                        # 或反代没挂住连接（本地 Bot API、提前收连接）。此时按 0.1 秒
+                        # 重试会退化成 10 次/秒短轮询，既吃 CPU 又逼近官方频率限制。
+                        empty_runs += 1
+                        if empty_runs > 3:
+                            self.stop_event.wait(min(3.0, 0.2 * empty_runs))
+                        else:
+                            self.stop_event.wait(0.2)
+                    else:
+                        empty_runs = 0
                 except Exception:
                     print("[bot] 轮询或检查点暂时失败；未持久确认的动作不执行。")
                     if self.stop_event.wait(delay):
