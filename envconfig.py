@@ -1,6 +1,9 @@
-"""One .env is the sole system configuration source; Python 3.10+ standard library.
-Runtime process env selects only EMOS_ENV_FILE, never overrides config values.
-Web edits validate the complete file then atomically replace it with mode 0600.
+"""配置 schema、校验、原子保存及解析缓存。
+
+只有首次创建 .env 才继承同名环境值；运行中以文件为准。
+EMOS_ENV_FILE 仅选路径，热配置通过 stat 指纹重新读取；监听和工作池参数需重启。
+Runtime: Python 3.10+ / 标准库。
+Test: python3 -B -m unittest test_runtime
 """
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -19,7 +22,7 @@ from urllib.parse import urlsplit
 
 
 class EnvConfigError(ValueError):
-    """Errors include keys or line numbers, never secret values."""
+    """配置错误容器；本模块构造的错误只报告键或行号，不拼接配置原值。"""
 
 
 @dataclass(frozen=True)
@@ -52,8 +55,8 @@ SCHEMA = {
     'RETRY_DELAYS': Field('300,900,2700', '失败退避（秒）', '1–5 档递增，每档至少 300 秒；当天耗尽后停止。', 'delays'),
     'BOT_WORKERS': Field('2', 'Bot 操作线程数', '默认 2；1 更省内存，最多 8。', 'int', 1, 8, restart=True),
     'BOT_MAX_JOBS': Field('16', 'Bot 待办上限', '包含正在运行任务；达到上限后明确拒绝新操作。', 'int', 4, 128, restart=True),
-    'TG_ALLOWED_USER_IDS': Field('', '仅允许这些 TG 用户（ID，逗号分隔）',
-                                 '留空 = 任何人搜到 Bot 都能用；自己用请填自己的数字 ID。', 'ids'),
+    'TG_ALLOWED_USER_IDS': Field('', '本人 TG 用户 ID',
+                                 '只填一个正整数 ID；同时作为通知接收人。留空关闭 Bot 和个人网页入口。', 'owner_id'),
     'TG_POLL_TIMEOUT': Field('45', 'TG 长轮询等待（秒）', '延长空闲等待减少连接与 CPU；范围 10–50。', 'int', 10, 50, restart=True),
     'SCHEDULER_INTERVAL': Field('60', '本地调度检查（秒）', '只检查本地数据库，不轮询官方接口。', 'int', 15, 300),
     'HTTP_REQUEST_TIMEOUT': Field('15', '网页请求超时（秒）', '防止空连接永久占用线程。', 'int', 3, 60, restart=True),
@@ -194,15 +197,10 @@ def validate_env(values, allow_unset_password=False):
             except (ImportError, KeyError, ValueError):
                 if value not in FIXED_ZONE_OFFSETS:
                     raise EnvConfigError('SIGN_TIMEZONE 不可用，请安装 tzdata 或选常用固定时区。') from None
-        elif field.kind == 'ids':
-            # 只收数字 TG 用户 ID，最多 20 个；写错就拒绝，不能静默变成「谁都能用」。
-            pieces = [piece for piece in re.split(r'[,\s]+', value) if piece]
-            if len(pieces) > 20:
-                raise EnvConfigError('%s 最多 20 个用户 ID。' % key)
-            for piece in pieces:
-                if not re.fullmatch(r'[1-9][0-9]{0,19}', piece):
-                    raise EnvConfigError('%s 只能填正整数 TG 用户 ID，多个用逗号分隔。' % key)
-            value = ','.join(pieces)
+        elif field.kind == 'owner_id':
+            # 空值用于首次配置；权限入口必须拒绝空身份，不能当作不限用户。
+            if value and (not re.fullmatch(r'[1-9][0-9]{0,18}', value) or int(value) >= 2**63):
+                raise EnvConfigError('%s 只能填一个正整数 TG 用户 ID。' % key)
         elif field.kind == 'delays':
             pieces = value.split(',')
             if not 1 <= len(pieces) <= 5 or any(not p.strip().isdigit() for p in pieces):
@@ -226,6 +224,22 @@ def validate_env(values, allow_unset_password=False):
     return normalized
 
 
+def configured_owner(cfg):
+    """读取唯一 TG 用户 ID；缺失、空白或非法均不返回可用身份。"""
+    if not isinstance(cfg, dict):
+        return None
+    raw = str(cfg.get('tg_allowed_user_ids') or '').strip()
+    if not re.fullmatch(r'[1-9][0-9]{0,18}', raw):
+        return None
+    value = int(raw)
+    return value if value < 2**63 else None
+
+
+def owner_permitted(cfg, tg_id):
+    """运行时唯一权限判据；不把账号已登记当作访问授权。"""
+    return type(tg_id) is int and tg_id > 0 and configured_owner(cfg) == tg_id
+
+
 def serialize_env(values):
     lines = ['# emoskata 系统配置唯一来源；进程环境同名值不会覆盖此文件。',
              '# 网页管理员保存修改到同一文件。个人账号设置仍在 SQLite 中。']
@@ -236,9 +250,9 @@ def serialize_env(values):
 
 
 def _seed_from_environ(environ=None):
-    """首次生成 .env 时，从进程环境变量里取显式给出的配置值。
+    """仅在首次建 .env 时从 SCHEMA 对应环境变量播种。
 
-    只认 SCHEMA 里存在的键；值仍要过 validate_env，写错就整条报错而不是静默忽略。
+    取值仍由 validate_env 校验；已存在的文件不会在运行中被环境变量覆盖。
     """
     environ = os.environ if environ is None else environ
     seeded = {}
@@ -285,10 +299,7 @@ class ConfigStore:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             with self._writer():
                 if not self.path.exists():
-                    # 首次生成 .env 时继承进程环境变量里的显式取值。
-                    # 不继承的话，docker-compose 里写 TG_ALLOWED_USER_IDS=你的ID
-                    # 会静默失效、Bot 对所有人开放 —— 用户以为锁上了，实际没锁。
-                    # 这些值会被写进 .env，之后 .env 仍是唯一来源。
+                    # 首次建文件时播种并持久化环境值；此后只读取文件。
                     seeded = {key: value for key, value in _seed_from_environ().items()}
                     self.provided_keys = set(seeded)
                     self._atomic(template_values(**seeded))
@@ -394,8 +405,9 @@ class ConfigStore:
                     'restart_required': [key for key in changed if SCHEMA[key].restart]}
 
     def app_config(self):
-        # cfg_all() 在签到/网页热路径上被反复调用。stat 一次判断 .env 有没有变，
-        # 没变就复用上次解析结果（仍会检测到文件被替换/改动）。
+        # 热路径用文件指纹避免重复解析，返回副本防止调用方改写缓存。
+        """按文件指纹复用解析结果；每次仍检测修改，不用 TTL 延迟热配置。
+        """
         try:
             info = self.path.stat()
         except OSError:

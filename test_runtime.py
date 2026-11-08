@@ -1,6 +1,8 @@
-"""Main-agent integration regressions: real app/accounts/bot/client with local fixtures.
-Run: python3 -B -m unittest -v test_runtime
-Deps: Python standard library; no Telegram or official server traffic.
+"""app/accounts/bot/client 本地集成和 .env 配置回归。
+
+仅使用临时目录、伪凭证和本地服务；不把替身成功视为生产授权或容器验收。
+Runtime: Python 3.10+ / 标准库。
+Test: python3 -B -m unittest test_runtime
 """
 import contextlib
 import json
@@ -171,37 +173,33 @@ class RuntimeTests(unittest.TestCase):
         instance._handle(update)
         self.assertTrue(instance.join_jobs(5))
 
-    def test_actual_bot_login_link_sign_and_revoke(self):
+    def test_actual_bot_primary_then_tokens_sign_all_owner_accounts(self):
+        original = self.app.cfg_all
+        self.app.cfg_all = lambda: dict(original(), tg_allowed_user_ids='101')
         with serve() as (server, base):
             self.seed_http(server)
+            server.identities[self.tokens[202]]['telegram_user_id'] = 101
+            server.identities[self.tokens[303]]['telegram_user_id'] = 101
             configure(self.app, base_url=base)
             tg = FakeTG()
             instance = bot.Bot('fixture:bot', self.app.Store(), tg=tg, synchronous=True)
             instance._accept_me(tg.get_me())
-            for actor, official in ((101, 'eA'), (202, 'eB'), (303, 'eC')):
-                self.dispatch(instance, actor, '/login ' + official)
-                url = tg.messages[-1][2][0][0]['url']
-                self.assertEqual(url, 'https://t.me/emospg_bot?start=link_' + official + '-fixture_emos_bot')
-                self.dispatch(instance, actor, '/start emosLinkAgree-' + self.tokens[actor])
-                self.assertIsNotNone(self.service.active(actor, required=False))
-            self.dispatch(instance, 202, '/code')
-            issued_text = tg.messages[-1][1]
-            import re
-            code = re.search(r'一次性码：<code>([^<]+)</code>', issued_text)[1]
-            self.dispatch(instance, 101, '/link eB ' + code)
-            a, b = self.service.active(101), self.service.active(202)
-            self.assertFalse(self.service.can_run(101, a['id'], b['id']))
-            self.dispatch(instance, 202, data='review:%d:%d:%d:1' % (b['id'], a['id'], b['id']))
+            self.dispatch(instance, 101, '/login eA')
+            self.assertEqual(tg.messages[-1][2][0][0]['url'],
+                             'https://t.me/emospg_bot?start=link_eA-fixture_emos_bot')
+            self.dispatch(instance, 101, '/start emosLinkAgree-' + self.tokens[101])
+            self.assertIsNotNone(self.service.primary_account(101))
+            self.dispatch(instance, 101, '/token ' + self.tokens[202])
+            self.dispatch(instance, 101, '/token ' + self.tokens[303])
+            self.assertEqual(len(self.service.owned(101)), 3)
             self.dispatch(instance, 101, '/sign')
-            self.assertEqual(server.signed, {'eA', 'eB'})
-            self.assertNotIn(self.tokens[101], '\n'.join(text for _, text, _ in tg.messages))
-            a, b = self.service.active(101), self.service.active(202)
-            self.dispatch(instance, 202, data='unlink:%d:%d:%d' % (b['id'], a['id'], b['id']))
-            before = len(server.hits)
-            server.signed.clear()
-            self.dispatch(instance, 101, '/sign')
-            self.assertEqual(server.signed, {'eA'})
-            self.assertTrue(all(uid != 'eB' for _, _, uid in server.hits[before:]))
+            self.assertEqual(server.signed, {'eA', 'eB', 'eC'})
+            before = list(server.hits)
+            self.dispatch(instance, 202, '/sign')
+            self.assertEqual(server.hits, before)
+            visible = '\n'.join(text for _, text, _ in tg.messages)
+            for token in self.tokens.values():
+                self.assertNotIn(token, visible)
             self.assertTrue(tg.deleted)
             instance.stop()
 
@@ -443,6 +441,8 @@ class RuntimeTests(unittest.TestCase):
     def test_cancel_during_http_login_prevents_account_save(self):
         entered, release = threading.Event(), threading.Event()
         configure(self.app, base_url='https://example.invalid')
+        original = self.app.cfg_all
+        self.app.cfg_all = lambda: dict(original(), tg_allowed_user_ids='101')
         tg = FakeTG()
         class WaitingClient:
             def __init__(self, *args):
@@ -530,14 +530,13 @@ class RuntimeTests(unittest.TestCase):
                                                   conn.execute('PRAGMA index_list(accounts)')])
 
     def test_first_boot_inherits_explicit_env_values(self):
-        # docker-compose 里写 TG_ALLOWED_USER_IDS=我的ID 必须真的生效。
-        # 之前首次生成 .env 完全不看环境变量，白名单静默为空 —— Bot 对所有人开放。
+        # 首次建配置必须继承显式环境值，此后不再作为覆盖来源。
         from envconfig import _seed_from_environ, template_values
-        seeded = _seed_from_environ({'TG_ALLOWED_USER_IDS': '101,202',
+        seeded = _seed_from_environ({'TG_ALLOWED_USER_IDS': '101',
                                      'PORT': '9000', 'NOT_A_KEY': 'x'})
-        self.assertEqual(seeded, {'TG_ALLOWED_USER_IDS': '101,202', 'PORT': '9000'})
+        self.assertEqual(seeded, {'TG_ALLOWED_USER_IDS': '101', 'PORT': '9000'})
         values = template_values(**seeded)
-        self.assertEqual(values['TG_ALLOWED_USER_IDS'], '101,202')
+        self.assertEqual(values['TG_ALLOWED_USER_IDS'], '101')
         self.assertEqual(values['PORT'], '9000')
         # 空值不等于显式配置，不能被继承成空串以外的东西
         self.assertNotIn('TG_BOT_TOKEN', seeded)
@@ -545,19 +544,18 @@ class RuntimeTests(unittest.TestCase):
             template_values(NOT_A_KEY='x')
 
     def test_allowlist_config_rejects_malformed_ids(self):
-        # 白名单写错绝不能变成「谁都放行」：非法值必须在写入时就报错。
+        # 单个 owner 的非法配置在保存时拒绝。
         from envconfig import SCHEMA, validate_env
         base = {key: field.default for key, field in SCHEMA.items()}
         base['PANEL_PASSWORD'] = 'abcdefgh'
-        for bad in ('0', '-5', 'abc', '101;202', '9999999999999999999999'):
+        for bad in ('0', '-5', 'abc', '101;202', '101,202', '101 202', '9999999999999999999999'):
             with self.assertRaises(envconfig.EnvConfigError, msg=bad):
                 validate_env(dict(base, TG_ALLOWED_USER_IDS=bad))
-        ok = validate_env(dict(base, TG_ALLOWED_USER_IDS='101 202'))
-        self.assertEqual(ok['TG_ALLOWED_USER_IDS'], '101,202')
+        ok = validate_env(dict(base, TG_ALLOWED_USER_IDS='101'))
+        self.assertEqual(ok['TG_ALLOWED_USER_IDS'], '101')
 
     def test_every_env_setting_is_reachable_from_the_web_panel(self):
-        # 新增配置项时最容易漏 CFG_TO_ENV：直写 .env 能用，但网页一提交就报
-        # 「未知配置项」—— 只有走网页的人会撞上。这里用 SCHEMA 的 ENV 名做对账。
+        # 配置 schema 与网页映射逐项对照，防止遗漏新增字段。
         from envconfig import CFG_TO_ENV, SCHEMA
         mapped_env = set(CFG_TO_ENV.values())
         unknown = sorted(env for env in mapped_env if env not in SCHEMA)
@@ -567,9 +565,8 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn(env, SCHEMA)
 
     def test_legacy_settings_table_moves_into_env_file(self):
-        # dd21d35 把系统配置存在 settings 表；现有版本只认 .env。
-        # 只换 py 会把 Bot Token 静默丢掉，所以升级时必须搬一次。
-        # 先把这几项清回默认值——那才是「旧部署刚换 py」的样子。
+        # 模拟旧 settings 配置迁移到 .env。
+        # 当前值为默认值时才满足此迁移条件。
         self.app.CONFIG.update({}, clear_secrets=['TG_BOT_TOKEN'])
         configure(self.app, sign_time='08:00', gap_seconds='8')
         self.app.set_setting('tg_bot_token', '123456789:legacyfixture')
@@ -589,7 +586,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(self.app.CONFIG.snapshot()[1], before)
 
     def test_legacy_import_never_overrides_values_already_in_env(self):
-        # 用户在 .env 里填过的值优先；旧库里过时的值不能盖掉它。
+        # 本用例填入非默认值，验证旧 settings 不覆盖该值。
         configure(self.app, tg_bot_token='999999:fromenvfile')
         self.app.set_setting('tg_bot_token', '123456789:stalelegacy')
         state = self.app.import_legacy_config()

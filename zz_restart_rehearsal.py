@@ -1,12 +1,9 @@
-#!/usr/bin/env python3
-"""真实重启演练：模拟用户的升级动作，验证数据与配置不丢。
+# !/usr/bin/env python3
+"""删除旧入口、上传候选并验证重启及数据的历史手工演练。
 
-动作顺序和手动操作一致：删掉旧的 emoskata.py -> 放上新的 -> 点「重启核心」。
-
-判据不能看 PID —— 重启是 os.execv，同一进程被替换，PID 天然不变；
-「PID 没变」在「重启成功」和「重启被取消」两种情况下都成立，等于什么都没证明。
-这里改成看**新文件的顶层代码有没有真的执行**：新 py 顶层写一个标记文件，
-重启后标记文件必须出现。
+固定端口和临时目录，只能串行手动运行；不进入 CI。使用假账号，不动真实配置。
+Runtime: Python 3.10+ / 标准库。
+Run: python3 zz_restart_rehearsal.py（先核对脚本路径和端口）
 """
 import json
 import os
@@ -25,7 +22,7 @@ MARKER = 'RESTART_MARKER_EVIDENCE.txt'
 
 
 def env_port(root):
-    """配置单一来源是 .env：进程环境变量里的 PORT 不生效。"""
+    """从已生成的 .env 读取端口；该文件存在后进程 PORT 不覆盖它。"""
     path = os.path.join(root, '.env')
     if not os.path.exists(path):
         return 8080
@@ -72,7 +69,7 @@ def wait_health(seconds=90):
 
 
 def snapshot_db(root):
-    """账号身份+余额+日志条数+当前用户。只数行数会漏掉「行还在但字段被清空」。"""
+    """快照账号身份、余额和用户选择；日志条数仅供观察，不作为等值判据。"""
     conn = sqlite3.connect(os.path.join(root, 'data', 'data.db'))
     conn.row_factory = sqlite3.Row
     try:
@@ -115,7 +112,7 @@ def main():
     if code != 200:
         print('FAIL 首次登录失败'); proc.kill(); return 1
 
-    # 造真实数据：一个账号 + 一条日志 + 一个已登录用户，才能验证「数据不丢」。
+    # 写入虚构账号、日志及已登录用户夹具，逐字段验证数据保留。
     import sqlite3
     db = sqlite3.connect(os.path.join(ROOT, 'data', 'data.db'))
     with db:
@@ -137,7 +134,7 @@ def main():
           % (len(accounts_before['accounts']), len(accounts_before['users']),
              accounts_before['logs'], len(env_before)))
 
-    # === 用户的升级动作：删旧 py，放新 py ===
+    # 删除旧入口后上传完整候选，模拟部署更新。
     source = open(os.path.join(ROOT, 'emoskata.py'), encoding='utf-8').read()
     os.remove(os.path.join(ROOT, 'emoskata.py'))
     # 锚点用文件里唯一确定的那行：单文件头是 'import sys as _sys'，不是 'import sys'。
@@ -160,7 +157,7 @@ def main():
     if code != 202:
         print('FAIL 重启没被接受'); proc.kill(); return 1
 
-    # === 等新代码执行：标记文件出现才算真的换了代码 ===
+    # 预检也执行顶层标记；此处仍需后续 health、登录和数据判据。
     marker_path = os.path.join(ROOT, MARKER)
     statuses = []
     deadline = time.time() + 120
@@ -188,7 +185,7 @@ def main():
         ok = False
     print('重启后 PID=%s（exec 天然不变）' % pid_of())
 
-    # === 数据与配置必须原样 ===
+    # 校验配置与业务字段，不把过程中的新增日志当作丢数据。
     accounts_after = snapshot_db(ROOT)
     env_after = open(os.path.join(ROOT, '.env'), 'rb').read()
     print('重启后：账号=%d 用户=%d 日志=%d .env=%d 字节'
@@ -208,13 +205,13 @@ def main():
     if env_after != env_before:
         print('FAIL .env 被改动了'); ok = False
 
-    # === 原密码必须还能登 ===
+    # 原管理员密码仍可认证。
     code2, _, cookie2 = call('/api/login', {'password': PW})
     print('重启后原密码登录=%s' % code2)
     if code2 != 200:
         print('FAIL 重启后登不进去'); ok = False
 
-    # === 白名单配置必须还在 ===
+    # 本人权限配置保持不变。
     if b'TG_ALLOWED_USER_IDS="101"' not in env_after:
         print('FAIL 白名单在重启后丢了'); ok = False
 

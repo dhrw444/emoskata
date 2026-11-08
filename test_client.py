@@ -1,5 +1,8 @@
-"""Client contract regression tests. Run: python3 -B -m unittest -v test_client.
-Every request uses a localhost fixture or an injected transport; never official APIs.
+"""JSON 契约、身份、余额、非幂等请求及网络错误回归。
+
+仅使用临时目录、伪凭证和本地服务；不把替身成功视为生产授权或容器验收。
+Runtime: Python 3.10+ / 标准库。
+Test: python3 -B -m unittest test_client
 """
 import unittest
 from unittest.mock import patch
@@ -80,8 +83,7 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(EmosClient('11_fixture', base).sign_once()['status'], 'blocked')
 
     def test_empty_sign_object_is_not_treated_as_signed(self):
-        # 官方原文只说「当天未签到时返回 null」。sign={} 不是已签证据，
-        # 当成已签会白丢一天；应当继续发起签到。
+        # sign={} 不作为已签到证据；当前策略继续提交，重复签到由官方响应归一。
         with serve() as (server, base):
             server.modes['eFixture'] = 'empty_sign'
             result = EmosClient('11_fixture', base).sign_once()
@@ -124,7 +126,7 @@ class ClientTests(unittest.TestCase):
 
     def test_generic_429_rate_and_429_already_are_distinct(self):
         # 官方样例是 429 + {"message":"重复签到"}；带句号/空白/近义写法也必须判成已签，
-        # 否则会被当成限流，白白退避一天。空 message 仍是限流。
+        # 空 message 仍按限流处理。
         for message, expected in [('重复签到', 'already'), ('重复签到。', 'already'),
                                   ('重复签到 ', 'already'), ('重复签到\u3000', 'already'),
                                   ('您今天已经签到过了', 'already'), ('', 'rate'),

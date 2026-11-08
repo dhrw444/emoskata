@@ -1,7 +1,8 @@
-"""Python 3.10+ / standard library. Run: python3 -m unittest -v test_bot.
-All Telegram/Emos traffic is fake. Settings checkpoints use a temporary SQLite DB.
-FakeAccounts explicitly models the contract; no production service fallback exists.
-Synchronous handlers make UI tests deterministic; threaded tests use Events+join_jobs.
+"""Bot 路由、消息失败、队列、菜单和替身签名回归。
+
+仅使用临时目录、伪凭证和本地服务；不把替身成功视为生产授权或容器验收。
+Runtime: Python 3.10+ / 标准库。
+Test: python3 -B -m unittest test_bot
 """
 
 from collections import deque
@@ -29,6 +30,7 @@ class FakeAccounts:
         self.grants, self.codes, self.records, self.pending = {}, {}, [], {}
         self.calls = []
         self.serial = 0
+        self.primaries = {}
 
     def ensure_user(self, tg_id, chat_id=None):
         if type(tg_id) is not int or tg_id <= 0 or chat_id not in (None, tg_id):
@@ -50,6 +52,13 @@ class FakeAccounts:
         self.owners[aid] = tg_id
         self.users[tg_id]["active_account_id"] = aid
         return dict(self.rows[aid])
+
+    def primary_account(self, tg_id):
+        aid = self.primaries.get(tg_id)
+        return dict(self.rows[aid]) if aid in self.rows and self.owners.get(aid) == tg_id else None
+
+    def has_primary_account(self, tg_id):
+        return self.primary_account(tg_id) is not None
 
     def begin_login(self, tg_id, official_id, expected_root=None):
         self.ensure_user(tg_id)
@@ -94,12 +103,18 @@ class FakeAccounts:
             raise DomainError("官方账号已归属其他用户，不能接管")
         row = self.add(tg_id, str(official), profile.get("_display") or profile.get("name")) if aid is None else dict(self.rows[aid])
         self.tokens[row["id"]] = token
+        self.primaries.setdefault(tg_id, row["id"])
         self.users[tg_id]["active_account_id"] = row["id"]
         self.cancel_login(tg_id)
         return row
 
-    def login_with_token(self, tg_id, token, profile, base_url=""):
-        """/token 直连路径的替身。语义与生产一致：官方 TG 绑定必须等于当前用户。"""
+    def login_with_token(self, tg_id, token, profile, base_url="", expected_root=None):
+        """只用于 Bot 交互测试；真实域权限由 test_owner_accounts 覆盖。"""
+        if not self.primary_account(tg_id):
+            raise DomainError('请先官方授权主账号')
+        selected = self.active(tg_id, required=False)
+        if expected_root is not None and (selected['id'] if selected else 0) != expected_root:
+            raise DomainError('当前账号已切换')
         if not isinstance(profile, dict):
             raise DomainError("登录资料无效，请重新授权")
         official = profile.get("user_id") or profile.get("_user_id")
@@ -260,8 +275,8 @@ class FakeAccounts:
 
     def run_scope(self, tg_id, include_links=True):
         aid = self.active(tg_id)["id"]
-        targets = [target for (source, target), enabled in self.grants.items()
-                   if source == aid and enabled and self.rows[target]["enabled"]] if include_links else []
+        targets = [index for index in self.rows if index != aid and self.owners[index] == tg_id
+                   and self.rows[index]['enabled']] if include_links else []
         return {"root_id": aid, "account_ids": [aid] + targets}
 
     def can_run(self, tg_id, root_id, target_id):
@@ -272,7 +287,7 @@ class FakeAccounts:
 
     def visible(self, tg_id):
         aid = self.active(tg_id)["id"]
-        ids = [aid] + [target for source, target in self.grants if source == aid]
+        ids = [aid] + [index for index in self.rows if index != aid and self.owners[index] == tg_id]
         return [dict(self.rows[index]) for index in ids]
 
     def logs(self, tg_id, limit=15):
@@ -280,7 +295,7 @@ class FakeAccounts:
         return [dict(row) for row in self.records if row["account_id"] in ids][:limit]
 
     def set_input(self, tg_id, kind, ttl=600):
-        if kind not in {"link", "time", "login"}:
+        if kind not in {"time", "login", "token"}:
             raise DomainError("输入类型无效")
         self.users[tg_id].update(input_kind=kind, input_until=int(time.time()) + ttl)
         self.calls.append(("set_input", tg_id, kind, ttl))
@@ -299,7 +314,7 @@ class FakeStore:
         self.temp = tempfile.TemporaryDirectory(prefix="emos-bot-test-")
         self.path = os.path.join(self.temp.name, "settings.db")
         self.lock = threading.Lock()
-        self.config = {"base_url": "https://fake-emos.invalid"}
+        self.config = {"base_url": "https://fake-emos.invalid", "tg_allowed_user_ids": "101"}
         self.runs = []
         self.run_contents = []
         self.run_hook = None
@@ -428,20 +443,22 @@ class BotTests(unittest.TestCase):
         self.uid = 0
         self.b = self.make_bot()
 
-    def test_allowed_users_empty_means_unrestricted(self):
-        # 不填 = 与旧行为一致，谁都能用
-        self.store.config.pop('tg_allowed_user_ids', None)
-        self.assertEqual(bot._allowed_users(self.store.cfg_all()), set())
-        self.assertTrue(bot.allowed_actor(101, self.store.cfg_all()))
+    def test_allowed_users_empty_denies_all(self):
+        for value in (None, ''):
+            self.store.config['tg_allowed_user_ids'] = value
+            self.assertEqual(bot._allowed_users(self.store.cfg_all()), set())
+            self.assertFalse(bot.allowed_actor(101, self.store.cfg_all()))
 
-    def test_allowed_users_parses_comma_and_space(self):
-        self.store.config['tg_allowed_user_ids'] = '101, 202'
-        self.assertEqual(bot._allowed_users(self.store.cfg_all()), {101, 202})
-        self.store.config['tg_allowed_user_ids'] = '101 202'
-        self.assertEqual(bot._allowed_users(self.store.cfg_all()), {101, 202})
+    def test_allowed_users_accepts_only_one_id(self):
+        for value in ('101,202', '101 202'):
+            self.store.config['tg_allowed_user_ids'] = value
+            self.assertFalse(bot.allowed_actor(101, self.store.cfg_all()))
+        self.store.config['tg_allowed_user_ids'] = '101'
+        self.assertTrue(bot.allowed_actor(101, self.store.cfg_all()))
+        self.assertFalse(bot.allowed_actor(202, self.store.cfg_all()))
 
     def test_allowed_users_parse_error_fails_closed(self):
-        # 配置写坏时不能退化成「谁都能用」——那是把锁砸了
+        # 配置解析失败必须拒绝，不回退为不限用户。
         self.store.config['tg_allowed_user_ids'] = '101,abc'
         self.assertFalse(bot.allowed_actor(101, self.store.cfg_all()))
         self.assertFalse(bot.allowed_actor(202, self.store.cfg_all()))
@@ -450,15 +467,15 @@ class BotTests(unittest.TestCase):
         self.store.config['tg_allowed_user_ids'] = '101'
         self.message('/start', actor=202)
         self.assertNotIn('主菜单', self.text())
-        # 名单外的人一条消息都不该发出去，也不该建任何用户状态
+        # 非 owner 的消息不发回复，也不创建用户状态。
         self.assertFalse([a for a in self.tg.actions if 'menu' in str(a)])
         self.assertNotIn(202, self.store.accounts.users)
 
     def test_allowlist_lets_listed_user_through(self):
         self.store.config['tg_allowed_user_ids'] = '101'
         self.message('/start', actor=101)
-        # 新用户先进登录页，这已经证明名单内的人被放行了（名单外的人连这个都收不到）
-        self.assertIn('本人官方登录', self.text())
+        # owner 可收到初次登录引导；与拒绝外人用例对照。
+        self.assertIn('第一个账号', self.text())
         self.assertIn(101, self.store.accounts.users)
 
     def test_allowlist_blocks_callbacks_too(self):
@@ -508,7 +525,9 @@ class BotTests(unittest.TestCase):
                 for row in (action[3] or []) for button in row]
 
     def own(self, actor=101, official="eA", name="账号 A"):
-        return self.store.accounts.add(actor, official, name)
+        row = self.store.accounts.add(actor, official, name)
+        self.store.accounts.primaries.setdefault(actor, row['id'])
+        return row
 
     def test_official_login_uses_this_users_entered_id_not_admin_or_tg_id(self):
         self.message("/login eVerified")
@@ -639,39 +658,22 @@ class BotTests(unittest.TestCase):
                 self.assertLessEqual(len(button["callback_data"].encode()), 64)
         self.assertIn("pref:notify_success", [button.get("callback_data") for button in buttons])
 
-    def test_generate_code_only_issuer_and_valid_link_roundtrip(self):
-        self.own(101, "eTarget")
-        self.own(202, "eSource")
-        self.message("/code")
-        code = self.store.accounts.codes["eTarget"][0]
-        self.assertIn(code, self.text(101))
-        self.assertNotIn(code, self.text(202))
-        urls = [button["url"] for button in self.buttons() if "url" in button]
-        payload = urls[-1].split("start=", 1)[1]
-        self.assertRegex(payload, r"^[A-Za-z0-9_-]+$")
-        self.assertLessEqual(len(payload), 64)
-        self.assertEqual(bot.Bot._association_args(payload), ("eTarget", code))
-        self.message("/start " + payload, actor=202)
+    def test_code_and_shared_link_are_disabled(self):
+        self.own()
+        self.message('/code')
+        self.message('/start associate_ZUJCMQ-oldSecret0000')
+        self.assertFalse(self.store.accounts.codes)
         self.assertFalse(self.store.accounts.grants)
-        self.callback('review:1:2:1:1', actor=101)
-        self.assertTrue(self.store.accounts.grants[2, 1])
-        self.assertNotIn(code, self.text(202))
-        self.assertTrue(any(action[:2] == ("delete", 202) for action in self.tg.actions))
+        self.assertIn('跨 TG 共享', self.text())
 
-    def test_id_and_code_direct_import_one_use_and_message_deleted(self):
+    def test_link_command_rejected_without_consuming_old_grant(self):
         a = self.own()
-        b = self.own(202, "eB")
-        issued = self.store.accounts.issue_code(202)
-        self.message("/link eB")
-        self.assertFalse(self.store.accounts.grants)
-        self.message("/link eB " + issued["code"])
-        self.assertFalse(self.store.accounts.grants)
-        self.callback('review:%d:%d:%d:1' % (b['id'], a['id'], b['id']), actor=202)
-        self.assertEqual(self.store.accounts.grants, {(a["id"], b["id"]): True})
-        self.message("/link eB " + issued["code"])
-        self.assertEqual(len([call for call in self.store.accounts.calls if call[0] == "redeem"]), 1)
-        self.assertNotIn(issued["code"], self.text())
-        self.assertTrue(any(action[0] == "delete" for action in self.tg.actions))
+        other = self.own(202, 'eB')
+        self.store.accounts.grants[a['id'], other['id']] = True
+        self.message('/link eB oldSecret0000')
+        self.assertEqual(self.store.accounts.grants, {(a['id'], other['id']): True})
+        self.assertFalse(any(c[0]=='redeem' for c in self.store.accounts.calls))
+        self.assertNotIn('oldSecret0000', self.text())
 
     def test_guided_input_expires_and_never_uses_new_root(self):
         a = self.own()
@@ -686,17 +688,11 @@ class BotTests(unittest.TestCase):
         self.message("13:00")
         self.assertEqual(self.store.accounts.rows[b["id"]]["sign_time"], "08:00")
 
-    def test_guided_link_input_redeems_and_clears(self):
+    def test_old_link_guide_button_rejected(self):
         a = self.own()
-        target = self.own(202, "eTarget")
-        code = self.store.accounts.issue_code(202)["code"]
-        self.callback("guide:link:%d" % a["id"])
-        self.message("eTarget " + code)
-        self.assertFalse(self.store.accounts.grants)
-        self.callback('review:%d:%d:%d:1' % (target['id'], a['id'], target['id']), actor=202)
-        self.assertTrue(self.store.accounts.grants[a["id"], target["id"]])
-        self.assertEqual(self.store.accounts.input_state(101), "")
-        self.assertNotIn(code, self.text())
+        self.callback('guide:link:%d' % a['id'])
+        self.assertEqual(self.store.accounts.input_state(101), '')
+        self.assertIn('跨 TG 共享', self.text())
 
     def test_input_restart_fails_closed(self):
         self.own()
@@ -715,9 +711,7 @@ class BotTests(unittest.TestCase):
         self.assertEqual(self.store.accounts.active(101)["sign_time"], "01:30")
 
     def test_bot_fake_matches_production_signatures(self):
-        # test_bot 的 FakeAccounts 复刻了 27 个 AccountService 方法。复刻一旦和生产
-        # 签名漂移，test_bot 就会对着假逻辑通过（曾出现：删掉生产 sign_mode 校验，
-        # test_bot/test_accounts 全绿）。这里把签名对齐变成显式约束。
+        # 对照生产公开接口的参数形状，防止替身签名漂移。
         import ast, pathlib
         def signatures(filename, marker):
             tree = ast.parse(pathlib.Path(filename).read_text(encoding='utf-8'))
@@ -787,35 +781,24 @@ class BotTests(unittest.TestCase):
         self.callback("pref:tg_bot_token")
         self.assertNotIn("tg_bot_token", self.store.accounts.user(101))
 
-    def test_link_source_toggle_both_endpoint_revocation(self):
-        a = self.own()
-        target = self.own(202, "eB")
-        self.store.accounts.grants[a["id"], target["id"]] = True
-        self.callback("toggle:%d:%d" % (a["id"], target["id"]), actor=202)
-        self.assertTrue(self.store.accounts.grants[a["id"], target["id"]])
-        self.callback("toggle:%d:%d" % (a["id"], target["id"]))
-        self.assertFalse(self.store.accounts.grants[a["id"], target["id"]])
-        self.callback("unlink:%d:%d:%d" % (target["id"], a["id"], target["id"]), actor=202)
-        self.assertEqual(self.store.accounts.grants, {})
-        self.store.accounts.grants[a["id"], target["id"]] = True
-        self.callback("unlink:%d:%d:%d" % (a["id"], a["id"], target["id"]))
-        self.assertEqual(self.store.accounts.grants, {})
+    def test_all_old_sharing_callbacks_rejected_without_data_mutation(self):
+        a = self.own(); target = self.own(202, 'eB')
+        self.store.accounts.grants[a['id'], target['id']] = True
+        before = dict(self.store.accounts.grants)
+        for data in ('toggle:%d:%d', 'review:%d:%d:1:1', 'unlink:%d:%d:1'):
+            self.callback(data % (a['id'], target['id']))
+        self.assertEqual(self.store.accounts.grants, before)
+        self.assertIn('跨 TG 共享', self.text())
 
-    def test_sign_only_active_and_direct_not_reverse_or_transitive(self):
-        a = self.own()
-        target = self.own(202, "eB")
-        c = self.own(303, "eC")
-        d = self.own(404, "eD")
-        self.store.accounts.grants.update({(a["id"], target["id"]): True,
-                                          (target["id"], c["id"]): True,
-                                          (d["id"], a["id"]): True})
-        self.message("/sign")
-        self.assertEqual(self.store.runs, [(101, True, a["id"], [a["id"], target["id"]])])
-        self.assertEqual(self.store.run_contents, [None])
-        # 附言就是用户输入的文字，官方用它做随机签到；不再当作非法参数拒绝。
-        self.message("/sign 今天也在")
-        self.assertEqual(len(self.store.runs), 2)
-        self.assertEqual(self.store.run_contents[-1], "今天也在")
+    def test_sign_covers_all_owner_accounts_not_shared_targets(self):
+        a = self.own(); second = self.own(101, 'eSecond')
+        target = self.own(202, 'eB')
+        self.store.accounts.switch(101, a['id'])
+        self.store.accounts.grants[a['id'], target['id']] = True
+        self.message('/sign')
+        self.assertEqual(self.store.runs, [(101, True, a['id'], [a['id'], second['id']])])
+        self.message('/sign 今天也在')
+        self.assertEqual(self.store.run_contents[-1], '今天也在')
 
     def test_revoke_during_sign_removes_target_report(self):
         a = self.own()
@@ -877,11 +860,12 @@ class BotTests(unittest.TestCase):
         self.assertEqual(len([call for call in self.store.accounts.calls if call[0] == "set_account"]), 1)
         self.assertEqual(len([action for action in self.tg.actions if action[0] == "answer"]), 2)
 
-    def test_send_failure_never_retries_destructive_action(self):
+    def test_send_failure_never_retries_token_addition(self):
         self.own()
         self.tg.fail_send = True
-        self.message("/code")
-        self.assertEqual(len([call for call in self.store.accounts.calls if call[0] == "issue_code"]), 1)
+        self.message('/token fake-valid-emos-token')
+        self.assertEqual(len([call for call in self.store.accounts.calls if call[0]=='login_with_token']), 1)
+        self.assertEqual(len(self.factory.calls), 1)
 
     def test_profile_failure_never_leaks_secret_to_stdout_or_ui(self):
         secret = "11_super-secret-value"
@@ -987,7 +971,7 @@ class BotTests(unittest.TestCase):
             release.wait(2)
             return []
         self.store.run_hook = block
-        self.message("/sign", actor=202, b=asynchronous)
+        self.assertTrue(asynchronous._jobs.submit("blocker", lambda: (entered.set(), release.wait(2))))
         self.assertTrue(entered.wait(1))
         self.message("/sign", b=asynchronous)
         self.store.accounts.switch(101, other["id"])

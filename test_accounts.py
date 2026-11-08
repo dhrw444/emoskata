@@ -1,8 +1,9 @@
-# Runtime: Python 3.9+ | SQLite3 | Standard-library unittest
-# Build: PYTHONDONTWRITEBYTECODE=1 python3 -c "import ast; ast.parse(open('test_accounts.py', encoding='utf-8').read())"
-# Run: PYTHONDONTWRITEBYTECODE=1 python3 test_accounts.py -v
-# Deps: Standard library only; temporary databases; no network or app imports
-"""Account-domain regression tests and observable probes, never real DBs."""
+"""账号域历史兼容、SQLite 事务、归属和字段投影回归。
+
+仅使用临时目录、伪凭证和本地服务；不把替身成功视为生产授权或容器验收。
+Runtime: Python 3.10+ / 标准库。
+Test: python3 -B -m unittest test_accounts
+"""
 
 import sys
 sys.dont_write_bytecode = True
@@ -38,8 +39,11 @@ CREATE TABLE logs (
 
 
 class TempStore:
-    def __init__(self, path):
+    def __init__(self, path, config=None):
         self.path = str(path)
+        # 默认刻意缺 owner 键以锁住旧 multi 回归语义；新测试显式传唯一 owner。
+        self.config = dict(config) if config is not None else {
+            "sign_time": "08:00", "base_url": "https://example.invalid"}
         self.lock = threading.RLock()
         self.next_write = None
         self.writes = 0
@@ -67,7 +71,7 @@ class TempStore:
                 raise
 
     def cfg(self):
-        return {"sign_time": "08:00", "base_url": "https://example.invalid"}
+        return dict(self.config)
 
 
 class AccountCase(unittest.TestCase):
@@ -131,6 +135,9 @@ class AccountCase(unittest.TestCase):
         self.assertIsNone(self.service.user(101))
         user = self.service.ensure_user(101)
         self.assertEqual((user["tg_id"], user["chat_id"], user["active_account_id"]), (101, 101, None))
+        self.assertIsNone(user['primary_account_id'])
+        self.assertIsNone(self.service.primary_account(101))
+        self.assertFalse(self.service.has_primary_account(101))
         self.assertEqual([user[key] for key in ("notify_success", "notify_fail", "notify_already")], [1, 1, 0])
         for key in ("notify_success", "notify_fail", "notify_already"):
             self.assertIs(type(user[key]), int)
@@ -305,12 +312,12 @@ class AccountCase(unittest.TestCase):
             "UPDATE accounts SET owner_tg_id=202 WHERE id=?", (a["id"],))
         with self.assertRaises(DomainError):
             self.service.set_account(101, auto_sign=False)
-        # The injected change and the failed operation both roll back.
+        # 注入变更与失败操作必须在同一事务内回滚。
         row = self.query("SELECT owner_tg_id,auto_sign FROM accounts")[0]
         self.assertEqual(row, {"owner_tg_id": 101, "auto_sign": 1})
 
     def test_set_account_sign_mode_whitelist_and_persistence(self):
-        # Bot 面板与网页都靠这条规则，test_bot 用的是替身，所以生产规则必须在这里测。
+        # 直接测试生产域规则；Bot 替身只验证交互，不能覆盖此判据。
         a = self.login(101, "A")
         self.assertEqual(a["sign_mode"], "normal")
         self.assertEqual(self.service.set_account(101, sign_mode="random")["sign_mode"], "random")
@@ -439,7 +446,7 @@ class AccountCase(unittest.TestCase):
     def test_concurrent_one_code_has_exactly_one_consumer(self):
         a, b, c = self.trio()
         issued = self.service.issue_code(202)
-        # Separate providers/locks exercise SQLite competition, not just a Python mutex.
+        # 独立连接和锁验证 SQLite 竞争，而非仅验证进程内互斥。
         other = TempStore(self.store.path)
         service2 = AccountService(other.db, other.write, other.cfg)
         barrier = threading.Barrier(3)
@@ -748,7 +755,7 @@ class AccountCase(unittest.TestCase):
 
 
     def test_admin_overview_sees_all_accounts_with_balances_but_users_do_not(self):
-        # 管理页要能一次看全所有账号和萝卜；普通用户仍只能看到自己visible的。
+        # 历史管理投影包含余额；个人投影遵守其可见范围。
         prof = {'_user_id': 'eA1', '_display': '甲', 'telegram_user_id': 101, '_carrot': 256}
         self.service.login_with_token(101, 'abcdefgh12345678', prof, 'https://emos.best')
         prof2 = {'_user_id': 'eB2', '_display': '乙', 'telegram_user_id': 202, '_carrot': 7}
@@ -767,8 +774,7 @@ class AccountCase(unittest.TestCase):
             self.assertNotIn('token', row)
 
     def test_login_with_token_creates_user_row_on_first_use(self):
-        # 第一次用 token 登录的人还没有 tg_users 行。只 UPDATE 会作用在 0 行上，
-        # 之后 active() 会报「请先登录」——账号明明加进去了却用不了。
+        # 历史 token 模式首次建用户后才能持久化当前选择。
         profile = {'user_id': 'eFirst', '_user_id': 'eFirst', '_display': '首个',
                    'telegram_user_id': 101, '_carrot': 5}
         self.service.login_with_token(101, 'abcdefgh12345678', profile, 'https://emos.best')
@@ -785,7 +791,7 @@ class AccountCase(unittest.TestCase):
         self.assertEqual(self.service.active(101)['carrot'], 128)
 
     def test_carrot_unknown_does_not_wipe_the_stored_balance(self):
-        # 读不到余额（None）时不能把已有数字清成 0 —— 那是丢账。
+        # 未知余额不覆盖已知缓存，也不伪装为零。
         profile = {'user_id': 'eKeep', '_user_id': 'eKeep', '_display': '保持',
                    'telegram_user_id': 101, '_carrot': 128}
         self.service.login_with_token(101, 'abcdefgh12345678', profile, 'https://emos.best')
@@ -931,8 +937,7 @@ class MigrationCase(unittest.TestCase):
         self.assertEqual((index["unique"], index["partial"]), (1, 1))
 
     def test_migration_duplicate_official_ids_keeps_earliest_and_clears_the_rest(self):
-        # 中止迁移会让进程启动即退出（容器 restart 下是永久崩溃循环），
-        # 所以改为：保留最早一行，其余 emos_id 置空，token 与历史不动。
+        # 重复官方 ID 迁移仅清除重复身份；原 Token 和历史记录保留。
         with self.store.write() as conn:
             conn.execute("ALTER TABLE accounts ADD COLUMN emos_id TEXT")
             conn.execute("UPDATE accounts SET emos_id='DUPLICATE'")
@@ -986,7 +991,7 @@ class MigrationCase(unittest.TestCase):
 
 
 def probes():
-    """Print observed, token-free values first; unittest assertions run afterward."""
+    """先输出不含密钥的实际观测，再运行 unittest 断言。"""
     with tempfile.TemporaryDirectory(prefix="emoskata-account-probe-") as temp:
         store = TempStore(Path(temp) / "probe.sqlite3")
         service = AccountService(store.db, store.write, store.cfg)

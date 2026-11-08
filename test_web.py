@@ -1,5 +1,8 @@
-"""Personal web permission and official-contract regressions. Local fixtures only.
-Run: python3 -B -m unittest -v test_web | Build: python3 build_single.py
+"""个人会话、字段投影及旧数据库兼容回归。
+
+仅使用临时目录、伪凭证和本地服务；不把替身成功视为生产授权或容器验收。
+Runtime: Python 3.10+ / 标准库。
+Test: python3 -B -m unittest test_web
 """
 import contextlib
 import hashlib
@@ -381,6 +384,8 @@ class WebTests(unittest.TestCase):
         self.assertEqual(webui.web_origin('http://127.0.0.1:8080'), 'http://127.0.0.1:8080')
 
     def test_bot_web_entry_is_only_given_after_self_login(self):
+        original = self.app.cfg_all
+        self.app.cfg_all = lambda: dict(original(), tg_allowed_user_ids='101')
         tg = FakeTG()
         instance = bot.Bot('fixture:bot', self.app.Store(), tg=tg, synchronous=True)
         instance._accept_me(tg.get_me())

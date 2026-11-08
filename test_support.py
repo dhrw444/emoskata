@@ -1,5 +1,8 @@
-"""Isolated test deployment: real .env and SQLite, no production app import.
-Runtime: Python 3.10+ stdlib | Run: python3 -B -m unittest discover
+"""隔离配置、数据库和应用导入的测试工厂回归。
+
+仅使用临时目录、伪凭证和本地服务；不把替身成功视为生产授权或容器验收。
+Runtime: Python 3.10+ / 标准库。
+Test: python3 -B -m unittest discover -p "test_*.py"
 """
 import importlib.util
 import os
@@ -20,17 +23,27 @@ def configure(app, **values):
     return app.CONFIG.update({keys.get(name, name): value for name, value in values.items()})
 
 
-def fixture_app(case, directory, name, entry=None):
+def fixture_app(case, directory, name, entry=None, single_owner=False):
     directory = Path(directory)
-    config = ConfigStore(directory / '.env', create=True)
+    with patch.dict(os.environ, {'TG_BOT_TOKEN': '', 'TG_ALLOWED_USER_IDS': ''}):
+        config = ConfigStore(directory / '.env', create=True)
     config.update({'PANEL_PASSWORD': 'fixture_password', 'DATA_DIR': str(directory / 'data'),
                    'HTTP_HOST': '127.0.0.1', 'EMOS_BASE_URL': 'http://127.0.0.1:1',
                    'SIGN_TIMEZONE': 'UTC',
-                   'TG_BOT_TOKEN': ''})
+                   'TG_BOT_TOKEN': '', 'TG_ALLOWED_USER_IDS': '101' if single_owner else ''},
+                  clear_secrets=['TG_BOT_TOKEN'])
     environment = patch.dict(os.environ, {'EMOS_ENV_FILE': str(config.path)})
     environment.start()
     case.addCleanup(environment.stop)
     spec = importlib.util.spec_from_file_location(name, entry or ROOT / 'app.py')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    if not single_owner:
+        application = module if hasattr(module, 'cfg_all') else module.app
+        original = application.cfg_all
+        def legacy_test_config():
+            result = original()
+            result.pop('tg_allowed_user_ids', None)
+            return result
+        application.cfg_all = legacy_test_config
     return module

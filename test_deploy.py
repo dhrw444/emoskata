@@ -1,6 +1,8 @@
-"""HTTP and deployment regressions; localhost fixtures and isolated data only.
-Run: python3 -B -m unittest -v test_deploy
-Build: python3 build_single.py | Deps: Python standard library.
+"""HTTP 管理权限与真实单文件首号、Token 和网页流程回归。
+
+仅使用临时目录、伪凭证和本地服务；不把替身成功视为生产授权或容器验收。
+Runtime: Python 3.10+ / 标准库。
+Test: python3 -B -m unittest test_deploy
 """
 from contextlib import contextmanager
 import importlib.util
@@ -192,7 +194,7 @@ class DeployTests(unittest.TestCase):
         self.assertEqual(single.emos.EmosClient('11_fixture').bases, list(single.emos.BASES))
         self.assertNotIn('from accounts import', '\n'.join(single._SOURCES.values()))
 
-    def test_single_file_only_real_login_associate_sign_revoke(self):
+    def test_single_file_official_first_token_second_owner_web_sign(self):
         stage = Path(self.temp.name) / 'single-only'
         stage.mkdir()
         sources = Path(self.temp.name) / 'sources'
@@ -201,13 +203,13 @@ class DeployTests(unittest.TestCase):
             shutil.copy2(ROOT / file, sources / file)
         subprocess.run([sys.executable, '-B', str(sources / 'build_single.py')], check=True, capture_output=True)
         shutil.copy2(sources / 'emoskata.py', stage / 'emoskata.py')
-        single = fixture_app(self, stage, 'single_runtime_fixture', stage / 'emoskata.py')
+        single = fixture_app(self, stage, 'single_runtime_fixture', stage / 'emoskata.py', single_owner=True)
         self.assertEqual([p.name for p in stage.glob('*.py')], ['emoskata.py'])
         single.app.init_db()
         with serve() as (server, base):
             configure(single.app, base_url=base)
-            server.identities = {'11_singleA': {'user_id': 'eA', 'telegram_user_id': 101},
-                                 '11_singleB': {'user_id': 'eB', 'telegram_user_id': 202}}
+            server.identities = {'11_singleA': {'user_id': 'eA', 'telegram_user_id': 101, 'carrot': 41},
+                                 '11_singleB': {'user_id': 'eB', 'telegram_user_id': 101, 'carrot': 777}}
             tg = FakeTG()
             instance = single.bot.Bot('fixture:bot', single.app.Store(), tg=tg, synchronous=True)
             instance._accept_me(tg.get_me())
@@ -215,44 +217,36 @@ class DeployTests(unittest.TestCase):
                 instance._handle({'update_id': number, 'message': {'message_id': number,
                     'from': {'id': actor}, 'chat': {'id': actor, 'type': 'private'}, 'text': text}})
             with patch.object(single.app._shutdown, 'wait', return_value=False):
-                for n, actor, token in ((1, 101, '11_singleA'), (3, 202, '11_singleB')):
-                    command(n, actor, '/login ' + server.identities[token]['user_id'])
-                    command(n + 1, actor, '/start emosLinkAgree-' + token)
+                command(1, 101, '/login eA')
+                command(2, 101, '/start emosLinkAgree-11_singleA')
+                command(3, 101, '/token 11_singleB')
                 service = single.app.Store().accounts
-                code = service.issue_code(202)
-                command(5, 101, '/link eB ' + code['code'])
-                a, b = service.active(101), service.active(202)
-                self.assertFalse(service.can_run(101, a['id'], b['id']))
-                service.review_link(202, a['id'], b['id'], True, expected_root=b['id'])
-                command(6, 101, '/sign')
+                self.assertEqual(len(service.owned(101)), 2)
+                self.assertEqual(service.primary_account(101)['emos_id'], 'eA')
+                command(4, 101, '/sign')
                 self.assertEqual(server.signed, {'eA', 'eB'})
-                a, b = service.active(101), service.active(202)
-                service.unlink(202, a['id'], b['id'])
-                server.signed.clear()
-                command(7, 101, '/sign')
-                self.assertEqual(server.signed, {'eA'})
+                before = list(server.hits)
+                command(5, 202, '/sign')
+                self.assertEqual(before, server.hits)
                 configure(single.app, web_base_url='http://127.0.0.1:8080')
                 web = single.app.personal_web()
                 self.addCleanup(web.stop)
                 from urllib.parse import parse_qs, urlsplit
-                login_code = parse_qs(urlsplit(web.issue_url(101)).fragment)['code'][0]
-                web_login = web.exchange(login_code)
-                self.assertEqual(web.authenticate(web_login['sid'])['tg_id'], 101)
-                page_state = web.state(101)
-                self.assertEqual([row['emos_id'] for row in page_state['owned']], ['eA'])
-                self.assertEqual(page_state['targets'], [])
-                issued = web.action(202, 'code', {'account_id': b['id']})
-                web.action(101, 'link', {'account_id': a['id'], 'target_emos_id': 'eB', 'code': issued['code']})
-                self.assertFalse(service.can_run(101, a['id'], b['id']))
-                web.action(202, 'review', {'account_id': b['id'], 'source_id': a['id'],
-                                         'target_id': b['id'], 'approve': True})
+                code = parse_qs(urlsplit(web.issue_url(101)).fragment)['code'][0]
+                auth = web.exchange(code)
+                self.assertEqual(web.authenticate(auth['sid'])['tg_id'], 101)
+                state = web.state(101)
+                self.assertTrue(state['single_owner'])
+                self.assertEqual(len(state['owned']), 2)
+                self.assertEqual(state['links'], {'incoming': [], 'outgoing': []})
                 server.signed.clear()
-                started = web.start_sign(101, {'account_id': a['id'], 'request_id': 'fixture_single_web_0001'})
+                started = web.start_sign(101, {'account_id': state['active']['id'],
+                    'request_id': 'fixture_single_web_0001'})
                 web.queue.join()
-                self.assertEqual([row['emos_id'] for row in web.job(101, started['job_id'])['rows']], ['eA', 'eB'])
+                self.assertEqual(len(web.job(101, started['job_id'])['rows']), 2)
                 self.assertEqual(server.signed, {'eA', 'eB'})
-                web.action(202, 'unlink', {'account_id': b['id'], 'source_id': a['id'], 'target_id': b['id']})
-                self.assertEqual(web.state(101)['targets'], [])
+                configure(single.app, tg_allowed_user_ids='202')
+                self.assertIsNone(web.authenticate(auth['sid']))
             instance.stop()
 
 

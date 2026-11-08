@@ -1,6 +1,8 @@
-"""Compile real inline page scripts with Node's JavaScript parser, never regex rules.
-Runtime: Python 3.10+ stdlib; Node 18+ (development/CI only, not application runtime)
-Build/Run: python3 check_web_js.py
+"""把替换占位符后的真实页面脚本交给 Node 语法检查器。
+
+Node 只在开发验证时使用，不是 emoskata 运行依赖。
+Runtime: Python 3.10+ / 标准库，检查另需 Node。
+Test: python3 -B check_web_js.py
 """
 import ast
 from html.parser import HTMLParser
@@ -55,8 +57,7 @@ def script_sources():
                             result[target.id + '_' + str(index)] = script
     if len(result) != 4:
         raise ValueError('未取得全部四段真实网页脚本，检查页面结构。')
-    # 页面里的状态文案是渲染时注入的；直接检查带占位符的源码会漏掉真实运行时错误
-    # （`const labels=__STATUS_JS__` 语法合法，运行时才 ReferenceError）。
+    # 检查替换占位符后的脚本；合法占位符表达式仍可能在运行时未定义。
     if '__STATUS_JS__' in result.get('_DASHBOARD_JS', ''):
         sys.path.insert(0, str(ROOT))
         import webui

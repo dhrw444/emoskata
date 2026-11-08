@@ -1,5 +1,9 @@
-"""Personal web access and owner-scoped signing jobs; Python 3.10+ stdlib.
-Build: python3 build_single.py | Run: python3 app.py | Test: python3 -B -m unittest test_web
+"""个人网页会话、一次性入口、账号投影与有界签到队列。
+
+会话持久化于 SQLite，每次请求重新验 owner；余额与单次所得分开呈现。
+共享相关结构仅用于历史兼容，生产单人模式拒绝旧共享操作。
+Runtime: Python 3.10+ / 标准库，由 app 提供 HTTP 路由。
+Test: python3 -B -m unittest test_web test_owner_web test_queue
 """
 import hashlib
 import hmac
@@ -13,12 +17,14 @@ from contextlib import closing
 from urllib.parse import urlsplit
 
 from accounts import DomainError
+from envconfig import owner_permitted
 
 WEB_CODE_TTL = 120
+# 运行时会从配置计算实际会话期限；此值是默认值。
 WEB_SESSION_TTL = 7 * 86400
 WEB_JOB_TTL = 600
 
-# 状态→中文。本人看原文；代签目标只给不含他人细节的说法。
+# 生产单人视图使用本人文案；降级文案保留用于历史测试兼容。
 _STATUS_TEXT = {'signed': '签到成功', 'already': '今日已签到', 'network': '网络异常',
                 'blocked': '接口访问受阻', 'rate': '接口限流', 'invalid': '登录凭证已失效',
                 'failed': '签到失败', 'revoked': '授权已撤销'}
@@ -77,6 +83,14 @@ class WebService:
         self.accepting = True
         self.stopping = threading.Event()
 
+    def _owner(self, tg_id):
+        cfg = self.cfg()
+        if 'tg_allowed_user_ids' in cfg:
+            if not owner_permitted(cfg, tg_id) or self.accounts.primary_account(tg_id) is None:
+                raise DomainError('只允许已完成官方首号授权的本人访问。')
+            return True
+        return False
+
     @staticmethod
     def init_schema(conn):
         conn.execute('CREATE TABLE IF NOT EXISTS web_auth_codes ('
@@ -89,6 +103,7 @@ class WebService:
                      'csrf_token TEXT NOT NULL)')
 
     def issue_url(self, tg_id):
+        self._owner(tg_id)
         base = web_origin(self.cfg().get('web_base_url') or '')
         if not self.accounts.owned(tg_id):
             raise DomainError('先在 Bot 通过官方授权登录自己的账号。')
@@ -114,6 +129,7 @@ class WebService:
             if row is None:
                 raise DomainError('网页入口无效、已过期或已使用，请在 Bot 重新打开。')
             tg_id = row['tg_id']
+            self._owner(tg_id)
             if not conn.execute('SELECT 1 FROM accounts WHERE owner_tg_id=? AND emos_id IS NOT NULL '
                                 "AND emos_id<>''", (tg_id,)).fetchone():
                 raise DomainError('账号归属已失效，请重新登录 Bot。')
@@ -125,6 +141,7 @@ class WebService:
             conn.execute('INSERT INTO web_sessions VALUES(?,?,?,?,?)',
                          (_digest(sid), tg_id, now,
                           now + int(self.cfg().get('web_session_hours', WEB_SESSION_TTL // 3600)) * 3600, csrf))
+        self._owner(tg_id)
         return {'sid': sid, 'csrf_token': csrf, 'tg_id': tg_id}
 
     def authenticate(self, sid):
@@ -139,9 +156,15 @@ class WebService:
                     or not conn.execute('SELECT 1 FROM accounts WHERE owner_tg_id=? '
                                         "AND emos_id IS NOT NULL AND emos_id<>''", (row['tg_id'],)).fetchone()):
                 return None
+        try:
+            self._owner(row['tg_id'])
+        except DomainError:
+            return None
         return {'tg_id': row['tg_id'], 'csrf_token': row['csrf_token']}
 
     def logout(self, sid):
+        """仅撤销个人网页会话；不删除 emos Token，不退出账号登录。
+        """
         if _secret(sid):
             with self.write() as conn:
                 conn.execute('DELETE FROM web_sessions WHERE sid_hash=?', (_digest(sid),))
@@ -155,21 +178,29 @@ class WebService:
         return session
 
     def state(self, tg_id):
+        owner_mode = self._owner(tg_id)
         active = self.accounts.active(tg_id, required=False)
         prefs = self.accounts.user(tg_id) or {}
         own = self.accounts.owned(tg_id)
-        links = self.accounts.links(tg_id)
         visible = self.accounts.visible(tg_id)
         basic = ('id', 'emos_id', 'name', 'last_status', 'last_carrot', 'last_run')
+        if owner_mode:
+            basic += ('carrot', 'carrot_at', 'enabled', 'auto_sign', 'sign_mode', 'sign_time')
         targets = [{k: row.get(k) for k in basic} for row in visible
                    if not active or row['id'] != active['id']]
-        return {'active': active, 'owned': own, 'targets': targets, 'links': links,
-                'pending_links': self.accounts.pending_links(tg_id),
-                'preferences': {key: int(prefs.get(key) or 0) for key in
-                                ('notify_success', 'notify_fail', 'notify_already')},
-                'timezone': str(self.cfg().get('timezone') or 'Asia/Shanghai')}
+        empty = {'incoming': [], 'outgoing': []}
+        result = {'active': active, 'owned': own, 'targets': targets,
+                  'links': empty if owner_mode else self.accounts.links(tg_id),
+                  'pending_links': empty if owner_mode else self.accounts.pending_links(tg_id),
+                  'preferences': {key: int(prefs.get(key) or 0) for key in
+                                  ('notify_success', 'notify_fail', 'notify_already')},
+                  'timezone': str(self.cfg().get('timezone') or 'Asia/Shanghai'),
+                  'single_owner': owner_mode}
+        self._owner(tg_id)
+        return result
 
     def logs(self, tg_id):
+        self._owner(tg_id)
         own_ids = {row['id'] for row in self.accounts.owned(tg_id)}
         rows = self.accounts.logs(tg_id, limit=40)
         result = []
@@ -181,6 +212,9 @@ class WebService:
         return result
 
     def action(self, tg_id, action, body):
+        owner_mode = self._owner(tg_id)
+        if owner_mode and action in {'code', 'link', 'toggle', 'unlink', 'review', 'withdraw'}:
+            raise DomainError('跨 TG 共享已关闭；从 Bot 用 /token 添加本人账号。')
         fields = {
             'switch': ('account_id', 'target_id'),
             'settings': ('account_id', 'auto_sign', 'sign_time', 'sign_mode'),
@@ -247,6 +281,9 @@ class WebService:
                 self.requests.pop(key, None)
 
     def start_sign(self, tg_id, body):
+        """入队前固定当前选择，worker 执行前再次核对本人权限。
+        """
+        self._owner(tg_id)
         _only(body, ('account_id', 'request_id'))
         root = _local_id(body.get('account_id'))
         request_id = body.get('request_id')
@@ -303,6 +340,7 @@ class WebService:
                 job['status'] = 'running'
                 actor, root = job['tg_id'], job['root_id']
             try:
+                self._owner(actor)
                 rows = self.run_user(actor, include_links=True, expected_root=root)
                 status = 'busy' if rows is None else 'done'
                 message = '另一个签到任务正在运行，请稍后重新签到。' if rows is None else ''
@@ -319,6 +357,7 @@ class WebService:
             self.queue.task_done()
 
     def job(self, tg_id, job_id):
+        self._owner(tg_id)
         if not isinstance(job_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{24}', job_id):
             raise DomainError('任务不存在或已过期。')
         with self.lock:
@@ -332,7 +371,7 @@ class WebService:
             return {'ok': True, 'status': 'stale', 'message': '当前账号已改变，请刷新日志。', 'rows': []}
         visible = {row['id'] for row in self.accounts.visible(tg_id)}
         own_ids = {row['id'] for row in self.accounts.owned(tg_id)}
-        fields = ('id', 'emos_id', 'name', 'status', 'message', 'carrot')
+        fields = ('id', 'emos_id', 'name', 'status', 'message', 'carrot', 'balance')
         rows = []
         for row in job['rows']:
             if not isinstance(row, dict) or row.get('id') not in visible:
@@ -385,16 +424,16 @@ button.secondary{background:#2b3646;color:var(--ink)}button.danger{background:#5
 '''
 
 _DASHBOARD_HTML = '''
-<header><div><h1>🥕 我的签到配置</h1><p class="muted">官方账号由 Telegram Bot 登录。这里只显示本人及明确授权的代签状态。</p></div><button id="logout" class="secondary">退出网页</button></header>
+<header><div><h1>🥕 我的签到配置</h1><p class="muted">首个账号通过官方 Bot 授权，其他账号用 emos Token 添加。这里只显示本人全部账号。</p></div><button id="logout" class="secondary">退出网页</button></header>
 <div id="flash" role="status" aria-live="polite"></div>
-<section><h2>当前账号</h2><label for="accounts">选择本人已登录账号</label><select id="accounts"></select><p id="identity" class="muted"></p><div class="row"><button id="sign">签到本人 + 已开启关联</button><button id="refresh" class="secondary">刷新状态</button></div><div id="result" role="status"></div></section>
+<section><h2>当前账号</h2><label for="accounts">选择本人已登录账号</label><select id="accounts"></select><p id="identity" class="muted"></p><div class="row"><button id="sign">签到全部本人账号</button><button id="refresh" class="secondary">刷新状态</button></div><div id="result" role="status"></div></section>
 <div class="grid"><section><h2>我的签到设置</h2><p class="muted">此处仅改变当前本人账号，不改变关联目标的设置。</p><label class="check"><input id="auto" type="checkbox">自动签到</label><label for="time">签到时间（00:xx 自动调整到 01:xx）</label><input id="time" type="time" value="08:00"><p id="timezone" class="muted"></p><label for="sign-mode">本人签到模式</label><select id="sign-mode"><option value="normal">普通签到（不带附言）</option><option value="random">随机字签到（自动带附言）</option></select><p class="muted">奖励由官方决定。每个账号保留自己的选择，关联方不能修改。</p><button id="save-settings">保存签到设置</button></section>
 <section><h2>我的通知</h2><label class="check"><input id="n-success" type="checkbox">签到成功通知</label><label class="check"><input id="n-fail" type="checkbox">签到失败通知</label><label class="check"><input id="n-already" type="checkbox">已签到通知</label><button id="save-preferences">保存通知设置</button><p class="muted">发送给本人的 TG 私聊。不会变更其他人的通知目标。</p></section></div>
-<section><h2>关联账号 · 我代签</h2><p class="muted">目标必须已在同一个 Bot 登录。官方账号 ID 用来定位，目标的一次性码用来申请；目标本人二次确认后授权。</p><form id="link-form"><div class="row"><div><label for="target">目标官方账号 ID</label><input id="target" autocomplete="off" placeholder="eXXXXXXXXs" maxlength="256" required></div><div><label for="link-code">目标的一次性关联码</label><input id="link-code" type="password" autocomplete="off" maxlength="256" required></div></div><button type="submit">添加关联</button></form><div id="outgoing"></div></section>
+<section><h2>关联账号 · 我代签（已停用）</h2><p class="muted">目标必须已在同一个 Bot 登录。官方账号 ID 用来定位，目标的一次性码用来申请；目标本人二次确认后授权。</p><form id="link-form"><div class="row"><div><label for="target">目标官方账号 ID</label><input id="target" autocomplete="off" placeholder="eXXXXXXXXs" maxlength="256" required></div><div><label for="link-code">目标的一次性关联码</label><input id="link-code" type="password" autocomplete="off" maxlength="256" required></div></div><button type="submit">添加关联</button></form><div id="outgoing"></div></section>
 <section><h2>让另一个账号代签我</h2><p class="muted">为当前账号生成 10 分钟、只使用一次的关联码。只有你同意的人能获得此码；重新生成会替换旧码。</p><button id="issue-code">生成关联凭证</button><button id="hide-code" class="secondary">隐藏凭证</button><div id="codebox" class="codebox" hidden><pre id="issued"></pre><button id="copy-code" class="secondary">复制 ID 与关联码</button><p id="expires" class="muted"></p></div><div id="incoming"></div></section>
 <section><h2>关联申请 · 目标本人二次确认</h2><p class="muted">ID 与码只创建申请。目标本人确认后才授予直接代签；来源可撤回。确认不会共享登录或反向授权。</p><div id="pending-incoming"></div><div id="pending-outgoing"></div></section>
-<section><h2>已授权目标的代签状态</h2><p class="muted">仅显示签到相关状态；不展示密钥、TG 身份、个人设置或目标的其他关联。</p><div id="targets"></div></section>
-<section><h2>本人及直接授权的签到记录</h2><div id="logs"></div><p class="muted">解除关联后，目标日志和异步任务结果立即不再提供。</p></section>
+<section><h2>其他本人账号 · 余额与状态</h2><p class="muted">仅显示签到相关状态；不展示密钥、TG 身份、个人设置或目标的其他关联。</p><div id="targets"></div></section>
+<section><h2>全部本人账号签到记录</h2><div id="logs"></div><p class="muted">账号凭证及 TG ID 不回显；变更允许 ID 后原网页会话立即失效。</p></section>
 '''
 
 _AUTH_HTML = '''<header><h1>🔐 进入个人配置页</h1></header><section><p id="auth-status">正在校验 Bot 签发的一次性入口…</p><p class="muted">登录参数不会放进 URL 查询、服务器访问日志或浏览器本地存储。请勿把本入口转发给别人。</p><a class="button" href="/web/login">重新获取入口</a></section>'''
@@ -416,11 +455,11 @@ async function api(path,data){const opts={credentials:'same-origin',method:data=
 async function operation(action){if(document.body.dataset.busy==='1')return;document.body.dataset.busy='1';document.querySelectorAll('button').forEach(b=>b.disabled=true);try{flash('');await action();}catch(error){flash(error.message||'操作失败，请刷新重试。');}finally{document.body.dataset.busy='0';document.querySelectorAll('button').forEach(b=>b.disabled=false);}}
 function renderLinks(list,container,incoming){const output=$(container);output.replaceChildren();if(!list.length){output.append(node('p',incoming?'暂无账号被授权代签当前账号。':'暂无外向关联。','muted'));return;}for(const link of list){const entry=node('div',undefined,'entry');entry.append(node('strong',link.source_name+' ('+link.source_emos_id+') → '+link.target_name+' ('+link.target_emos_id+')'));entry.append(node('p',link.enabled?'联动已开启':'联动已暂停','muted'));if(!incoming){const toggle=node('button',link.enabled?'暂停联动':'开启联动','secondary');toggle.onclick=()=>operation(async()=>{await api('toggle',{account_id:root(),source_id:link.source_id,target_id:link.target_id,enabled:!Boolean(link.enabled)});await load();flash('联动开关已更新。');});entry.append(toggle);}const unlink=node('button','解除关联','danger');unlink.onclick=()=>operation(async()=>{if(!confirm('解除后不能继续代签或查看目标日志。确定解除？'))return;await api('unlink',{account_id:root(),source_id:link.source_id,target_id:link.target_id});await load();flash('关联已解除。');});entry.append(unlink);output.append(entry);}}
 function renderPending(){for(const direction of ['incoming','outgoing']){const box=$('pending-'+direction);box.replaceChildren();const rows=state.pending_links[direction];if(!rows.length){box.append(node('p',direction==='incoming'?'没有待本人确认的申请。':'没有待目标确认的申请。','muted'));continue;}for(const row of rows){const entry=node('div',undefined,'entry');entry.append(node('strong',row.source_name+' ('+row.source_emos_id+') → '+row.target_name+' ('+row.target_emos_id+')'));entry.append(node('p','等待本人确认 · 到期 '+new Date(row.expires_at*1000).toLocaleTimeString(),'muted'));if(direction==='incoming'){for(const [approve,text] of [[true,'确认直接代签'],[false,'拒绝申请']]){const button=node('button',text,approve?'':'danger');button.onclick=()=>operation(async()=>{if(approve&&!confirm('确认让此来源账号代签当前账号？只授予直接签到与签到状态查看权限。'))return;await api('review',{account_id:root(),source_id:row.source_id,target_id:row.target_id,approve});await load();flash(approve?'本人已确认，直接关联生效。':'申请已拒绝，未建立权限。');});entry.append(button);}}else{const button=node('button','撤回申请','secondary');button.onclick=()=>operation(async()=>{await api('withdraw',{account_id:root(),source_id:row.source_id,target_id:row.target_id});await load();flash('申请已撤回。');});entry.append(button);}box.append(entry);}}}
-function renderTargets(){const output=$('targets');output.replaceChildren();if(!state.targets.length){output.append(node('p','暂无直接授权目标。','muted'));return;}for(const row of state.targets){const entry=node('div',undefined,'entry');entry.append(node('strong',row.name+' · '+row.emos_id));entry.append(node('p',(labels[row.last_status]||'未运行')+' · 最近 '+(row.last_run||'—')+(row.last_carrot==null?'':' · 萝卜 '+row.last_carrot),'muted'));output.append(entry);}}
+function renderTargets(){const output=$('targets');output.replaceChildren();if(!state.targets.length){output.append(node('p','暂无直接授权目标。','muted'));return;}for(const row of state.targets){const entry=node('div',undefined,'entry');entry.append(node('strong',row.name+' · '+row.emos_id));entry.append(node('p','可用余额：'+(Number.isInteger(row.carrot)?row.carrot:'未知')+(row.carrot_at?' · 更新 '+new Date(row.carrot_at*1000).toLocaleString():''),'muted'));entry.append(node('p',(labels[row.last_status]||'未运行')+' · 最近 '+(row.last_run||'—')+(row.last_carrot==null?'':' · 本次 +'+row.last_carrot),'muted'));output.append(entry);}}
 async function loadLogs(){const data=await api('logs');const output=$('logs');output.replaceChildren();if(!data.rows.length){output.append(node('p','暂无可见签到记录。','muted'));return;}for(const row of data.rows){const entry=node('div',undefined,'entry');entry.append(node('strong',row.name+' · '+row.emos_id));entry.append(node('p',row.ts+' · '+(labels[row.status]||row.status)+(row.carrot==null?'':' · 萝卜 '+row.carrot),'muted'));entry.append(node('div',row.message));output.append(entry);}}
-async function load(){const data=await api('me');const changed=state&&state.active&&(!data.active||data.active.id!==state.active.id);state=data;csrf=data.csrf_token;if(changed){hideCode();requestKey=null;if(jobTimer)clearTimeout(jobTimer);$('result').textContent='已切换账号，旧任务结果不再展示。';}const selector=$('accounts');selector.replaceChildren();for(const row of data.owned){const option=node('option',row.name+' · '+row.emos_id);option.value=row.id;option.selected=Boolean(data.active&&row.id===data.active.id);selector.append(option);}if(!data.active){selector.prepend(node('option','请选择本人账号'));$('identity').textContent='没有已选择的本人账号。';}else{$('identity').textContent=data.active.name+' · 官方 ID '+data.active.emos_id+' · '+(data.active.enabled?'有效':'需重新登录');$('auto').checked=Boolean(data.active.auto_sign);$('time').value=data.active.sign_time||data.default_sign_time||'08:00';$('sign-mode').value=data.active.sign_mode||'normal';}$('timezone').textContent='时区：'+data.timezone;$('n-success').checked=Boolean(data.preferences.notify_success);$('n-fail').checked=Boolean(data.preferences.notify_fail);$('n-already').checked=Boolean(data.preferences.notify_already);renderLinks(data.links.outgoing,'outgoing',false);renderLinks(data.links.incoming,'incoming',true);renderPending();renderTargets();await loadLogs();}
+async function load(){const data=await api('me');if(data.single_owner){for(const id of ['link-form','issue-code','pending-incoming','pending-outgoing']){const element=$(id);if(element)element.closest('section').hidden=true;}}const changed=state&&state.active&&(!data.active||data.active.id!==state.active.id);state=data;csrf=data.csrf_token;if(changed){hideCode();requestKey=null;if(jobTimer)clearTimeout(jobTimer);$('result').textContent='已切换账号，旧任务结果不再展示。';}const selector=$('accounts');selector.replaceChildren();for(const row of data.owned){const option=node('option',row.name+' · '+row.emos_id);option.value=row.id;option.selected=Boolean(data.active&&row.id===data.active.id);selector.append(option);}if(!data.active){selector.prepend(node('option','请选择本人账号'));$('identity').textContent='没有已选择的本人账号。';}else{$('identity').textContent=data.active.name+' · 官方 ID '+data.active.emos_id+' · '+(data.active.enabled?'有效':'需重新登录')+' · 可用余额 '+(Number.isInteger(data.active.carrot)?data.active.carrot:'未知');$('auto').checked=Boolean(data.active.auto_sign);$('time').value=data.active.sign_time||data.default_sign_time||'08:00';$('sign-mode').value=data.active.sign_mode||'normal';}$('timezone').textContent='时区：'+data.timezone;$('n-success').checked=Boolean(data.preferences.notify_success);$('n-fail').checked=Boolean(data.preferences.notify_fail);$('n-already').checked=Boolean(data.preferences.notify_already);renderLinks(data.links.outgoing,'outgoing',false);renderLinks(data.links.incoming,'incoming',true);renderPending();renderTargets();await loadLogs();}
 function newKey(){return Array.from(crypto.getRandomValues(new Uint8Array(24)),n=>n.toString(16).padStart(2,'0')).join('');}
-async function pollJob(id,expected){try{if(!state||!state.active||state.active.id!==expected)return;const value=await api('job?job_id='+encodeURIComponent(id));if(value.status==='queued'||value.status==='running'){$('result').textContent=value.status==='queued'?'签到已排队…':'正在签到本人及直接关联…';jobTimer=setTimeout(()=>pollJob(id,expected),2500);return;}requestKey=null;$('result').textContent=value.message||value.rows.map(row=>(labels[row.status]||row.status)+' · '+row.name+' ('+row.emos_id+')'+(row.carrot==null?'':' · 萝卜 '+row.carrot)+'\n'+row.message).join('\n\n')||'没有可显示的结果。';await load();}catch(error){flash(error.message||'查询任务失败。可刷新本人日志查看结果。');}}
+async function pollJob(id,expected){try{if(!state||!state.active||state.active.id!==expected)return;const value=await api('job?job_id='+encodeURIComponent(id));if(value.status==='queued'||value.status==='running'){$('result').textContent=value.status==='queued'?'签到已排队…':'正在签到全部本人账号…';jobTimer=setTimeout(()=>pollJob(id,expected),2500);return;}requestKey=null;$('result').textContent=value.message||value.rows.map(row=>(labels[row.status]||row.status)+' · '+row.name+' ('+row.emos_id+')'+(row.carrot==null?'':' · 萝卜 '+row.carrot)+'\n'+row.message).join('\n\n')||'没有可显示的结果。';await load();}catch(error){flash(error.message||'查询任务失败。可刷新本人日志查看结果。');}}
 $('accounts').onchange=()=>operation(async()=>{const current=state&&state.active?state.active.id:0;const target=Number($('accounts').value);await api('switch',{account_id:current,target_id:target});hideCode();await load();});
 $('save-settings').onclick=()=>operation(async()=>{await api('settings',{account_id:root(),auto_sign:$('auto').checked,sign_time:$('time').value,sign_mode:$('sign-mode').value});await load();flash('本人签到设置已保存。');});
 $('save-preferences').onclick=()=>operation(async()=>{await api('preferences',{notify_success:$('n-success').checked,notify_fail:$('n-fail').checked,notify_already:$('n-already').checked});await load();flash('本人的通知设置已保存。');});

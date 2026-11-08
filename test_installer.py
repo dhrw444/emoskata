@@ -1,6 +1,9 @@
-# Python 3.10+ | Build: python3 build_single.py
-# Run: python3 -B -m unittest -v test_installer
-# Deps: stdlib; shell syntax and localhost/synthetic temporary files only
+"""安装准备不覆盖配置、shell 与网页脚本语法回归。
+
+仅使用临时目录、伪凭证和本地服务；不把替身成功视为生产授权或容器验收。
+Runtime: Python 3.10+ / 标准库。
+Test: python3 -B -m unittest test_installer
+"""
 from pathlib import Path
 import shutil
 import subprocess

@@ -1,7 +1,8 @@
 #!/bin/sh
-# Runtime: Python 3.10+ for build, Docker Compose for deployment
-# Build: python3 build_single.py | Run: sh prepare_docker.sh
-# Deps: Python stdlib; does not start containers or overwrite runtime/config/data
+# 准备 Compose 挂载目录，仅补不存在的配置和运行文件；不启动容器。
+# Run: sh prepare_docker.sh
+# Build: python3 build_single.py
+# Runtime: 构建用 Python 3.10+ / 标准库；实际部署另需 Docker Compose。
 set -eu
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 cd "$HERE"

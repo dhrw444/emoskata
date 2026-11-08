@@ -1,5 +1,9 @@
-# Runtime: Python 3.10+ | Run: python3 -B -m unittest -v test_features
-# Build: python3 build_single.py | Deps: stdlib, synthetic localhost fixtures
+"""配置、身份、并发和已关闭共享入口回归。
+
+仅使用临时目录、伪凭证和本地服务；不把替身成功视为生产授权或容器验收。
+Runtime: Python 3.10+ / 标准库。
+Test: python3 -B -m unittest test_features
+"""
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -68,34 +72,25 @@ class FeatureTests(unittest.TestCase):
                 self.assertEqual(server.signed, {'eA'})
                 self.assertFalse(any(who=='eB' for _,_,who in server.hits))
 
-    def test_target_review_and_source_withdraw_work_from_web_and_bot(self):
+    def test_old_shared_callbacks_cannot_be_used_by_owner_bot(self):
         self.pending()
-        self.assertEqual(len(self.web.state(202)['pending_links']['incoming']), 1)
-        self.assertEqual(self.web.state(303)['pending_links'], {'incoming':[], 'outgoing':[]})
-        for actor in (101,303):
-            with self.assertRaises(DomainError):
-                self.review(actor, True)
+        original = self.app.cfg_all
+        self.app.cfg_all = lambda: dict(original(), tg_allowed_user_ids='101')
         tg = FakeTG()
         instance = bot.Bot('123456:fixture_bot', self.app.Store(), tg=tg, synchronous=True)
         instance._accept_me(tg.get_me())
         self.addCleanup(instance.stop)
-        def click(uid, actor, data):
-            instance._handle({'update_id':uid,'callback_query': {'id':'fixture'+str(uid),
-                'from':{'id':actor}, 'message': {'message_id':uid, 'chat':{'id':actor,'type':'private'}},
-                'data':data}})
-        source,target=self.ids[101],self.ids[202]
-        click(1,202,'links:%d:0'%target)
-        buttons=[b.get('callback_data') for row in tg.messages[-1][2] for b in row]
-        self.assertIn('review:%d:%d:%d:1'%(target,source,target),buttons)
-        click(2,202,'review:%d:%d:%d:0'%(target,source,target))
-        self.assertFalse(self.service.can_run(101,source,target))
-        self.assertEqual(self.service.pending_links(101), {'incoming':[],'outgoing':[]})
-        self.pending()
-        click(3,101,'withdraw:%d:%d:%d'%(source,source,target))
-        self.assertEqual(self.service.pending_links(202), {'incoming':[],'outgoing':[]})
-        self.pending()
-        click(4,202,'review:%d:%d:%d:1'%(target,source,target))
-        self.assertTrue(self.service.can_run(101,source,target))
+        root, target = self.ids[101], self.ids[202]
+        for index, data in enumerate(('links:%d:0' % root,
+                'review:%d:%d:%d:1' % (root, root, target),
+                'withdraw:%d:%d:%d' % (root, root, target)), 1):
+            instance._handle({'update_id': index, 'callback_query': {'id': 'closed%d' % index,
+                'from': {'id': 101}, 'message': {'message_id': index,
+                    'chat': {'id': 101, 'type': 'private'}}, 'data': data}})
+        self.assertTrue(any('跨 TG 共享' in text for _, text, _ in tg.messages))
+        with self.app.db() as conn:
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM link_requests').fetchone()[0], 1)
+            self.assertEqual(conn.execute('SELECT COUNT(*) FROM account_links').fetchone()[0], 0)
 
     def test_pending_expiry_replay_ownership_and_bool_checks(self):
         self.pending()
@@ -216,6 +211,8 @@ class OwnerProofTests(unittest.TestCase):
         self.assertTrue(self.accounts.login_pending(101))
 
     def test_unbound_official_callback_has_real_binding_guide_not_success(self):
+        original = self.app.cfg_all
+        self.app.cfg_all = lambda: dict(original(), tg_allowed_user_ids='101')
         with serve() as (server,base):
             server.identities['11_fixture_A']={'user_id':'eA','telegram_user_id':None,
                                               'telegram_bind_url':'https://t.me/emos_test_bot?start=bind_fixture'}

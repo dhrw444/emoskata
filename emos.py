@@ -1,4 +1,10 @@
-"""emos JSON client; redirect refusal and official-host-only failover."""
+"""emos JSON 客户端：官方身份预检查、余额与签到响应归一。
+
+网络失败不重发写请求；blocked 的备用域名行为另见 EmosClient.call。自定义站点不追加官方域。
+未知余额返回 None，错误与正常响应分开；字段契约与公开 Postman 集合核对。
+Runtime: Python 3.10+ / 标准库，由 app 和 bot 调用。
+Test: python3 -B -m unittest test_client
+"""
 import json
 import random
 import re
@@ -70,10 +76,9 @@ class _NoCredentialRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def _carrot_of(profile):
-    """官方 /api/user 的 carrot 字段是可用萝卜余额。
+    """读取 /api/user 的可用余额；缺失或类型无效时返回 None。
 
-    官方只说它是 int。缺失或类型不对时返回 None 而不是 0 —— 把「读不到」
-    显示成「0 个萝卜」会让人误以为账号被清了。
+    carrot 为账户余额，earn_point/last_carrot 为单次所得，不能混作同一指标。
     """
     value = profile.get('carrot')
     if type(value) is int:
@@ -148,11 +153,11 @@ class EmosClient:
         return status, body
 
     def call(self, method, path, params=None):
-        """GET 可以在备用域名上重试；PUT /api/user/sign 不是幂等请求。
+        """在当前地址顺序中调用，并记录最后成功地址。
 
-        签到换域名重发等于向官方多提交一次签到尝试（官方明确禁止接口轮询）。
-        网络中断时请求可能已经到达服务器并签到成功，所以只报 network，
-        由本地退避稍后再查；网关拦截（blocked，403/HTML）确定没有执行，可以换域名。
+        GET 遇 network/blocked 可降级；PUT/POST/DELETE 遇 network 立即返回错误，
+        避免未知提交结果被重发。写请求遇 blocked 仍可尝试备用域名；该行为不能
+        表述为所有 PUT 永不重发，也不能把网关错误视作服务端未执行的确定证据。
         """
         bases = list(self.bases)
         non_idempotent = method in ('PUT', 'POST', 'DELETE')
@@ -187,7 +192,7 @@ class EmosClient:
         return result
 
     def check(self):
-        """Official '判断是否登录': is_sign is logged-in state, not today's sign-in."""
+        """读取官方登录状态 is_sign，不用于判定今天是否已经签到。"""
         status, body = self.call('GET', '/api/sign/check')
         if status != 200 or not isinstance(body.get('is_sign'), bool):
             raise EmosError('登录状态响应不完整。', status)
@@ -196,7 +201,7 @@ class EmosClient:
         return body['is_sign'], body
 
     def do_sign(self, content=''):
-        """content 已由 sign_once 校验并选定；空字符串表示不带附言的普通签到。"""
+        """发送已选定的 content query；空文本表示不带附言的普通签到。"""
         return self.call('PUT', '/api/user/sign', {'content': content} if content else None)
 
     def sign_once(self, content='', mode='normal'):
@@ -220,8 +225,7 @@ class EmosClient:
             today_sign = profile['sign']
             if today_sign is not None and not isinstance(today_sign, dict):
                 raise EmosError('官方当天签到信息结构不完整，本次未执行。')
-            # 官方原文只说「当天未签到时返回 null」。空对象不是已签证据，
-            # 当成已签会白丢一天萝卜；宁可多一次 PUT，官方会用 429 重复签到告诉我们。
+            # sign={} 不作为已签到证据；当前策略继续提交，重复签到由官方响应归一。
             if today_sign:
                 result.update(status='already', message='今日已签到')
                 return result

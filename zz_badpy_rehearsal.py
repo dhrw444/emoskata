@@ -1,5 +1,10 @@
-#!/usr/bin/env python3
-"""坏 py 演练：上传语法错误的文件后点重启，必须被拒绝且旧核心不动。"""
+# !/usr/bin/env python3
+"""语法错误候选被拒绝而旧核心仍服务的历史手工演练。
+
+固定端口和临时目录，只能串行手动运行；不进入 CI。使用假账号，不动真实配置。
+Runtime: Python 3.10+ / 标准库。
+Run: python3 zz_badpy_rehearsal.py（先核对脚本路径和端口）
+"""
 
 import json
 import os

@@ -1,6 +1,9 @@
-# Python 3.10+ | Build: python3 build_single.py
-# Run: python3 -B -m unittest -v test_update
-# Deps: standard library, localhost-only fixtures; no real Telegram/emos requests.
+"""无外部包单文件启动、删除重传、exec 和全部持久数据保留回归。
+
+仅使用临时目录、伪凭证和本地服务；不把替身成功视为生产授权或容器验收。
+Runtime: Python 3.10+ / 标准库。
+Test: python3 -B -m unittest test_update
+"""
 import json
 import os
 from pathlib import Path
@@ -22,10 +25,9 @@ ROOT = Path(__file__).resolve().parent
 
 
 def _single_file(sources):
-    """按 build_single.py 的 bootstrap 形状拼一个最小单文件。
+    """构造会实际 exec 内嵌模块的最小入口夹具。
 
-    测试夹具必须长得像真文件：只有 _SOURCES 赋值的话，模块根本不会被执行，
-    「导入即崩」的测试就永远在测空气（这个坑真踩过）。
+    只赋值 _SOURCES 不会执行模块，无法验证导入期错误拦截。
     """
     return ('''import sys as _sys
 import types as _types
@@ -72,16 +74,20 @@ class UpdateTests(unittest.TestCase):
         with socket.socket() as probe:
             probe.bind(('127.0.0.1', 0))
             self.port = probe.getsockname()[1]
-        self.config = ConfigStore(self.root / 'config' / '.env', create=True)
+        # 不让真实 App 环境凭据播种到隔离测试。
+        with patch.dict(os.environ, {'TG_BOT_TOKEN': '', 'TG_ALLOWED_USER_IDS': ''}):
+            self.config = ConfigStore(self.root / 'config' / '.env', create=True)
         self.config.update({'DATA_DIR': './data', 'PANEL_PASSWORD': 'fixture_password',
                            'HTTP_HOST': '127.0.0.1', 'PORT': str(self.port),
-                           'SIGN_TIME': '23:59', 'SCHEDULER_INTERVAL': '300'})
+                           'SIGN_TIME': '23:59', 'SCHEDULER_INTERVAL': '300',
+                           'TG_BOT_TOKEN': '', 'TG_ALLOWED_USER_IDS': '101'},
+                          clear_secrets=['TG_BOT_TOKEN'])
         self.process = None
         self.log = None
 
     def start(self):
         self.log = (self.root / 'process.log').open('ab')
-        self.process = subprocess.Popen([sys.executable, '-u', str(self.entry)], cwd=self.root,
+        self.process = subprocess.Popen([sys.executable, '-I', '-S', '-u', str(self.entry)], cwd=self.root,
             env=dict(os.environ, EMOS_ENV_FILE=str(self.config.path), PYTHONDONTWRITEBYTECODE='1'),
             stdout=self.log, stderr=subprocess.STDOUT)
         self.addCleanup(self.stop)
@@ -115,14 +121,15 @@ class UpdateTests(unittest.TestCase):
                     return
             except (OSError, ValueError):
                 pass
-            # This local integration test polls loopback, not the official service.
+            # 这里只轮询 localhost 就绪状态，不轮询官方接口。
             time.sleep(0.08)
         self.fail('local process readiness timed out')
 
     def dump_data(self):
         with sqlite3.connect(self.db_path) as conn:
             return {table: conn.execute('SELECT * FROM ' + table + ' ORDER BY rowid').fetchall()
-                    for table in ('accounts', 'tg_users', 'account_links', 'link_requests', 'logs')}
+                    for table in ('accounts', 'tg_users', 'account_links', 'link_requests', 'logs',
+                                  'settings', 'sessions', 'web_auth_codes', 'web_sessions')}
 
     def seed(self):
         with sqlite3.connect(self.db_path) as conn:
@@ -136,6 +143,14 @@ class UpdateTests(unittest.TestCase):
             conn.execute("INSERT INTO account_links VALUES(1,2,1,'fixture')")
             conn.execute("INSERT INTO logs(account_id,name,ts,status,message,carrot) "
                          "VALUES(1,'Fixture A','fixture','signed','fixture saved',3)")
+            conn.execute("UPDATE tg_users SET primary_account_id=1,notify_already=1 WHERE tg_id=101")
+            conn.execute("UPDATE accounts SET carrot=777,carrot_at=1700000000,sign_mode='random' WHERE id=1")
+            conn.execute("INSERT INTO accounts(id,name,token,emos_id,owner_tg_id,auto_sign,sign_time,carrot) "
+                         "VALUES(3,'Fixture Extra','22_synthetic_extra','eExtra',101,0,'19:00',42)")
+            conn.execute("INSERT INTO settings VALUES('quality_marker','kept')")
+            conn.execute("INSERT INTO web_auth_codes VALUES('fixture-hashed-code',101,2000000000)")
+            conn.execute("INSERT INTO web_sessions VALUES('fixture-hashed-session',101,1700000000,"
+                         "2000000000,'fixture-csrf')")
 
     def test_delete_py_running_reupload_exec_same_pid_and_preserve_user_data(self):
         self.start()
@@ -156,7 +171,7 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(request(self.port, '/api/health')[0], 200)
         shutil.copyfile(ROOT / 'emoskata.py', self.entry)
         self.assertEqual(request(self.port, '/api/restart', {'confirm': True}, self.cookie)[0], 202)
-        # Validated image survives unlink after acceptance; no half-upload race.
+        # 请求接受后即删除入口，验证 exec 仍读取已验过的临时镜像。
         self.entry.unlink()
         self.wait(lambda: request(self.port, '/api/runtime', cookie=self.cookie)[2].get('restart_status') == 'running')
         value = request(self.port, '/api/runtime', cookie=self.cookie)[2]
@@ -172,6 +187,13 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(self.config.path.read_bytes(), config_before)
         self.process.terminate()
         self.assertEqual(self.process.wait(timeout=8), 0)
+
+    def test_clean_interpreter_starts_with_only_one_python_file(self):
+        self.assertEqual([file.name for file in self.runtime.glob('*.py')], ['emoskata.py'])
+        self.start()  # -I -S 禁用 site 初始化及外部 Python 路径。
+        self.assertEqual(request(self.port, '/api/health')[0], 200)
+        self.assertTrue(self.db_path.is_file())
+        self.assertIsNone(self.process.poll())
 
     def test_restart_requires_confirmation_and_admin_not_personal_role(self):
         self.start()
@@ -203,11 +225,8 @@ class UpdateTests(unittest.TestCase):
         self.assertFalse(module._shutdown.is_set())
 
     def test_preflight_rejects_import_time_crash_that_is_syntactically_valid(self):
-        # 语法合法、一导入就抛：只有真的执行过一遍才拦得住。以前这里只 compile，
-        # 这种文件能一路过闸，execv 之后进程直接消失 —— 服务再也起不来。
-        #
-        # 夹具必须带真实的 bootstrap（把内嵌模块 exec 进 sys.modules）。
-        # 只有 _SOURCES 赋值的话，模块根本不会被执行，这个测试就永远在测空气。
+        # 夹具要真实执行内嵌模块，才能验证导入异常被拒绝。
+        # 只有 _SOURCES 赋值不会触发模块导入。
         module = fixture_app(self, self.root / 'fixture', 'crash_app')
         body = {name: "VALUE = 1\n" for name in
                 ('envconfig', 'runtime_info', 'emos', 'accounts', 'webui', 'bot', 'app')}
@@ -224,8 +243,7 @@ class UpdateTests(unittest.TestCase):
         self.assertFalse(module._shutdown.is_set())
 
     def test_probe_does_not_consume_the_image_that_execv_needs(self):
-        # 自检用共享 fd 读一遍会把 offset 带到末尾，execv 后新核心读到 0 字节当场死亡。
-        # 这个测试盯的就是「自检跑完之后 image 仍从 0 开始」。
+        # 导入预检返回时，源码镜像必须仍从第 0 字节可读。
         module = fixture_app(self, self.root / 'fixture', 'offset_app')
         body = {name: "VALUE = 1\n" for name in
                 ('envconfig', 'runtime_info', 'emos', 'accounts', 'webui', 'bot', 'app')}
@@ -238,11 +256,7 @@ class UpdateTests(unittest.TestCase):
                 image.close()
 
     def test_probe_uses_a_copy_of_the_env_file(self):
-        # 新版本改了配置 schema 时，自检里的 ConfigStore 会重写 .env。
-        # 那只能发生在切换之后 —— 现在拿副本跑，真文件必须一个字节都没动。
-        #
-        # 判据要「主动改写」才算数：光比字节的话，自带完整 .env 根本不会触发重写，
-        # 用真文件跑也一样不变，测试等于没测（变异验证抓到过这个洞）。
+        # 自检主动改写临时 .env，确认真实配置不被修改。
         module = fixture_app(self, self.root / 'fixture', 'envcopy_app')
         body = {name: "VALUE = 1\n" for name in
                 ('envconfig', 'runtime_info', 'emos', 'accounts', 'webui', 'bot', 'app')}

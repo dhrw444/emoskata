@@ -1,6 +1,8 @@
 #!/bin/sh
-# Runtime: Python 3.10+ | Build: python3 build_single.py
-# Run: sh install.sh /opt/emoskata | Deps: Python standard library, optional systemd
+# 把单文件程序与默认 .env 安装到指定目录；已有配置不覆盖。
+# Run: sh install.sh /opt/emoskata
+# Build: python3 build_single.py
+# Runtime: Python 3.10+ / 标准库；systemd 可用时注册服务。
 set -eu
 DIR="${1:-/opt/emoskata}"
 HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)

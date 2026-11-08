@@ -3,7 +3,7 @@ FROM python:3.12-alpine
 WORKDIR /app
 COPY emoskata.py /app/
 
-# 时区数据（缺了会退回固定偏移表，装了才准）
+# zoneinfo 依赖 IANA 时区数据库；缺失时应用只退回有限的固定偏移表。
 RUN apk add --no-cache tzdata && cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
 
 ENV TZ=Asia/Shanghai \

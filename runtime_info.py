@@ -1,5 +1,8 @@
-"""Lightweight process resource telemetry; no monitoring loops or subprocesses.
-Python 3.10+ standard library. Call snapshot() from the authenticated admin API.
+"""按需采集进程 CPU、内存、线程和监听地址。
+
+不启动监控线程；不可读取的统计返回未知值，采样值不代表生产资源上限。
+Runtime: Python 3.10+ / 标准库，Linux 的 /proc 为可选统计来源。
+Test: python3 -B -m unittest test_update
 """
 import os
 from pathlib import Path
@@ -31,6 +34,8 @@ def container_ip():
 
 
 def snapshot():
+    """按需采样当前进程；不可获取的指标保留未知值，不创建监控循环。
+    """
     global _LAST
     now, process = time.monotonic(), time.process_time()
     with _LOCK:
