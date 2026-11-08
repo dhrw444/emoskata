@@ -17,6 +17,18 @@ WEB_CODE_TTL = 120
 WEB_SESSION_TTL = 7 * 86400
 WEB_JOB_TTL = 600
 
+# 状态→中文。本人看原文；代签目标只给不含他人细节的说法。
+_STATUS_TEXT = {'signed': '签到成功', 'already': '今日已签到', 'network': '网络异常',
+                'blocked': '接口访问受阻', 'rate': '接口限流', 'invalid': '登录凭证已失效',
+                'failed': '签到失败', 'revoked': '授权已撤销'}
+_OTHER_TEXT = dict(_STATUS_TEXT, invalid='目标需重新授权')
+
+
+def status_text(status, own=True, fallback='签到状态已更新'):
+    return (_STATUS_TEXT if own else _OTHER_TEXT).get(status, fallback)
+
+
+
 
 def web_origin(value):
     value = str(value or '').strip().rstrip('/')
@@ -159,14 +171,11 @@ class WebService:
     def logs(self, tg_id):
         own_ids = {row['id'] for row in self.accounts.owned(tg_id)}
         rows = self.accounts.logs(tg_id, limit=40)
-        status_text = {'signed': '签到成功', 'already': '今日已签到', 'network': '网络异常',
-                       'blocked': '接口访问受阻', 'rate': '接口限流', 'invalid': '登录凭证已失效',
-                       'failed': '签到失败', 'revoked': '授权已撤销'}
         result = []
         for row in rows:
             entry = {key: row.get(key) for key in ('account_id', 'emos_id', 'name', 'ts', 'status', 'carrot')}
             entry['message'] = (str(row.get('message') or '')[:240] if row['account_id'] in own_ids
-                                else status_text.get(row.get('status'), '签到状态已更新'))
+                                else status_text(row.get('status')))
             result.append(entry)
         return result
 
@@ -329,9 +338,8 @@ class WebService:
                 continue
             entry = {key: row.get(key) for key in fields}
             if row['id'] not in own_ids:
-                entry['message'] = {'signed': '签到成功', 'already': '今日已签到', 'network': '网络异常',
-                                    'blocked': '接口访问受阻', 'rate': '接口限流', 'failed': '签到失败',
-                                    'invalid': '目标需重新授权'}.get(row.get('status'), '代签状态已更新')
+                entry['message'] = status_text(row.get('status'), own=False,
+                                               fallback='代签状态已更新')
             rows.append(entry)
         return {'ok': True, 'status': job['status'], 'message': job['message'], 'rows': rows}
 

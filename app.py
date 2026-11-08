@@ -40,6 +40,7 @@ _EXISTING_DB = os.path.isfile(DB_PATH)
 TZ_FALLBACK = FIXED_ZONE_OFFSETS
 LOGIN_MAX_FAIL = 5
 LOGIN_LOCK_SEC = 300
+_RL_SWEEP = 0
 
 _write_lock = threading.RLock()
 _run_lock = threading.Lock()
@@ -160,6 +161,8 @@ def init_db():
         if 'retry_day' not in columns:
             conn.execute("ALTER TABLE accounts ADD COLUMN retry_day TEXT DEFAULT ''")
         conn.execute("DELETE FROM settings WHERE key LIKE 'oauth_state_%' OR key LIKE 'oauth_back_%'")
+        # 限流表按来源 IP 单调增长，长期运行会积累到几万行；过期条目没有保留价值。
+        conn.execute("DELETE FROM login_fail WHERE until<>0 AND until<?", (int(time.time()),))
     try:
         os.chmod(DATA_DIR, 0o700)
         os.chmod(DB_PATH, 0o600)
@@ -310,6 +313,11 @@ def rl_fail(ip):
             "INSERT INTO login_fail(ip,count,until) VALUES(?,?,?) "
             "ON CONFLICT(ip) DO UPDATE SET count=excluded.count,until=excluded.until",
             (ip, cnt, until))
+        # 每 64 次失败顺手清一次过期行，避免表随扫描来源 IP 无限增长。
+        global _RL_SWEEP
+        _RL_SWEEP += 1
+        if _RL_SWEEP % 64 == 0:
+            conn.execute("DELETE FROM login_fail WHERE until<>0 AND until<?", (now,))
     return cnt
 
 

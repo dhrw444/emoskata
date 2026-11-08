@@ -511,16 +511,21 @@ class RuntimeTests(unittest.TestCase):
                 self.app.run_user(101)
             self.assertEqual(self.app._account_record(a['id'])['last_day'], '2026-11-08')
 
-    def test_atomic_schema_migration_fails_without_partial_claims(self):
+    def test_duplicate_official_id_does_not_block_startup(self):
+        # 老库里有重复 emos_id 时，启动必须能继续：保留最早一行，其余置空。
         with self.app.write_db() as conn:
             conn.execute('DROP INDEX ux_accounts_emos_id')
             conn.execute("INSERT INTO accounts(name,token,emos_id) VALUES('Old A','11_legacyA','dup')")
             conn.execute("INSERT INTO accounts(name,token,emos_id) VALUES('Old B','11_legacyB','dup')")
-        with self.assertRaises(Exception):
-            self.app.init_db()
+        self.app.init_db()
         with self.app.db() as conn:
-            self.assertEqual(conn.execute('SELECT COUNT(*) FROM accounts').fetchone()[0], 2)
-            self.assertEqual(conn.execute('SELECT COUNT(*) FROM accounts WHERE owner_tg_id IS NOT NULL').fetchone()[0], 0)
+            rows = conn.execute('SELECT id,emos_id,token FROM accounts ORDER BY id').fetchall()
+            self.assertEqual([row['emos_id'] for row in rows], ['dup', None])
+            self.assertEqual([row['token'] for row in rows], ['11_legacyA', '11_legacyB'])
+            self.assertEqual(conn.execute(
+                'SELECT COUNT(*) FROM accounts WHERE owner_tg_id IS NOT NULL').fetchone()[0], 0)
+            self.assertIn('ux_accounts_emos_id', [row[1] for row in
+                                                  conn.execute('PRAGMA index_list(accounts)')])
 
 
 if __name__ == '__main__':

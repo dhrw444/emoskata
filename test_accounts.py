@@ -839,16 +839,25 @@ class MigrationCase(unittest.TestCase):
         index = next(row for row in self.rows("PRAGMA index_list(accounts)") if row["name"] == "ux_accounts_emos_id")
         self.assertEqual((index["unique"], index["partial"]), (1, 1))
 
-    def test_migration_duplicate_official_ids_rolls_back_without_silent_data_repair(self):
+    def test_migration_duplicate_official_ids_keeps_earliest_and_clears_the_rest(self):
+        # 中止迁移会让进程启动即退出（容器 restart 下是永久崩溃循环），
+        # 所以改为：保留最早一行，其余 emos_id 置空，token 与历史不动。
         with self.store.write() as conn:
             conn.execute("ALTER TABLE accounts ADD COLUMN emos_id TEXT")
             conn.execute("UPDATE accounts SET emos_id='DUPLICATE'")
-        before = self.rows("SELECT * FROM accounts")
-        with self.assertRaises(DomainError):
-            self.migrate()
-        self.assertEqual(self.rows("SELECT * FROM accounts"), before)
-        self.assertNotIn("owner_tg_id", {row["name"] for row in self.rows("PRAGMA table_info(accounts)")})
-        self.assertEqual(self.rows("SELECT name FROM sqlite_master WHERE name='tg_users'"), [])
+        tokens = {row["id"]: row["token"] for row in self.rows("SELECT id,token FROM accounts")}
+        self.migrate()
+        rows = self.rows("SELECT id,emos_id,owner_tg_id,token FROM accounts ORDER BY id")
+        self.assertEqual([row["emos_id"] for row in rows], ["DUPLICATE", None])
+        self.assertEqual([row["token"] for row in rows], [tokens[1], tokens[2]])
+        self.assertIn("owner_tg_id", {row["name"] for row in self.rows("PRAGMA table_info(accounts)")})
+        index = next(row for row in self.rows("PRAGMA index_list(accounts)")
+                     if row["name"] == "ux_accounts_emos_id")
+        self.assertEqual((index["unique"], index["partial"]), (1, 1))
+        # 迁移必须幂等：再跑一次不能改动任何东西
+        self.migrate()
+        self.assertEqual([row["emos_id"] for row in self.rows(
+            "SELECT emos_id FROM accounts ORDER BY id")], ["DUPLICATE", None])
 
     def test_duplicate_legacy_tokens_claim_one_row_not_every_unowned_row(self):
         self.migrate()

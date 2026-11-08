@@ -155,7 +155,23 @@ class AccountService:
                 ON accounts(emos_id) WHERE emos_id IS NOT NULL AND emos_id<>''
             """)
         except sqlite3.IntegrityError:
-            raise DomainError("旧数据有重复官方账号 ID，迁移已中止") from None
+            # 老数据可能有两行指向同一个官方账号。中止迁移会让进程启动即退出
+            # （容器 restart 策略下就是永久崩溃循环），所以保留最早一行，
+            # 其余 emos_id 置空；token 与历史都保留，重新登录会补回身份。
+            duplicates = [row[0] for row in conn.execute(
+                "SELECT emos_id FROM accounts WHERE emos_id IS NOT NULL AND emos_id<>'' "
+                "GROUP BY emos_id HAVING COUNT(*)>1")]
+            for emos_id in duplicates:
+                keep = conn.execute("SELECT MIN(id) FROM accounts WHERE emos_id=?",
+                                    (emos_id,)).fetchone()[0]
+                conn.execute("UPDATE accounts SET emos_id=NULL, owner_tg_id=NULL "
+                             "WHERE emos_id=? AND id<>?", (emos_id, keep))
+                print("[db] 官方账号 %s 有重复记录，已保留最早一行，其余需重新登录。"
+                      % emos_id[:12])
+            conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_accounts_emos_id
+                ON accounts(emos_id) WHERE emos_id IS NOT NULL AND emos_id<>''
+            """)
         index = next(r for r in conn.execute("PRAGMA index_list(accounts)")
                      if r[1] == "ux_accounts_emos_id")
         indexed = [r[2] for r in conn.execute("PRAGMA index_info(ux_accounts_emos_id)")]
