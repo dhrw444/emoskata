@@ -25,6 +25,7 @@ if [ ! -f "$DIR/.env" ]; then
     exit 1
 fi
 chmod 600 "$DIR/.env"
+EMOS_ENV_FILE="$DIR/.env" python3 "$DIR/emoskata.py" --check-config
 if command -v systemctl >/dev/null 2>&1 && [ "$(id -u)" = 0 ]; then
     python3 -c 'import pathlib,sys; d=sys.argv[1]; p=pathlib.Path("/etc/systemd/system/emoskata.service"); p.write_text("[Unit]\nDescription=emoskata Telegram signing Bot\nAfter=network-online.target\nWants=network-online.target\n[Service]\nType=simple\nWorkingDirectory="+d+"\nEnvironment=EMOS_ENV_FILE="+d+"/.env\nExecStart=/usr/bin/env python3 "+d+"/emoskata.py\nRestart=always\nRestartSec=5\nTimeoutStopSec=120\nUMask=0077\n[Install]\nWantedBy=multi-user.target\n")' "$DIR"
     systemctl daemon-reload

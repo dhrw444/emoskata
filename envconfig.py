@@ -1,8 +1,8 @@
-""".env 的 schema、校验、缺项补齐、原子保存和指纹缓存。
+""".env 解析、配置契约与原子保存。
 
-现有文件值优先；首次创建才播种环境值，显式默认值和空凭据也保留。
-Runtime: Python 3.10+ / 标准库，文件锁依赖 POSIX fcntl。
-"""
+部署者提供文件；读取缺项只补内存，不继承同名业务环境变量。
+网页保存、旧库迁移和启动预检副本均经 update() 写入；不会自动创建部署配置。
+Runtime: Python 3.10+ / POSIX 标准库；文件互斥依赖 fcntl。"""
 from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
@@ -19,8 +19,7 @@ from urllib.parse import urlsplit
 
 
 class EnvConfigError(ValueError):
-    """配置错误容器；本模块构造的错误只报告键或行号，不拼接配置原值。
-    """
+    """可公开返回的配置错误；本模块文案只包含键、行号或路径，不拼接配置值。"""
 
 
 @dataclass(frozen=True)
@@ -109,6 +108,9 @@ def _value(raw, number):
 
 
 def parse_env(text):
+    """解析受支持的 KEY=VALUE 格式，拒绝重复项和未知项。
+
+    不执行 shell 展开或 Python 表达式；已退役的已知键可读取但不进入运行配置。"""
     if '\x00' in text:
         raise EnvConfigError('配置文件包含无效字符。')
     values, seen = {}, set()
@@ -149,6 +151,9 @@ def _validate_url(value, key, optional=False, origin=False):
 
 
 def validate_env(values, allow_unset_password=False):
+    """校验完整键集合并返回规范化字符串，不触碰文件。
+
+    调用方决定是否允许空面板密码；业务读取和保存使用 complete_values() 统一判定。"""
     missing = set(SCHEMA) - set(values)
     extra = set(values) - set(SCHEMA)
     if missing:
@@ -203,7 +208,7 @@ def validate_env(values, allow_unset_password=False):
                 if value not in FIXED_ZONE_OFFSETS:
                     raise EnvConfigError('SIGN_TIMEZONE 不可用，请安装 tzdata 或选常用固定时区。') from None
         elif field.kind == 'owner_id':
-            # 空值用于首次配置；权限入口必须拒绝空身份，不能当作不限用户。
+            # 允许部署文件留空，但空身份始终表示拒绝，不表示开放访问。
             if value and (not re.fullmatch(r'[1-9][0-9]{0,18}', value) or int(value) >= 2**63):
                 raise EnvConfigError('%s 只能填一个正整数 TG 用户 ID。' % key)
         elif field.kind == 'tg_bot':
@@ -211,7 +216,7 @@ def validate_env(values, allow_unset_password=False):
             if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{4,31}', value):
                 raise EnvConfigError('%s 只能填 Bot 用户名，不含 @，5–32 位。' % key)
         elif field.kind == 'emos_id':
-            # 与 Bot 侧同一判据：只收官网用户 ID，拒绝误填 emos Token。
+            # 这里是官方账号 ID，不接受带下划线的 Token，避免把密钥当定位信息。
             if value and (not re.fullmatch(r'[A-Za-z0-9_]{1,48}', value)
                           or re.fullmatch(r'[0-9]+_[A-Za-z0-9_-]{8,}', value)):
                 raise EnvConfigError('%s 只能填 emos 官网用户 ID，不要填 Token。' % key)
@@ -239,8 +244,7 @@ def validate_env(values, allow_unset_password=False):
 
 
 def configured_owner(cfg):
-    """读取唯一 TG 用户 ID；缺失、空白或非法均不返回可用身份。
-    """
+    """解析唯一 TG 操作者 ID；缺失、空值或非法配置返回 None，不解释为开放访问。"""
     if not isinstance(cfg, dict):
         return None
     raw = str(cfg.get('tg_allowed_user_ids') or '').strip()
@@ -251,12 +255,12 @@ def configured_owner(cfg):
 
 
 def owner_permitted(cfg, tg_id):
-    """运行时唯一权限判据；不把账号已登记当作访问授权。
-    """
+    """核对正整数操作者与实时配置 ID；账号登记本身不构成访问授权。"""
     return type(tg_id) is int and tg_id > 0 and configured_owner(cfg) == tg_id
 
 
 def serialize_env(values):
+    """按 schema 输出完整配置文本；调用方负责保护文本中的凭据和决定写盘。"""
     lines = ['# emoskata 系统配置唯一来源；进程环境同名值不会覆盖此文件。',
              '# 网页管理员保存修改到同一文件。个人账号设置仍在 SQLite 中。']
     for key, field in SCHEMA.items():
@@ -266,10 +270,9 @@ def serialize_env(values):
 
 
 def complete_values(parsed):
-    """把文件里出现的值合并到 schema 默认值上，只补内存，不回写文件。
+    """合并内存默认值与已解析键，并按网页开关判定密码要求。
 
-    关闭网页时不要求管理员密码：纯 Bot 模式不用网页面板，空密码不构成风险。
-    """
+    只生成并校验字典，不补写部署文件；关闭网页时允许空面板密码。"""
     values = {key: field.default for key, field in SCHEMA.items()}
     values.update(parsed)
     enabled = str(values['HTTP_ENABLED']).strip().lower()
@@ -281,12 +284,11 @@ TEMPLATE_NAME = '.env.example'
 
 
 def render_env_example():
-    """生成仓库里的 .env.example：键与 SCHEMA 完全一致，凭据一律留空。
+    """生成与 schema 同步的部署模板，凭据默认留空。
 
-    模板本身不必能通过校验（密码留空就是要人去填），只保证键集合正确。
-    """
+    启用网页时空密码模板不能直接启动，部署者必须先填写密码。"""
     lines = ['# emoskata 系统配置模板。复制为 .env，填好后与程序一起上传。',
-             '# 程序不会创建或自动改写 .env；只有管理员网页保存时才写回文件。',
+             '# 读取不创建也不补写 .env；网页保存或一次性旧库迁移通过校验后写回。',
              '# 文件权限应为 0600。标“重启生效”的项修改后要重启核心。']
     for key, field in SCHEMA.items():
         suffix = '（重启生效）' if field.restart else ''
@@ -296,13 +298,14 @@ def render_env_example():
 
 
 def missing_config_message(path):
+    """返回缺失部署文件的操作提示，不创建文件也不生成凭据。"""
     return ('配置文件 %s 不存在。请把 %s 复制为 .env，填写 PANEL_PASSWORD、'
             'TG_BOT_TOKEN、TG_ALLOWED_USER_IDS 后与程序一起上传；'
             '程序不再自动生成配置。' % (path, TEMPLATE_NAME))
 
 
 def template_values(password, **overrides):
-    """测试与演练用的完整配置字典；密码必须显式给出，不再随机生成。"""
+    """为回归与演练构造完整配置；密码必须显式提供，不生成随机部署密码。"""
     values = {key: field.default for key, field in SCHEMA.items()}
     values['PANEL_PASSWORD'] = password
     unknown = set(overrides) - set(SCHEMA)
@@ -327,13 +330,11 @@ def _read(path):
 
 
 class ConfigStore:
+    """持有部署配置的指纹缓存；读取与保存都返回独立数据，不暴露内部缓存。"""
     def __init__(self, path):
-        """只读加载部署者提供的 .env；文件缺失即报错，绝不代为创建。
+        """加载已存在的普通文件；缺文件或非法配置抛 EnvConfigError。
 
-        文件里缺的 schema 键按默认值补进内存，原文件保持字节不变，
-        因此升级新增字段不需要程序改写配置。只有 update() 会写回文件。
-        provided_keys 是文件里真实出现的键，供旧库迁移判断谁说了算。
-        """
+        不创建目录、配置或锁文件，不改权限；provided_keys 只记录当前磁盘中的显式键。"""
         self.path = Path(path).absolute()
         self.lock = threading.RLock()
         self._fingerprint, self._cache, self._revision = None, None, None
@@ -353,6 +354,9 @@ class ConfigStore:
 
     @contextmanager
     def _writer(self):
+        """持有线程外的文件锁，串行化各进程的保存。
+
+        保存需配置目录可写，锁文件可创建；只读加载不进入这里。"""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         lock_path = self.path.parent / (self.path.name + '.lock')
         flags = os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0)
@@ -369,6 +373,9 @@ class ConfigStore:
             os.close(fd)
 
     def _atomic(self, values):
+        """在同目录写完整临时配置，刷盘后原子替换。
+
+        替换前失败保留旧文件；拒绝符号链接，新文件权限为 0600。"""
         text = serialize_env(values)
         if parse_env(text) != values:
             raise EnvConfigError('新配置无法无损读回，旧文件未改变。')
@@ -394,10 +401,9 @@ class ConfigStore:
         self._fingerprint = None
 
     def snapshot(self, force=False):
-        """返回独立配置字典与原文件 SHA256；指纹变化或 force 时重新读取。
+        """按 inode、时间和大小缓存解析，返回配置副本与磁盘原字节 SHA256。
 
-        文件里缺的键按 schema 默认值补进内存，不回写；解析或校验失败明确抛错。
-        """
+        缺键只补内存，解析成功后刷新 provided_keys；失败不修改原文件。"""
         with self.lock:
             try:
                 info = self.path.stat()
@@ -407,16 +413,17 @@ class ConfigStore:
             if force or stamp != self._fingerprint:
                 raw, parsed = _read(self.path)
                 values = complete_values(parsed)
+                self.provided_keys = set(parsed)
                 self._cache = values
                 self._revision = hashlib.sha256(raw).hexdigest()
                 self._fingerprint = stamp
             return dict(self._cache), self._revision
 
     def update(self, changes, revision=None, clear_secrets=()):
-        """加锁后按当前文件合并、校验、原子保存；revision 不匹配拒绝。
+        """持有保存锁后重读文件，合并、校验并原子保存。
 
-        敏感字段空白保留原值，clear_secrets 才清空；显式保存也记录默认值来源。
-        """
+        revision 冲突拒绝；敏感空值保留，clear_secrets 明确清除。
+        显式保存缺失默认键也落盘，避免重启后被旧库迁移覆盖；changed 只列值变化。"""
         if not isinstance(changes, dict) or set(changes) - set(SCHEMA):
             raise EnvConfigError('网页含未知配置项。')
         if not isinstance(clear_secrets, (list, tuple)) or any(k not in SCHEMA or not SCHEMA[k].secret or k == 'PANEL_PASSWORD' for k in clear_secrets):
@@ -432,22 +439,18 @@ class ConfigStore:
                 new[key] = value
             for key in clear_secrets:
                 new[key] = ''
-            new = validate_env(new)
+            new = complete_values(new)
             changed = [key for key in SCHEMA if new[key] != old[key]]
-            if changed:
+            explicitly_saved = set(changes) | set(clear_secrets)
+            if changed or explicitly_saved - self.provided_keys:
                 self._atomic(new)
-            # 成功保存即是显式选择，默认值和明确清空也不能再被旧库覆盖。
-            self.provided_keys.update(changes)
-            self.provided_keys.update(clear_secrets)
             _, new_revision = self.snapshot(force=True)
             return {'revision': new_revision, 'changed': changed,
                     'restart_required': [key for key in changed if SCHEMA[key].restart]}
 
     def app_config(self):
-        # 热路径用文件指纹避免重复解析，返回副本防止调用方改写缓存。
-        """按文件指纹复用解析结果；每次仍检测修改，不用 TTL 延迟热配置。
-
-        """
+        # 高频读取走指纹缓存，调用者拿到副本而不是共享可变字典。
+        """按文件指纹缓存运行字段类型，返回副本；不把热更新改成定时轮询。"""
         try:
             info = self.path.stat()
         except OSError:
@@ -470,10 +473,12 @@ class ConfigStore:
         return dict(result)
 
     def password(self):
+        """单独读取面板密码；调用方不得把返回值放入日志或公开配置。"""
         values, _ = self.snapshot()
         return values['PANEL_PASSWORD']
 
     def public_fields(self):
+        """生成管理员编辑元数据，凭据仅返回配置状态而不回显值。"""
         values, revision = self.snapshot()
         fields = []
         for key, field in SCHEMA.items():
@@ -485,6 +490,7 @@ class ConfigStore:
 
 
 def config_path(entry_file, environ=None):
+    """EMOS_ENV_FILE 只选择部署文件路径；相对路径以入口目录为基准。"""
     environ = os.environ if environ is None else environ
     selected = environ.get('EMOS_ENV_FILE')
     if selected is not None and not str(selected).strip():

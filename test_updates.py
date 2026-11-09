@@ -1,10 +1,10 @@
 """更新事务的同 PID 恢复、WAL 快照和状态校验回归。
 
-夹具只使用临时或演练数据；本地通过不代表真实官方授权。
-Test: python3 -B -m unittest test_updates。
-"""
+仅用隔离目录、合成身份或 localhost；正式授权和真实生产资源不在此验收。
+Test: python3 -B -m unittest test_updates"""
 import json
 import os
+from contextlib import closing
 from pathlib import Path
 import signal
 import sqlite3
@@ -76,7 +76,7 @@ class UpdateIntegrationTests(unittest.TestCase):
         self.target = self.root / 'target.db'
         self.config.write_bytes(b'OLD_CONFIG=private-test\n# preserve raw\r\n')
         os.chmod(self.config, 0o600)
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
             connection.execute('CREATE TABLE values_table (value TEXT)')
             connection.execute('INSERT INTO values_table VALUES (?)', ('old',))
         self.old = (embedded_prefix() +
@@ -201,7 +201,7 @@ class UpdateIntegrationTests(unittest.TestCase):
         self.assertEqual(self.entry.read_bytes(), source)
         self.assertEqual(self.last_good.read_bytes(), source)
         self.assertEqual(self.config.read_bytes(), b'NEW_CONFIG=secret-test\n')
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
             self.assertEqual(connection.execute('SELECT value FROM values_table').fetchall(),
                              [('candidate',)])
         state = json.loads(self.state_path.read_text())
@@ -321,7 +321,7 @@ class UpdateValidationTests(unittest.TestCase):
         self.entry.write_bytes(b'print("old")\n')
         self.config.write_bytes(b'PRIVATE=test\n')
         os.chmod(self.config, 0o640)
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection, connection:
             connection.execute('CREATE TABLE t (v TEXT)')
             connection.execute('INSERT INTO t VALUES ("old")')
         self.environment_patch = mock.patch.dict(os.environ,

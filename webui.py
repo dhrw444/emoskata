@@ -1,8 +1,8 @@
-"""个人网页会话、一次性入口、账号视图和按需签到任务。
+"""个人网页域：一次性入口、SQLite 会话、账号视图与按需任务。
 
-监听由 app 持有；有效会话在 SQLite，任务和确认在内存，范围入队后固定。
-Test: python3 -B -m unittest test_web test_owner_web test_multi_accounts。
-"""
+HTTP 监听属于 app；账号与会话持久化，签到任务和退出确认仅保存在内存。
+每次访问核 owner 和主号；前端模板不读取磁盘上的额外网页文件。
+Test: python3 -B -m unittest test_web test_owner_web test_multi_accounts"""
 import hashlib
 import hmac
 import json
@@ -36,6 +36,7 @@ def status_text(status, own=True, fallback='签到状态已更新'):
 
 
 def web_origin(value):
+    """校验不含路径和凭据的公开 origin；非本机 HTTP 拒绝，部署公网需 HTTPS。"""
     value = str(value or '').strip().rstrip('/')
     try:
         parsed = urlsplit(value)
@@ -52,8 +53,7 @@ def web_origin(value):
 
 
 def _digest(value):
-    """生成网页一次性码或 sid 的库内摘要；不负责 emos Token 的存储方式。
-    """
+    """为一次性码和网页 sid 生成库内摘要，不改变 emos Token 的存储形式。"""
     return hashlib.sha256(value.encode('ascii')).hexdigest()
 
 
@@ -68,13 +68,13 @@ def _local_id(value, allow_zero=False):
 
 
 def _only(body, allowed):
-    """拒绝白名单外字段，避免客户端悄悄改到不该改的列。
-    """
+    """只接受规定字段，防止个人请求误写系统配置或账号私有列。"""
     if not isinstance(body, dict) or set(body) - set(allowed):
         raise DomainError('请求字段无效。')
 
 
 class WebService:
+    """持有个人会话域和有界签到队列；首次签到才启动一个 worker。"""
     def __init__(self, db, write, cfg, accounts, run_user):
         self.db, self.write, self.cfg = db, write, cfg
         self.accounts, self.run_user = accounts, run_user
@@ -87,8 +87,7 @@ class WebService:
         self.stopping = threading.Event()
 
     def _owner(self, tg_id, conn=None):
-        """要求该 TG ID 已通过官方授权并仍有有效主账号；conn 可复用调用方事务。
-        """
+        """核对实时唯一操作者和有效本地主号；可复用现有事务，禁止嵌套借连接。"""
         cfg = self.cfg()
         if 'tg_allowed_user_ids' in cfg:
             if not owner_permitted(cfg, tg_id):
@@ -108,8 +107,7 @@ class WebService:
 
     @staticmethod
     def init_schema(conn):
-        """在调用方事务中创建缺失的入口码与会话表，不清空已有有效会话。
-        """
+        """在调用方事务内创建缺失表和索引，不清空已有有效网页会话。"""
         conn.execute('CREATE TABLE IF NOT EXISTS web_auth_codes ('
                      'code_hash TEXT PRIMARY KEY,tg_id INTEGER NOT NULL REFERENCES tg_users(tg_id) '
                      'ON DELETE CASCADE,expires_at INTEGER NOT NULL)')
@@ -120,8 +118,7 @@ class WebService:
                      'csrf_token TEXT NOT NULL)')
 
     def issue_url(self, tg_id):
-        """生成一次性网页入口码；库内只存码的摘要，原码放在 URL fragment。
-        """
+        """签发有期限的一次性入口，库内只存摘要，原码放 URL fragment。"""
         self._owner(tg_id)
         base = web_origin(self.cfg().get('web_base_url') or '')
         if not self.accounts.owned(tg_id):
@@ -138,8 +135,9 @@ class WebService:
         return base + '/web/auth#code=' + code
 
     def exchange(self, code):
-        """一次性入口码换会话；码删除与发会话在同一写事务里，重放拿不到第二次。
-        """
+        """在同一事务消费入口码并创建会话，重复兑换不能拿到第二份 sid。
+
+        落库前后核 owner，返回原 sid 仅用于设置 Cookie，不记录日志。"""
         if not _secret(code):
             raise DomainError('网页入口无效、已过期或已使用，请在 Bot 重新打开。')
         now = int(time.time())
@@ -166,8 +164,7 @@ class WebService:
         return {'sid': sid, 'csrf_token': csrf, 'tg_id': tg_id}
 
     def authenticate(self, sid):
-        """校验会话并复核账号归属；主账号失效后旧会话立即作废。
-        """
+        """检查库内摘要、期限、实时 owner 和主号登录；失败返回 None。"""
         if not _secret(sid):
             return None
         now = int(time.time())
@@ -186,16 +183,13 @@ class WebService:
         return {'tg_id': row['tg_id'], 'csrf_token': row['csrf_token']}
 
     def logout(self, sid):
-        """仅撤销个人网页会话；不删除 emos Token，不退出账号登录。
-
-        """
+        """只撤销当前个人网页会话，不清账号 Token，也不触发账号退出。"""
         if _secret(sid):
             with self.write() as conn:
                 conn.execute('DELETE FROM web_sessions WHERE sid_hash=?', (_digest(sid),))
 
     def authorize(self, sid, csrf=None, mutating=False):
-        """会话 + CSRF 校验；mutating 为真时缺 token 一律拒绝。
-        """
+        """会话有效后按 mutating 再验 CSRF；写请求缺 token 一律拒绝。"""
         session = self.authenticate(sid)
         if session is None:
             raise DomainError('网页会话已失效，请从 Bot 重新打开。')
@@ -204,6 +198,7 @@ class WebService:
         return session
 
     def state(self, tg_id):
+        """组装脱敏个人账号视图并在返回前复核 owner；系统配置不在这里写入。"""
         owner_mode = self._owner(tg_id)
         active = self.accounts.active(tg_id, required=False)
         prefs = self.accounts.user(tg_id) or {}
@@ -302,14 +297,13 @@ class WebService:
         return {'ok': True}
 
     def _account_logout(self, tg_id, root, body):
-        """签发短时确认凭据；执行请求必须带回同一凭据、选择和登录代际。
+        """绑定根、范围和登录代际签发或消费短期退出确认；首次请求只展示。
 
-        确认后调用域事务撤销本地密钥，取消排队任务；不向官方撤销 Token。
-        """
+        确认有效才调用账号域清本地凭据并标记待办撤销，不向官方撤销 Token。"""
         all_accounts = body.get('all_accounts', False)
         if type(all_accounts) is not bool:
             raise DomainError('退出范围必须为布尔值。')
-        # 准备只读取当前账号；执行时由账号域事务再次验 owner 与根。
+        # 确认提示不写凭据；执行时仍须事务性检查 owner 和当前根。
         with self.accounts._access(tg_id) as (conn, _):
             self.accounts._expected(conn, tg_id, root)
             revision = conn.execute('SELECT login_revision FROM tg_users WHERE tg_id=?',
@@ -331,7 +325,7 @@ class WebService:
                 raise DomainError('退出确认已失效，请重新点击退出并确认。')
             result = self.accounts.logout(tg_id, all_accounts=all_accounts, expected_root=root)
             self.logout_confirmations.pop(tg_id, None)
-            # 队列标成 revoked；运行中的逐账号发送仍由即时 can_run 拦截。
+            # 已排队任务标撤销，执行中请求靠即时守卫阻断后续发送。
             for job in self.jobs.values():
                 if job['tg_id'] == tg_id and job['status'] == 'queued':
                     job.update(status='revoked', rows=[], message='账号已本地退出，排队签到已取消。')
@@ -349,8 +343,9 @@ class WebService:
                 self.requests.pop(key, None)
 
     def start_sign(self, tg_id, body):
-        """入队前固定当前账号和签到范围；默认仅当前号，重复请求不得改变范围。
-        """
+        """请求编号、当前根和明确范围先校验，去重成功才占容量并启动一个 worker。
+
+        默认只签当前号；容量、排空状态和同请求换范围都明确拒绝。"""
         self._owner(tg_id)
         _only(body, ('account_id', 'request_id', 'all_accounts'))
         all_accounts = body.get('all_accounts', False)
@@ -392,10 +387,9 @@ class WebService:
             return {'ok': True, 'job_id': job_id}
 
     def _worker(self):
-        """按需执行队列，空队列时退出；运行前核对 owner、选择和登录代际。
+        """串行执行网页待办，开始前重验 owner、选择和登录代际，空队列退出。
 
-        结果写到内存任务记录。异常转换成公开状态，不暴露原始异常或保证任务跨重启恢复。
-        """
+        结果只留内存任务记录；异常转为脱敏状态，签到日志另在 SQLite 持久化。"""
         while not self.stopping.is_set():
             try:
                 job_id = self.queue.get_nowait()
@@ -442,6 +436,7 @@ class WebService:
             self.queue.task_done()
 
     def job(self, tg_id, job_id):
+        """读取有期限的本用户任务状态；实时 owner 无效时不返回旧任务结果。"""
         self._owner(tg_id)
         if not isinstance(job_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{24}', job_id):
             raise DomainError('任务不存在或已过期。')
@@ -471,8 +466,7 @@ class WebService:
                 'all_accounts': job.get('all_accounts', False), 'rows': rows}
 
     def begin_drain(self):
-        """只停止接受新任务；已排队和在跑任务由调用方检查并等待。
-        """
+        """只拒收新签到；已排队和执行中任务由应用检查并等待，不在此标记撤销。"""
         with self.lock:
             self.accepting = False
 
@@ -482,10 +476,7 @@ class WebService:
             self.accepting = True
 
     def stop(self, timeout=55):
-        """撤销尚未运行的任务，设置停止标记并有限等待当前 worker。
-
-        本服务不拥有 HTTP 监听；超时后在跑线程仍可能存活，由 app 决定能否 exec。
-        """
+        """拒收并等待当前 worker；等待到期不强杀运行中的业务线程。"""
         self.stopping.set()
         while True:
             try:
@@ -574,6 +565,7 @@ load().catch(error=>flash(error.message));
 
 
 def render_page(kind, nonce):
+    """渲染内置模板与真实脚本，生成同一 CSP nonce；不依赖旁边 HTML 或 JS 文件。"""
     if not isinstance(nonce, str) or not re.fullmatch(r'[A-Za-z0-9_-]{16,80}', nonce):
         raise ValueError('invalid CSP nonce')
     if kind == 'auth':

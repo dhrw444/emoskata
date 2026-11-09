@@ -1,8 +1,7 @@
 """HTTP JSON 契约、身份、余额与非幂等请求回归。
 
-夹具只使用临时或演练数据；本地通过不代表真实官方授权。
-Test: python3 -B -m unittest test_client。
-"""
+仅用隔离目录、合成身份或 localhost；正式授权和真实生产资源不在此验收。
+Test: python3 -B -m unittest test_client"""
 import unittest
 from unittest.mock import patch
 
@@ -110,6 +109,43 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(client.sign_once()['status'], 'network')
         self.assertEqual(len(attempts), 1)
         self.assertEqual(attempts[0][2], BASES[0])
+
+    def test_gateway_side_effect_never_resends_sign_to_failover(self):
+        for status, body, content_type in (
+            (403, {'message': 'Forbidden'}, 'application/json'),
+            (403, '<html>gateway denied after write</html>', 'text/html'),
+            (200, '<html>gateway rewrote upstream reply</html>', 'text/html'),
+        ):
+            writes = []
+            class AppliedThenBlocked(Fixture):
+                def do_PUT(self):
+                    self.server.signed.add('eFixture')
+                    writes.append('primary-applied')
+                    self.raw(status, body, content_type)
+            class Failover(Fixture):
+                def do_PUT(self):
+                    writes.append('backup-applied')
+                    super().do_PUT()
+            with self.subTest(status=status, content_type=content_type):
+                with serve(AppliedThenBlocked) as (primary, first), serve(Failover) as (_, backup):
+                    client = EmosClient('11_fixture', first)
+                    client.bases = [first, backup]
+                    result = client.sign_once()
+                    self.assertEqual(writes, ['primary-applied'], (writes, result))
+                    self.assertEqual(primary.signed, {'eFixture'})
+                    self.assertEqual(result['status'], 'blocked')
+
+    def test_mutating_methods_do_not_fail_over_on_blocked_result(self):
+        for method in ('PUT', 'POST', 'DELETE'):
+            attempts = []
+            client = EmosClient('11_fixture', BASES[0])
+            def blocked(method, path, endpoint, params=None):
+                attempts.append(endpoint)
+                raise EmosError('synthetic blocked after write', kind='blocked')
+            with self.subTest(method=method), patch.object(client, '_once', side_effect=blocked):
+                with self.assertRaises(EmosError):
+                    client.call(method, '/api/user/sign')
+                self.assertEqual(attempts, [BASES[0]])
 
     def test_get_profile_still_fails_over(self):
         attempts = []

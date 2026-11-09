@@ -1,8 +1,7 @@
-"""真单文件的首次创建、跨版本代码激活、补项和失败回滚验收。
+"""回归一个 py + 部署 .env 的启动、完整代码更新和未就绪失败恢复。
 
-仅在临时目录启动准确记录 PID 的 Python，使用合成账号，不访问外部接口。
-Test: python3 -B -m unittest test_single_file_upgrade
-"""
+仅用隔离目录、合成身份或 localhost；正式授权和真实生产资源不在此验收。
+Test: python3 -B -m unittest test_single_file_upgrade"""
 import ast
 import hashlib
 import json
@@ -15,6 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import closing
 from http.client import HTTPConnection
 
 from build_single import build
@@ -179,7 +179,7 @@ class SingleFileUpgradeTests(unittest.TestCase):
             self.log.close()
 
     def seed(self):
-        with sqlite3.connect(self.db) as conn:
+        with closing(sqlite3.connect(self.db)) as conn, conn:
             conn.execute("INSERT INTO accounts(id,name,token,emos_id,owner_tg_id,auto_sign,sign_time,carrot,sign_mode) VALUES(1,'primary','11_fixture_primary','ePrimary',101,0,'16:30',777,'random')")
             conn.execute("INSERT INTO accounts(id,name,token,emos_id,owner_tg_id,auto_sign,sign_time,carrot) VALUES(2,'independent','22_fixture_extra','eExtra',101,0,'17:30',42)")
             conn.execute("INSERT INTO tg_users(tg_id,chat_id,active_account_id,primary_account_id,notify_success,notify_fail) VALUES(101,101,2,1,0,1)")
@@ -188,7 +188,7 @@ class SingleFileUpgradeTests(unittest.TestCase):
             conn.execute("INSERT INTO web_sessions VALUES('fixture_session_hash',101,1700000000,2000000000,'fixture_csrf')")
 
     def data(self, columns=None):
-        with sqlite3.connect(self.db) as conn:
+        with closing(sqlite3.connect(self.db)) as conn, conn:
             if columns is None:
                 names = [row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
                 columns = {name: [row[1] for row in conn.execute('PRAGMA table_info("%s")' % name)] for name in names}
@@ -216,7 +216,7 @@ class SingleFileUpgradeTests(unittest.TestCase):
         import secrets
         raw_sid = secrets.token_urlsafe(32)
         now = int(time.time())
-        with sqlite3.connect(self.db) as conn:
+        with closing(sqlite3.connect(self.db)) as conn, conn:
             conn.execute('INSERT INTO web_sessions VALUES(?,?,?,?,?)',
                          (hashlib.sha256(raw_sid.encode('ascii')).hexdigest(), 101, now,
                           now + 86400, 'fixture_csrf'))
@@ -310,7 +310,7 @@ class SingleFileUpgradeTests(unittest.TestCase):
         self.assertEqual(self.config.read_bytes(), env_before)
         self.assertEqual(env_values(self.config), config_before)
         self.assertEqual(self.data(columns)[1], before)
-        with sqlite3.connect(self.db) as conn:
+        with closing(sqlite3.connect(self.db)) as conn, conn:
             self.assertEqual(conn.execute('SELECT upgrade_test_column FROM accounts ORDER BY id').fetchall(), [(7,), (7,)])
             self.assertEqual(conn.execute('SELECT COUNT(*) FROM upgrade_test_items').fetchone()[0], 0)
         self.assertEqual(self.request('/api/config')[2]['upgrade_test_option'], 'fixture-added')

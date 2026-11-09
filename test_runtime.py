@@ -1,8 +1,7 @@
 """应用、账号、Bot 和客户端的本地 HTTP 集成回归。
 
-夹具只使用临时或演练数据；本地通过不代表真实官方授权。
-Test: python3 -B -m unittest test_runtime。
-"""
+仅用隔离目录、合成身份或 localhost；正式授权和真实生产资源不在此验收。
+Test: python3 -B -m unittest test_runtime"""
 import contextlib
 import json
 import os

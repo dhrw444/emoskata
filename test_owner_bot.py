@@ -1,8 +1,7 @@
 """真实账号域驱动的私聊菜单、按钮和输入流程回归。
 
-夹具只使用临时或演练数据；本地通过不代表真实官方授权。
-Test: python3 -B -m unittest test_owner_bot。
-"""
+仅用隔离目录、合成身份或 localhost；正式授权和真实生产资源不在此验收。
+Test: python3 -B -m unittest test_owner_bot"""
 import tempfile
 import unittest
 

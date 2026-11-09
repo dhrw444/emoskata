@@ -1,8 +1,7 @@
 """标准库单文件启动、删除重传、exec 与持久数据保留回归。
 
-夹具只使用临时或演练数据；本地通过不代表真实官方授权。
-Test: python3 -B -m unittest test_update。
-"""
+仅用隔离目录、合成身份或 localhost；正式授权和真实生产资源不在此验收。
+Test: python3 -B -m unittest test_update"""
 import json
 import os
 from pathlib import Path
@@ -14,6 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import closing
 from http.client import HTTPConnection
 from unittest.mock import patch
 
@@ -123,13 +123,13 @@ class UpdateTests(unittest.TestCase):
         self.fail('local process readiness timed out')
 
     def dump_data(self):
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             return {table: conn.execute('SELECT * FROM ' + table + ' ORDER BY rowid').fetchall()
                     for table in ('accounts', 'tg_users', 'account_links', 'link_requests', 'logs',
                                   'settings', 'sessions', 'web_auth_codes', 'web_sessions')}
 
     def seed(self):
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute("INSERT INTO accounts(id,name,token,emos_id,owner_tg_id,auto_sign,sign_time) "
                          "VALUES(1,'Fixture A','11_synthetic_A','eA',101,0,'15:30')")
             conn.execute("INSERT INTO accounts(id,name,token,emos_id,owner_tg_id,auto_sign,sign_time) "
@@ -208,7 +208,7 @@ class UpdateTests(unittest.TestCase):
         after = request(self.port, '/api/runtime', cookie=self.cookie)[2]
         self.assertEqual(before['pid'], after['pid'])
         self.assertLessEqual(after['threads'], 6)
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             self.assertEqual(conn.execute('SELECT COUNT(*) FROM logs').fetchone()[0], 0)
         self.assertLess(after['cpu_seconds'] - before['cpu_seconds'], 1.0)
 

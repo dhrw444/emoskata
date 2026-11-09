@@ -2,7 +2,7 @@
 
 **专用 TG Bot：首个账号官方授权，后续 emos Token 添加，全部账号统一签到。**
 
-Python 3.10+，零第三方 Python 依赖（仓库里的 `requirements.txt` 是空的，只为满足托管平台的检查）。可以上传生成的 `emoskata.py`，也可以上传分模块源码并启动 `app.py`。调度、Bot 和网页服务在一个应用进程内运行；重启预检会临时创建子进程。
+Python 3.10+，零第三方 Python 依赖（`requirements.txt` 只含注释，没有需安装的包）。单文件部署只需上传 `emoskata.py` 和你填好的 `.env`；不需要上传维护模块或 Node。也可上传分模块源码并启动 `app.py`。调度、Bot 和网页服务在一个应用进程内运行；重启预检会临时创建子进程。
 
 > 当前版本已按单人方案接通 Token 引导、全部账号操作、余额展示和个人网页权限。历史跨 TG 共享数据保留但入口关闭。更新先隔离初始化预检；就绪前启动失败由事务恢复旧代码、配置和数据库；见 [验证记录](VALIDATION.md) 和 [维护地图](MAINTENANCE.md)。
 
@@ -12,7 +12,7 @@ Python 3.10+，零第三方 Python 依赖（仓库里的 `requirements.txt` 是�
 
 进程环境里的同名变量**不会**被继承成配置——`.env` 是唯一来源。缺 `.env` 时程序直接停下并提示复制模板，不会替你生成。
 
-文件里少写的键按默认值补进**内存**，原文件字节不变，所以升级新增字段不需要程序改写配置。真正写文件的只有一处：**管理员网页点保存**。保存是加锁 + 校验 + 原子替换，校验失败时旧文件一个字节都不动。标为“重启生效”的项保存后需重启核心，其余在下一次读取时生效。
+文件里少写的键按默认值补进**内存**，读取不会改原文件，所以升级新增字段不需要补写配置。管理员网页保存继续走加锁、校验和原子替换；显式保存缺失键的默认值也会写盘，重启后仍算你的选择。一次性旧库设置迁移同样通过这条更新入口补缺失键；预检只写隔离副本。标为“重启生效”的项保存后需重启核心，其余在下一次读取时生效。
 
 | 键 | 默认 | 说明 |
 |---|---|---|
@@ -112,6 +112,18 @@ query content：说点什么进行随机签到以获得更多萝卜
 
 ## 部署
 
+### 单文件（服务器）
+
+```sh
+cp .env.example .env
+# 编辑 .env：填 PANEL_PASSWORD、TG_BOT_TOKEN、TG_ALLOWED_USER_IDS
+chmod 600 .env
+python3 emoskata.py --check-config
+python3 emoskata.py
+```
+
+`.env` 必须与入口同目录，或用 `EMOS_ENV_FILE` 指定原配置的绝对路径。`--check-config` 只读校验，不创建数据目录、数据库、成功快照或服务线程。
+
 ### 单文件（容器）
 
 ```sh
@@ -125,7 +137,7 @@ docker compose up -d
 `config/.env` 必须由你自己准备；程序不会生成它。上传/写好后可以先只校验不改文件：
 
 ```sh
-EMOS_ENV_FILE=config/.env python3 runtime/emoskata.py --check-config
+EMOS_ENV_FILE="$PWD/config/.env" python3 runtime/emoskata.py --check-config
 ```
 
 `docker-compose.yml` 已配好三个挂载：
@@ -198,7 +210,7 @@ docker cp emoskata.py emoskata:/app/runtime/emoskata.py
 - Bot 工作线程按需创建，容量受 `BOT_WORKERS` / `BOT_MAX_JOBS` 限制；网页签到单 worker，调度单线程。
 - 调度检查先读本地库；需要补签时才发官方请求，不能概括为“空闲永远不请求”。
 - 每个账号的 `logs` 保留最近 200 条。零散登录失败记录保留 24 小时，在启动及每 64 次失败时清理；有效锁定不提前删除。
-- 空库、无 Bot Token 的独立采样 60.04 秒：空闲 CPU 约单核 0.067%，RSS 22.03 MiB，进程峰值 37.70 MiB，4 线程、1 个应用进程。样本不证明生产上限或显著降幅，原始数据见 [质量核查](QUALITY_REVIEW.md)。
+- 本轮隔离 60 秒样本：面板空闲约 0.033%–0.05% 单核，认证后初始 RSS 约 22 MiB、峰值约 38 MiB；实际本地 Bot 长轮询约 0.033%–0.05%、初始 RSS 约 23.5 MiB、5 线程。Android 期间会回收驻留页，后续 RSS 下降不代表优化效果；这些不是生产上限。完整样本见 [质量核查](QUALITY_REVIEW.md)。
 
 ## 补签与故障处理
 
@@ -206,7 +218,7 @@ docker cp emoskata.py emoskata:/app/runtime/emoskata.py
 - 断网单独归类 `network`，不烧退避配额；纯网络失败不发失败通知。
 - 401 或明确失效 → 停用账号；CF 403 HTML 不误判成密钥失效。
 - 200 必须有有效 JSON 与签到字段，HTML/空壳不算成功。
-- 仅两个官方域互为备用；自定义地址不追加官方站；重定向不携带密钥跟随。
+- 只有读取请求在官方域间降级；签到等写请求遇 network/blocked 不立即换域重发，下次调度先读当天状态。自定义地址不追加官方站；emos 重定向不携带密钥跟随。
 
 ## 测试
 

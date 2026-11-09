@@ -1,8 +1,7 @@
 """一个获准 TG 操作者管理多个独立 emos Token 的真实 HTTP 回归。
 
-首号官方授权；额外号允许绑定其他 TG 或不绑定。使用隔离 SQLite 与本地接口。
-Test: python3 -B -m unittest test_multi_accounts
-"""
+仅用隔离目录、合成身份或 localhost；正式授权和真实生产资源不在此验收。
+Test: python3 -B -m unittest test_multi_accounts"""
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import tempfile

@@ -1,8 +1,8 @@
-"""emos JSON 请求、Token 身份核验与签到结果归一。
+"""标准库 emos 客户端：身份核验、请求边界与签到结果归一。
 
-自定义域不追加公共域；请求守卫核对撤销状态，非幂等请求不保证恰好一次。
-Test: python3 -B -m unittest test_client。
-"""
+自定义站点不向官方站降级；Token 不随重定向发送。
+单次写请求结果未知时不重发；只有 GET 允许在网络或网关失败时换备用域。
+Test: python3 -B -m unittest test_client"""
 import json
 import random
 import re
@@ -38,6 +38,7 @@ def _safe_json(raw):
 
 
 def pick_content(preferred='', mode='normal'):
+    """选取普通空附言或随机词表；调用者文本限制属于本程序，不代表官方奖励承诺。"""
     if mode not in ('normal', 'random'):
         raise EmosError('签到模式必须为普通或随机字。', kind='config')
     if not isinstance(preferred, str):
@@ -58,6 +59,7 @@ def clamp_sign_time(hhmm):
 
 
 def valid_base(base):
+    """规范化 HTTP/HTTPS API 地址，拒绝内嵌凭据、查询和 fragment。"""
     value = str(base or BASES[0]).strip().rstrip('/')
     parsed = urllib.parse.urlsplit(value)
     if (parsed.scheme not in ('https', 'http') or not parsed.hostname
@@ -74,10 +76,7 @@ class _NoCredentialRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def _carrot_of(profile):
-    """读取 /api/user 的可用余额；缺失或类型无效时返回 None。
-
-    carrot 为账户余额，earn_point/last_carrot 为单次所得，不能混作同一指标。
-    """
+    """读取 /api/user 的可用余额；缺失或类型异常返回 None，不假定余额为零。"""
     value = profile.get('carrot')
     if type(value) is int:
         return value
@@ -93,6 +92,7 @@ def _already_message(body):
 
 
 class EmosClient:
+    """持有已校验 Token 和有限地址顺序；请求前守卫由调用方注入。"""
     def __init__(self, token, base='', timeout=TIMEOUT):
         self.before_request = None
         self.expected_user_id = None
@@ -108,6 +108,9 @@ class EmosClient:
         self.opener = urllib.request.build_opener(_NoCredentialRedirect())
 
     def _once(self, method, path, base, params=None):
+        """一次请求最多读 1 MiB，按响应分类失效、限流和网关阻断。
+
+        发送前执行授权守卫；无 JSON 的 403 不等于账号失效。"""
         url = base + path
         if params:
             url += '?' + urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
@@ -151,12 +154,10 @@ class EmosClient:
         return status, body
 
     def call(self, method, path, params=None):
-        """在当前地址顺序中调用，并记录最后成功地址。
+        """按当前地址列表请求并记住成功域。
 
-        GET 遇 network/blocked 可降级；PUT/POST/DELETE 遇 network 立即返回错误，
-        避免未知提交结果被重发。写请求遇 blocked 仍可尝试备用域名；该行为不能
-        表述为所有 PUT 永不重发，也不能把网关错误视作服务端未执行的确定证据。
-        """
+        GET 的 network/blocked 可换域；非幂等写请求两类失败都不换域重发。
+        网关结果不能证明远端没执行；后续调度先读当天 sign 再决定是否提交。"""
         bases = list(self.bases)
         non_idempotent = method in ('PUT', 'POST', 'DELETE')
         last = None
@@ -169,13 +170,14 @@ class EmosClient:
                 last = error
                 if error.kind not in ('network', 'blocked'):
                     raise
-                if non_idempotent and error.kind == 'network':
+                if non_idempotent:
                     raise
                 if index + 1 >= len(bases):
                     raise
         raise last or EmosError('所有接口均不可用。', network=True)
 
     def profile(self):
+        """读取并验证官方账号 ID，补上内部显示名和可用余额字段；不落库。"""
         status, body = self.call('GET', '/api/user')
         if status != 200:
             raise EmosError('读取用户信息失败。', status)
@@ -190,8 +192,7 @@ class EmosClient:
         return result
 
     def check(self):
-        """读取官方登录状态 is_sign，不用于判定今天是否已经签到。
-        """
+        """读取 is_sign 登录状态，不用于判断当天是否已签到。"""
         status, body = self.call('GET', '/api/sign/check')
         if status != 200 or not isinstance(body.get('is_sign'), bool):
             raise EmosError('登录状态响应不完整。', status)
@@ -200,11 +201,13 @@ class EmosClient:
         return body['is_sign'], body
 
     def do_sign(self, content=''):
-        """发送已选定的 content query；空文本表示不带附言的普通签到。
-        """
+        """用 PUT 提交已选附言，空附言不加 content query；不执行本地日志写入。"""
         return self.call('PUT', '/api/user/sign', {'content': content} if content else None)
 
     def sign_once(self, content='', mode='normal'):
+        """读资料验证预期 ID、主号 TG 绑定与当天 sign，再按响应归一签到结果。
+
+        未知余额保留 None，失败返回明确分类；远端结果不在本函数落库。"""
         result = {'status': 'failed', 'message': '', 'point': None, 'days': None,
                   'rank': None, 'name': '', 'retry_after': 0, 'carrot': None}
         try:

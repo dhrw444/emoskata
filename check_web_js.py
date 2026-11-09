@@ -1,8 +1,7 @@
-"""提取渲染后的四段真实网页脚本，交给 Node 检查语法。
+"""提取最终网页中的四段真实 JavaScript，交给 Node 官方解析器。
 
-不模拟 JavaScript 解析规则；Node 只用于开发验收，不是服务运行依赖。
-Run: python3 -B check_web_js.py。
-"""
+不模拟语法规则；Node 仅用于开发和 CI，部署入口不需要 Node。
+Run: python3 -B check_web_js.py"""
 import ast
 from html.parser import HTMLParser
 from pathlib import Path
@@ -36,6 +35,9 @@ class Scripts(HTMLParser):
 
 
 def script_sources():
+    """按 AST 取得实际模板和脚本，并替换生产同款状态占位符。
+
+    必须得到全部四段；少一段或留下占位符直接失败，不把局部解析当验收。"""
     result = {}
     import json as _json
     for filename, wanted in (('app.py', {'PAGE', 'LOGIN_PAGE'}),
@@ -56,7 +58,7 @@ def script_sources():
                             result[target.id + '_' + str(index)] = script
     if len(result) != 4:
         raise ValueError('未取得全部四段真实网页脚本，检查页面结构。')
-    # 检查替换占位符后的脚本；合法占位符表达式仍可能在运行时未定义。
+    # 必须检查渲染后的值；语法合法的占位符也可能在浏览器运行时报错。
     if '__STATUS_JS__' in result.get('_DASHBOARD_JS', ''):
         sys.path.insert(0, str(ROOT))
         import webui
@@ -69,6 +71,7 @@ def script_sources():
 
 
 def check_scripts():
+    """对四段真实脚本运行 node --check，任何解析错误中止检查。"""
     node = shutil.which('node')
     if not node:
         raise RuntimeError('网页脚本验收需要 Node 18+，应用运行不需要 Node。')

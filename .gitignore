@@ -10,3 +10,8 @@ config.json
 *.db
 *.db-wal
 *.db-shm
+
+# 更新备份包含原配置和账号数据库，不得纳入提交。
+.*.last-good
+.*.update-state.json
+.*.update-stage-*/

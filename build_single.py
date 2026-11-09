@@ -1,8 +1,7 @@
-"""从维护源码生成一个包含八个隔离模块的 Python 入口。
+"""将维护模块生成隔离命名空间的一个可部署 Python 入口。
 
-运行时不提取或依赖旁边的 py；旧版明文 _SOURCES 更新格式保持兼容。
-Build: python3 -B build_single.py；Test: python3 -B build_single.py --check。
-"""
+只转换本项目导入；运行不释放额外 py 到磁盘，也不依赖旁边维护源码。
+Build: python3 -B build_single.py；Check: python3 -B build_single.py --check"""
 import ast
 from pathlib import Path
 
@@ -12,10 +11,7 @@ PACKAGE = '_emoskata_embedded'
 
 
 def embedded_source(name):
-    """改写本地 from-import 到内嵌命名空间，返回已编译校验的源码。
-
-    只转换维护模块引用；动态源码与第三方依赖不在此函数推断。
-    """
+    """按 AST 完整节点改写本地导入并编译，保留节点外源码，不猜跨行签名边界。"""
     source = (ROOT / (name + '.py')).read_text(encoding='utf-8')
     lines = source.splitlines(keepends=True)
     replacements = []
@@ -40,10 +36,9 @@ def embedded_source(name):
 
 
 def build(write=True):
-    """生成八模块与引导模板；write=False 只返回源码，不改入口文件。
+    """从维护源码生成运行模块和引导；write=False 只返回文本。
 
-    部署上传生成入口后须重启才能加载新代码，不覆盖配置或旁边的维护文件。
-    """
+    普通启动先恢复事务再初始化；--check-config 仅执行配置解析，不创建运行资源。"""
     sources = {name: embedded_source(name) for name in MODULES}
     bootstrap = '''#!/usr/bin/env python3
 """emoskata 生成入口；只修改维护模块，再运行 build_single.py。
@@ -60,7 +55,10 @@ _package = _types.ModuleType(_package_name)
 _package.__path__ = []
 _package.__file__ = __file__
 _sys.modules[_package_name] = _package
+_check_config = __name__ == '__main__' and _sys.argv[1:] == ['--check-config']
 for _name, _source in _SOURCES.items():
+    if _check_config and _name != 'envconfig':
+        continue
     _qualified = _package_name + '.' + _name
     _module = _types.ModuleType(_qualified)
     _module.__file__ = __file__
@@ -74,6 +72,15 @@ for _name, _source in _SOURCES.items():
         _module.recover_entry(__file__)
         _module.capture_image(__file__, globals().get('__emos_image__'))
 
+if _check_config:
+    try:
+        _config = _package.envconfig.ConfigStore(_package.envconfig.config_path(__file__))
+        print('配置通过校验：%d 项' % len(_config.snapshot()[0]))
+    except _package.envconfig.EnvConfigError as _error:
+        print('[config] %s' % _error)
+        raise SystemExit(2) from None
+    raise SystemExit(0)
+
 emos = _package.emos
 accounts = _package.accounts
 webui = _package.webui
@@ -81,16 +88,12 @@ bot = _package.bot
 app = _package.app
 main = app.main
 
-# 作为模块导入时也释放字典与最后一段源码；不要求启动 main 才清理。
+# 运行镜像已另存；释放构建阶段的模块源码字符串，避免稳态重复保留。
 _SOURCES.clear()
 del _source
 
 if __name__ == '__main__':
-    if _sys.argv[1:] == ['--check-config']:
-        # 只校验部署者上传的 .env：不建文件、不改文件、不启动服务。
-        print('配置通过校验：%d 项' % len(app.CONFIG.snapshot(force=True)[0]))
-    else:
-        main()
+    main()
 '''
     output = bootstrap.replace('__SOURCES__', repr(sources))
     compile(output, 'emoskata.py', 'exec')

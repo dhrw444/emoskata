@@ -1,7 +1,7 @@
 """兼容自检入口，调用正式 unittest 发现器。
 
-Run: python3 -B selftest.py；运行依赖与正式测试相同。
-"""
+不维护第二套测试或成功判据；Node 是否可用由对应开发测试判断。
+Run: python3 -B selftest.py"""
 from pathlib import Path
 import sys
 import unittest

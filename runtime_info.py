@@ -1,8 +1,7 @@
-"""按需读取进程资源和展示地址。
+"""按需运行统计与监听展示地址。
 
-CPU 比例来自两次调用之间的时间增量；不可读指标返回未知，不伪造零值。
-Runtime: Python 3.10+ / 标准库；由管理页面调用。
-"""
+CPU 是两次采样间的进程时间比例，100% 表示一个逻辑核。
+Linux 指标不可读时返回 None，不设监控线程，也不伪造零内存。"""
 import os
 from pathlib import Path
 import socket
@@ -15,6 +14,7 @@ _LAST = None
 
 
 def container_ip():
+    """通过 UDP 路由选择查询本地地址，不向探测地址发送数据；失败回落本机地址。"""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.connect(('198.51.100.1', 9))
@@ -33,9 +33,9 @@ def container_ip():
 
 
 def snapshot():
-    """按需采样当前进程；不可获取的指标保留未知值，不创建监控循环。
+    """按需读取进程 CPU 和 /proc 内存，返回当前 Python 线程数。
 
-    """
+    首个 CPU 比例未知；峰值包含启动和 scrypt 认证，不等于稳态 RSS。"""
     global _LAST
     now, process = time.monotonic(), time.process_time()
     with _LOCK:

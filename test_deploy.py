@@ -1,8 +1,7 @@
 """管理员 HTTP 权限、单文件命名空间和账号网页完整流程回归。
 
-夹具只使用临时或演练数据；本地通过不代表真实官方授权。
-Test: python3 -B -m unittest test_deploy。
-"""
+仅用隔离目录、合成身份或 localhost；正式授权和真实生产资源不在此验收。
+Test: python3 -B -m unittest test_deploy"""
 from contextlib import contextmanager
 import ast
 import importlib.util

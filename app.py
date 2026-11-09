@@ -1,8 +1,8 @@
-"""持久数据、HTTP、调度、通知和单进程核心生命周期。
+"""单进程应用装配：SQLite、HTTP、调度、通知和核心更新。
 
-配置与 SQLite 独立于程序；先隔离预检并排空，更新就绪前失败恢复快照。
-Run: python3 app.py，或使用生成入口 emoskata.py；仅标准库。
-"""
+导入时读部署 .env 并确定数据路径；账号和会话存在 SQLite，不写入程序。
+完整启动先恢复未完成更新，就绪前线程停在门闩；之后才处理业务。
+Run: python3 emoskata.py；Python 3.10+ / POSIX 标准库。"""
 
 import hashlib
 import html
@@ -32,7 +32,7 @@ from webui import WebService, render_page
 from updates import (recover_entry, capture_image, mark_ready, exec_update,
                      restore_missing_entry, snapshot_database)
 
-# 恢复未完成的更新必须发生在读取配置、打开数据库和创建线程之前。
+# pending 恢复会同 PID exec；此时不能已有配置缓存、线程或数据库句柄。
 recover_entry(__file__)
 capture_image(__file__, globals().get('__emos_image__'))
 _STARTUP_PROBE = os.environ.get('EMOS_STARTUP_PROBE') == '1'
@@ -75,10 +75,9 @@ _notification_wakeup = threading.Event()
 
 
 def request_restart():
-    """在锁内固定并预检候选字节，成功后进入排空状态。
+    """串行固定并预检上传字节，成功才进入拒收和排空状态。
 
-    已有重启或正在停机返回 False；候选失败抛配置错误，旧核心继续运行。
-    """
+    已有更新或停机返回 False；候选失败抛配置错误，旧核心继续服务。"""
     global _restart_status, _restart_error, _restart_image
     with _restart_lock:
         if _restart_requested.is_set() or _shutdown.is_set():
@@ -109,11 +108,11 @@ LOG_KEEP = 200
 
 
 class DatabaseBusy(sqlite3.OperationalError):
-    """数据库达到容量或正在收尾；不暴露 SQL、凭据和底层异常。
-    """
+    """容量或收尾导致的可恢复数据库错误，不包含 SQL 或凭据。"""
 
 
 def _close_physical(connection):
+    """完成物理关闭后才释放容量；关闭失败隔离句柄，禁止补建绕过上限。"""
     global _db_total, _db_closing
     failed = False
     try:
@@ -133,6 +132,7 @@ def _close_physical(connection):
 
 
 class _Connection:
+    """单线程租约代理；退出事务即归还或关闭物理连接，不等同于裸 SQLite 连接。"""
     def __init__(self, connection, owner):
         self.connection = connection
         self.owner = owner
@@ -157,6 +157,7 @@ class _Connection:
             self.close()
 
     def close(self):
+        """只归还一次租约；未完成事务先回滚，坏连接不进入空闲缓存。"""
         global _db_borrowed, _db_closing
         with self._lock:
             connection, self.connection = self.connection, None
@@ -179,11 +180,10 @@ class _Connection:
 
 
 def db():
-    """最多八个物理 SQLite 连接；含创建和关闭中的连接，空闲缓存最多三个。
+    """借用一个 SQLite 连接，物理总量上限 8，空闲缓存上限 3。
 
-    满容量有限等待；禁止同线程嵌套借用，内部查询必须复用已有 conn。
-    创建失败归还预约；物理关闭失败隔离连接，不能继续补建绕过上限。
-    """
+    创建和关闭也占容量；达到上限有限等待，同线程嵌套必须复用现有 conn。
+    调用者用 with db() 或显式 close() 归还租约。"""
     global _db_borrowed, _db_total, _db_waiters, _db_closing
     owner = threading.get_ident()
     connection = None
@@ -235,8 +235,7 @@ def db():
 
 
 def close_idle_db():
-    """同步关闭空闲和隔离连接，关闭完成前暂停新的预约。
-    """
+    """同步关闭空闲和隔离句柄；关闭期间暂停新预约，不替调用者回收活跃租约。"""
     global _db_closing, _db_purging
     with _db_available:
         while _db_purging:
@@ -271,10 +270,9 @@ def _seal_db_pool(sealed):
 
 @contextmanager
 def write_db():
-    """串行持有 BEGIN IMMEDIATE 写事务；退出时提交或回滚，并归还连接租约。
+    """持有进程写锁和 BEGIN IMMEDIATE 事务，退出时提交或回滚并归还租约。
 
-    事务中的其他查询必须复用 conn，不能再次 db()。
-    """
+    事务中的其他查询复用传入 conn，不再次借连接。"""
     with _write_lock:
         with db() as conn:
             conn.execute('BEGIN IMMEDIATE')
@@ -282,10 +280,9 @@ def write_db():
 
 
 def init_db():
-    """在一个写事务内补齐 schema、索引和限流记录；不清空账号及签到历史。
+    """在单个写事务中补齐表、列、索引与过期限流记录。
 
-    迁移不兼容时抛错；目录及数据库权限的 chmod 为尽力执行。
-    """
+    保留账号、密钥、余额和有效会话；结构不兼容中止事务，权限收紧尽力执行。"""
     with write_db() as conn:
         for statement in (
             'CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value TEXT)',
@@ -331,10 +328,11 @@ def set_setting(key, value):
 
 def cfg_all():
     # 配置复用文件指纹缓存，仍逐次检测变更以保持热更新。
+    """读取文件指纹缓存中的运行配置副本；不从进程环境补业务值。"""
     return CONFIG.app_config()
 
 
-# 兼容旧 settings 配置；迁移优先级和失败行为见 import_legacy_config。
+# 仅用于旧库系统设置迁移；账号设置仍留在 SQLite。
 LEGACY_SETTING_KEYS = (
     ('base_url', 'EMOS_BASE_URL'),
     ('sign_time', 'SIGN_TIME'),
@@ -345,11 +343,10 @@ LEGACY_SETTING_KEYS = (
 
 
 def import_legacy_config():
-    """一次性把旧 SQLite settings 补进 .env 里缺失的键；老库升级用，不创建文件。
+    """一次性迁移旧 SQLite 系统设置，补 .env 尚未显式提供的键。
 
-    只写文件里没有的键，已有值（包括显式默认值和空 Token）一律不动；
-    非法旧值逐项拒绝，不拖垮启动。迁移完成即打标记，之后不再触发。
-    """
+    这是启动期的兼容写入，仍经 ConfigStore.update() 校验和原子保存；
+    非法旧值逐项跳过，迁移完成记录标记，既有默认值和空 Token 不覆盖。"""
     state = {'imported': [], 'untouched': [], 'rejected': []}
     if get_setting('legacy_config_imported') == '1':
         return state
@@ -379,6 +376,7 @@ _web_service_lock = threading.Lock()
 
 
 def personal_web():
+    """延迟创建个人网页服务；HTTP 监听仍由应用持有，SQLite 连接经共享池借用。"""
     global _web_service
     with _web_service_lock:
         if _web_service is None:
@@ -388,6 +386,7 @@ def personal_web():
 
 
 class Store:
+    """适配 Bot 所需的域服务和应用回调；不另建数据库或应用进程。"""
     def __init__(self):
         self.accounts = AccountService(db, write_db, cfg_all)
 
@@ -434,10 +433,9 @@ def verify_password(pw):
 
 
 def init_password():
-    """把 .env 里的密码同步成 scrypt 校验值；密码变化时清除管理员会话。
+    """同步 .env 密码的 scrypt 校验值；变更密码时清除管理员会话。
 
-    密码由部署者在 .env 里自己填写，程序不再生成或打印明文。
-    """
+    密码由部署者填写，不生成也不打印明文。"""
     source = CONFIG.password()
     if not verify_password(source):
         with write_db() as conn:
@@ -468,6 +466,7 @@ def create_session(ip, ua):
 
 
 def session_ok(tok):
+    """按当前管理员会话期限检查数据库记录；不把个人 wsid 当管理员凭据。"""
     if not isinstance(tok, str) or not tok or len(tok) > 256:
         return False
     now = int(time.time())
@@ -493,17 +492,13 @@ def rl_blocked(ip):
 
 
 def _purge_login_failures(conn, now):
-    """回收过期锁定和超过保留窗口的零散错误；仍有效的锁定不删除。
-    """
+    """删除过期锁定和超出保留窗口的零散失败；仍有效的锁定不提前清除。"""
     conn.execute('DELETE FROM login_fail WHERE (until>0 AND until<=?) '
                  'OR (until=0 AND updated_at<=?)', (now, now - LOGIN_FAIL_TTL))
 
 
 def rl_fail(ip):
-    """记录一次认证失败；保留窗口或锁定过期后重新计数。
-
-    每 64 次失败清理过期记录；当前有效锁定不被清除。
-    """
+    """记录认证失败，过期后从一次重新计数；每 64 次失败回收旧记录。"""
     now = int(time.time())
     with _write_lock, db() as conn:
         row = conn.execute('SELECT count,until,updated_at FROM login_fail WHERE ip=?', (ip,)).fetchone()
@@ -529,6 +524,9 @@ def rl_ok(ip):
 # 通知队列
 
 def public_base(handler=None):
+    """优先采用配置公开地址，否则读取代理头和 Host。
+
+    部署需反向代理规范化这些头；本函数不证明头来自可信代理。"""
     cfg = cfg_all()
     if cfg['public_base']:
         return cfg['public_base'].rstrip('/')
@@ -570,6 +568,7 @@ def build_report(rows, started, ended):
 
 
 def _queue_result(row, cfg):
+    """根据实时订阅安排有界通知；队列满时丢弃通知而保留已落库的签到结果。"""
     global _notification_drops
     service = Store().accounts
     for user in service.watchers(row['id']):
@@ -587,6 +586,7 @@ def _queue_result(row, cfg):
 
 
 def _deliver_notification(task):
+    """发送前再核对订阅和唯一操作者；返回 False 表示已无权或无凭据发送。"""
     from bot import TG
     account_id, tg_id, preference, row = task
     current = next((user for user in Store().accounts.watchers(account_id) if user['tg_id'] == tg_id), None)
@@ -605,10 +605,7 @@ def _deliver_notification(task):
 
 
 def _request_shutdown():
-    """设置停机标记，并给通知队列送入一次唤醒。
-
-    信号处理器只设标记；这里由正常收尾路径调用，避免信号中重入队列锁。
-    """
+    """设置停机标记并投递一次通知唤醒；只在正常路径调用，避免信号重入队列锁。"""
     _shutdown.set()
     if _notification_wakeup.is_set():
         return
@@ -620,8 +617,7 @@ def _request_shutdown():
 
 
 def notification_loop():
-    """等待通知而不定时空转；None 只用于停机唤醒，任务计数始终归还。
-    """
+    """阻塞等待通知，不定时空转；每次取出都归还任务计数，停机由 None 唤醒。"""
     while not _shutdown.is_set():
         task = _notifications.get()
         try:
@@ -648,10 +644,9 @@ def _next_retry(count):
 
 
 def _store_result(account, result, cfg, trigger):
-    """在写事务中核对凭据、归属和登录代际，再写结果与有限日志。
+    """在写事务内复核账号凭据、归属和登录代际，再记录结果和有限日志。
 
-    过期快照返回 None；invalid 停用账号，未知余额不覆盖已有余额。
-    """
+    过期快照返回 None；invalid 停用账号，未知余额不覆盖旧缓存。"""
     now = now_local(cfg)
     today, stamp = now.strftime('%Y-%m-%d'), now.strftime('%Y-%m-%d %H:%M:%S')
     status = result['status']
@@ -684,11 +679,11 @@ def _store_result(account, result, cfg, trigger):
         enabled = 0 if status == 'invalid' else current['enabled']
         conn.execute('INSERT INTO logs(account_id,name,ts,status,message,carrot) VALUES(?,?,?,?,?,?)',
                      (account['id'], safe_name, stamp, status, result['message'], result.get('point')))
-        # 按账号裁剪到 LOG_KEEP 条；不让长期签到日志无限增长。
+        # 每账号只保留有限日志，避免长期签到不断扩大数据库。
         conn.execute('DELETE FROM logs WHERE account_id=? AND id <= '
                      '(SELECT id FROM logs WHERE account_id=? ORDER BY id DESC LIMIT 1 OFFSET ?)',
                      (account['id'], account['id'], LOG_KEEP))
-        # carrot 为官方缓存余额；None 不覆盖已知值，last_carrot 仅为单次所得。
+        # 未知余额不能清掉已有缓存；单次所得与总余额分别保存。
         balance = result.get('carrot')
         if balance is None:
             conn.execute('UPDATE accounts SET last_status=?,last_msg=?,last_carrot=?,last_run=?,'
@@ -711,8 +706,7 @@ def _store_result(account, result, cfg, trigger):
 
 
 def _auto_permission(owner, source_id, target_id, cfg):
-    """自动签到前的即时授权复核；主账号失效或归属改变即拒绝，不依赖启动时的快照。
-    """
+    """自动请求前复核实时 owner、主号登录和本地授权；不依赖启动时权限快照。"""
     live = cfg_all()
     if 'tg_allowed_user_ids' in live:
         if (not owner_permitted(live, owner) or source_id != target_id
@@ -741,10 +735,10 @@ def _auto_permission(owner, source_id, target_id, cfg):
 
 
 def _run_ids(cfg, account_ids, trigger='manual', actor=None, root_id=None, scopes=None, content=None):
-    """串行执行账号列表；请求前复核权限，写回时再核对账号快照。
+    """串行执行去重账号列表，请求和结果写回分别核权。
 
-    已有执行返回 None。撤销可拦截后续请求和旧结果，不能撤回已发送的 HTTP。
-    """
+    已有执行返回 None；网络不可达时同地址后续账号安排退避。
+    撤销阻止后续请求和旧结果写回，不能撤回已发送的 HTTP。"""
     if not _run_lock.acquire(blocking=False):
         return None
     rows, unavailable = [], set()
@@ -812,6 +806,9 @@ def _run_ids(cfg, account_ids, trigger='manual', actor=None, root_id=None, scope
 
 
 def run_user(tg_id, include_links=True, expected_root=None, content=None):
+    """验 owner、当前选择和明确范围后执行签到；拒收状态不接受新任务。
+
+    include_links 为历史参数名，单人模式 True 表示全部有效号，False 仅当前号。"""
     live = cfg_all()
     if 'tg_allowed_user_ids' in live and not owner_permitted(live, tg_id):
         raise DomainError('只允许配置的 TG 用户操作。')
@@ -831,10 +828,9 @@ def run_user(tg_id, include_links=True, expected_root=None, content=None):
 
 
 def _eligible(account, now, cfg, automatic):
-    """本地调度候选判据：启用、有凭据、当天未完成且退避允许。
+    """本地候选判据：账号启用、有密钥、当天未完成且退避已到时。
 
-    automatic=True 才检查自动开关和时间；网络身份和授权另行核验。
-    """
+    automatic=True 再检查开关和时间；远端身份与即时授权在执行时核验。"""
     today = now.strftime('%Y-%m-%d')
     if (not account['enabled'] or not str(account['token'] or '').strip()
             or account['last_day'] == today):
@@ -854,6 +850,9 @@ def _eligible(account, now, cfg, automatic):
 
 
 def scheduler_tick(cfg=None):
+    """只查本地库决定当天未完成范围，存在候选才调用官方接口。
+
+    单人模式无有效主号返回空列表，不使用历史共享授权扩展范围。"""
     if _draining.is_set():
         return []
     cfg = cfg or cfg_all()
@@ -894,6 +893,7 @@ def scheduler_tick(cfg=None):
 
 
 def scheduler_loop():
+    """按配置间隔检查本地候选，Event.wait 支持及时停机；不是官方接口轮询。"""
     while not _shutdown.is_set():
         try:
             scheduler_tick()
@@ -948,8 +948,7 @@ PAGE = '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name
 # HTTP 入口
 
 def _cookie_value(handler, name):
-    """读取请求中的第一个同名 Cookie；缺失返回空字符串。
-    """
+    """取第一个匹配的 Cookie；缺失返回空串，不验证 Cookie 身份。"""
     raw = handler.headers.get('Cookie') or ''
     for part in raw.split(';'):
         key, _, value = part.strip().partition('=')
@@ -968,6 +967,7 @@ def _cookie_sid(handler):
 
 
 def _update_config(body):
+    """规范化管理员保存请求并交给唯一配置存储；改密码后同步哈希和撤销会话。"""
     allowed = set(CFG_TO_ENV) | {'changes', 'revision', 'clear_secrets', 'new_password', 'clear_tg_token'}
     if not isinstance(body, dict) or set(body) - allowed:
         raise EnvConfigError('管理员请求包含未知配置项。')
@@ -989,6 +989,7 @@ def _update_config(body):
 
 
 class Handler(BaseHTTPRequestHandler):
+    """区分管理员与个人会话的 HTTP 入口；写请求先校验同源，个人写请求另验 CSRF。"""
     def _web_page(self, kind):
         nonce = secrets.token_urlsafe(18)
         self._web_nonce = nonce
@@ -1116,6 +1117,7 @@ class Handler(BaseHTTPRequestHandler):
             self._web_nonce = None
 
     def _body(self):
+        """按 Content-Length 读取最多 64 KiB 的 JSON 对象，不接受数组或超限请求。"""
         try:
             n = int(self.headers.get('Content-Length') or 0)
         except ValueError:
@@ -1133,6 +1135,9 @@ class Handler(BaseHTTPRequestHandler):
         return body
 
     def _same_origin(self):
+        """拒绝浏览器标明的跨站请求，并比较 Origin 与配置或代理公开地址。
+
+        缺 Origin 时允许非浏览器调用；认证、个人 CSRF 和代理头清洗仍各自必要。"""
         site = self.headers.get('Sec-Fetch-Site')
         if site in ('cross-site', 'same-site'):
             return False
@@ -1311,6 +1316,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def bot_supervisor():
+    """监听配置身份变化并收尾旧 Bot，才启动替换轮询线程。
+
+    没有有效 Token 或唯一 TG ID 不起 Bot；监督仍每五秒读取缓存配置。"""
     global _active_bot
     from bot import Bot
     identity, current = None, None
@@ -1360,6 +1368,7 @@ def bot_supervisor():
 
 
 class _BoundedHTTPServer(ThreadingHTTPServer):
+    """单个监听器配有限请求线程；满容量立即 503，空连接有读取超时。"""
     daemon_threads = False
     block_on_close = True
 
@@ -1420,12 +1429,10 @@ _PROBE_BOOTSTRAP = "import os,sys\npath,mark,entry=sys.argv[1:4]\nwith open(path
 
 
 def _probe_core(image, entry, module_dir=None):
-    """在临时子进程执行候选初始化，验证数据库迁移、监听与核心线程创建。
+    """在临时子进程执行候选的完整初始化，只触及配置和 SQLite 副本。
 
-    配置和 SQLite 都使用副本；业务线程停在门闩，不进入 Bot、调度或通知。
-    候选沿用当前端口时改绑临时端口，真实切换仍要重新绑定目标端口。
-    失败抛配置错误；不返回镜像，也不是任意候选代码的安全沙箱。
-    """
+    线程停在门闩，不发真实业务请求；同端口改绑临时端口，切换仍需重新 bind。
+    失败拒绝更新且保留旧核心；候选代码是受信任部署内容，不是执行沙箱。"""
     import shutil
     import subprocess
     import tempfile
@@ -1439,7 +1446,7 @@ def _probe_core(image, entry, module_dir=None):
         with open(env_copy, 'wb') as handle:
             handle.write(raw)
         os.chmod(env_copy, 0o600)
-        # 预检用真实 SQLite 的一致性副本，不迁移生产数据。
+        # 候选迁移只操作 SQLite backup 副本，避免预检污染旧核心。
         candidate = ConfigStore(env_copy)
         candidate_cfg = candidate.app_config()
         selected = Path(candidate_cfg['data_dir']).expanduser()
@@ -1463,7 +1470,7 @@ def _probe_core(image, entry, module_dir=None):
         environment = dict(os.environ, EMOS_ENV_FILE=env_copy, PYTHONDONTWRITEBYTECODE='1',
                            EMOS_STARTUP_PROBE='1')
         environment.pop('EMOS_UPDATE_ACTIVE', None)
-        # 自己仍占有的端口只能在同地址的临时端口验证；新端口实际试绑定。
+        # 当前端口仍被旧核心占用，用临时端口预检；新端口则真实试绑定。
         environment['EMOS_PROBE_REUSE_BIND'] = '1' if (
             _HTTP_SERVER is not None and candidate_cfg['port'] == _HTTP_SERVER.server_port) else '0'
         # 隔离调用方的导入路径；仅分模块入口需要显式提供同目录依赖。
@@ -1492,11 +1499,10 @@ def _probe_core(image, entry, module_dir=None):
 
 
 def _prepare_core():
-    """固定候选字节并完成语法及隔离启动预检，返回游标为零的临时镜像。
+    """固定上传源码并完成语法和隔离启动预检，返回游标为零的临时镜像。
 
-    只有入口本身缺失时尝试恢复成功快照，并要求再次重启；依赖缺失不覆盖入口。
-    异常关闭镜像。接受后再删或重传入口不改变本次使用的字节。
-    """
+    入口缺失可恢复可信成功快照并要求再次重启；坏上传不自动覆盖。
+    接受后再删或重传文件不会改变本次镜像，失败立即关闭临时句柄。"""
     import ast
     import tempfile
     entry = os.path.abspath(__file__)
@@ -1548,13 +1554,11 @@ def _prepare_core():
 
 
 def _restore_last_good(entry):
-    """只恢复缺失入口；快照定位与排他写入由 updates 统一维护。
-    """
+    """仅恢复缺失入口；可信快照和排他发布由 updates 维护。"""
     return restore_missing_entry(entry, str(CONFIG.path))
 
 def _exec_core(image=None):
-    """切换已验证字节；启动失败时由更新事务恢复旧代码、配置和数据库。
-    """
+    """消费已预检镜像并同 PID 切换；候选未就绪失败由事务恢复代码、配置和数据库。"""
     image = image or _prepare_core()
     cfg = CONFIG.app_config()
     selected = Path(cfg['data_dir']).expanduser()
@@ -1564,10 +1568,9 @@ def _exec_core(image=None):
 
 
 def _drain_core(timeout=0):
-    """开始拒收新业务，检查队列、请求、连接和网络任务是否都已归还。
+    """即时检查网页、Bot、通知、HTTP 与数据库是否收完；不在此等待。
 
-    这是一次即时判定，不等待；main 负责重试和截止时间。
-    """
+    main 负责重试和截止时间，只有就绪的排空状态才允许 exec。"""
     if _web_service is not None:
         _web_service.begin_drain()
         with _web_service.lock:
@@ -1595,12 +1598,14 @@ def _drain_core(timeout=0):
 
 
 def _gated_core_task(task):
+    """等待应用就绪门闩，停机后不进入真实业务循环。"""
     _CORE_START_GATE.wait()
     if not _shutdown.is_set():
         task()
 
 
 def _start_core_threads():
+    """只创建缺失的核心线程；复用仍存活线程，不为重复检查增加线程。"""
     tasks = (('emos-scheduler', scheduler_loop), ('emos-supervisor', bot_supervisor),
              ('emos-notifications', notification_loop))
     existing = {thread.name: thread for thread in _CORE_THREADS}
@@ -1614,6 +1619,7 @@ def _start_core_threads():
 
 
 def _resume_core():
+    """取消更新后重新放行连接、业务和队列；只补建已经退出的核心线程。"""
     _seal_db_pool(False)
     _shutdown.clear()
     _notification_wakeup.clear()
@@ -1629,10 +1635,7 @@ def _resume_core():
 
 
 def _stop_core(timeout):
-    """通知核心退出并等待线程、连接收尾；返回是否允许安全 exec。
-
-    没有收完返回 False，调用方取消更新并恢复旧核心。
-    """
+    """请求线程和连接收尾，返回是否允许安全 exec；超时不能当作已结束。"""
     deadline = time.monotonic() + max(0, timeout)
     _request_shutdown()
     _CORE_START_GATE.set()
@@ -1654,8 +1657,7 @@ def _stop_core(timeout):
 
 
 def _cancel_restart(message, status='failed'):
-    """拒绝重启时统一回滚状态，避免界面显示"正在重启"但实际没动。
-    """
+    """释放未使用镜像并清更新标记，恢复旧核心，保留可见失败状态。"""
     global _restart_status, _restart_error, _restart_image
     _restart_status, _restart_error = status, message
     if _restart_image is not None:
@@ -1670,10 +1672,10 @@ _restart_image = None
 
 
 def main():
-    """初始化持久化、监听和核心线程；就绪提交后才释放业务门闩。
+    """初始化数据库、监听和核心线程；提交就绪后才放行真实业务。
 
-    预检模式在就绪点返回；正常模式处理停机与同 PID 更新，finally 收尾自己创建的资源。
-    """
+    预检在就绪前返回并收尾；正常模式在主线程管理拒收、排空和同 PID 更新。
+    finally 只关闭本应用持有的监听、网页 worker 和空闲连接。"""
     global _HTTP_SERVER, _restart_status, _restart_error
     _CORE_START_GATE.clear()
     _HTTP_SERVER = None
@@ -1713,7 +1715,7 @@ def main():
             raise EnvConfigError('核心线程未成功启动。')
         if _STARTUP_PROBE:
             return
-        # 真配置/数据初始化、监听和线程创建均成功；之后才允许调度和 TG 请求。
+        # 提交成功快照后放行业务，失败候选不能提前发送签到或 Telegram 请求。
         mark_ready(os.path.abspath(__file__), str(CONFIG.path))
         _CORE_START_GATE.set()
         while not _shutdown.is_set():

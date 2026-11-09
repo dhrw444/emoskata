@@ -1,8 +1,7 @@
 """SQLite 物理连接容量、等待超时、租约归还与关闭失败回归。
 
-夹具只使用临时或演练数据；本地通过不代表真实官方授权。
-Test: python3 -B -m unittest test_database_pool。
-"""
+仅用隔离目录、合成身份或 localhost；正式授权和真实生产资源不在此验收。
+Test: python3 -B -m unittest test_database_pool"""
 import sqlite3
 import tempfile
 import threading

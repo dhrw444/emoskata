@@ -1,9 +1,9 @@
 """安装脚本不创建配置、不覆盖已有文件，以及 shell、真实网页脚本语法回归。
 
-夹具只使用临时目录与模板；本地通过不代表真实官方授权。
-Test: python3 -B -m unittest test_installer。
-"""
+仅用隔离目录、合成身份或 localhost；正式授权和真实生产资源不在此验收。
+Test: python3 -B -m unittest test_installer"""
 from pathlib import Path
+import os
 import shutil
 import subprocess
 import tempfile
@@ -78,15 +78,22 @@ class InstallerTests(unittest.TestCase):
             for name in ('emoskata.py', 'install.sh', '.env.example'):
                 shutil.copyfile(ROOT / name, root / name)
             target = root / 'opt'
+            binaries = root / 'bin'
+            binaries.mkdir()
+            for name in ('sh', 'python3', 'mkdir', 'cp', 'chmod', 'dirname'):
+                binary = shutil.which(name)
+                self.assertIsNotNone(binary, name)
+                (binaries / name).symlink_to(binary)
+            environment = dict(os.environ, PATH=str(binaries))
             result = subprocess.run(['sh', str(root / 'install.sh'), str(target)], cwd=root,
-                                    text=True, capture_output=True, timeout=60)
+                                    env=environment, text=True, capture_output=True, timeout=60)
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse((target / '.env').exists())
             self.assertTrue((target / '.env.example').is_file())
             config_path = fill_env(target / '.env')
             before = config_path.read_bytes()
             result = subprocess.run(['sh', str(root / 'install.sh'), str(target)], cwd=root,
-                                    text=True, capture_output=True, timeout=60)
+                                    env=environment, text=True, capture_output=True, timeout=60)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(config_path.read_bytes(), before)
             self.assertEqual(config_path.stat().st_mode & 0o777, 0o600)

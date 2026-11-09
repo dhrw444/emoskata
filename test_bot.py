@@ -1,11 +1,10 @@
 """Bot 路由、消息失败、任务队列、菜单和替身签名回归。
 
-夹具只使用临时或演练数据；本地通过不代表真实官方授权。
-Test: python3 -B -m unittest test_bot。
-"""
+仅用隔离目录、合成身份或 localhost；正式授权和真实生产资源不在此验收。
+Test: python3 -B -m unittest test_bot"""
 
 from collections import deque
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 import copy
 import io
 import json
@@ -335,11 +334,11 @@ class FakeStore:
         self.run_contents = []
         self.run_hook = None
         self.write_failure = False
-        with sqlite3.connect(self.path) as conn:
+        with closing(sqlite3.connect(self.path)) as conn, conn:
             conn.execute("CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT)")
 
     def cfg_all(self):
-        with self.lock, sqlite3.connect(self.path) as conn:
+        with self.lock, closing(sqlite3.connect(self.path)) as conn, conn:
             result = dict(self.config)
             result.update(conn.execute("SELECT key,value FROM settings"))
             return result
@@ -347,7 +346,7 @@ class FakeStore:
     def set_setting(self, key, value):
         if self.write_failure:
             raise OSError("test checkpoint unavailable")
-        with self.lock, sqlite3.connect(self.path) as conn:
+        with self.lock, closing(sqlite3.connect(self.path)) as conn, conn:
             conn.execute("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
 
     def run_user(self, tg_id, include_links=True, expected_root=None, content=None):

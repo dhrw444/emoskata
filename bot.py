@@ -1,8 +1,8 @@
-"""TG 私聊路由、首号官方授权、独立 Token 添加和有界任务。
+"""Telegram 入口：官方首登、独立 Token、菜单和有界任务。
 
-每次操作核对白名单；单号与全部签到显式分开，输入和退出确认有期限。
-Test: python3 -B -m unittest test_bot test_owner_bot test_multi_accounts。
-"""
+仅处理唯一操作者的私聊；接收、排队执行和网络结果落库分别核验权限。
+长轮询和 worker 属于当前应用进程，不承担后台常驻或自动进程重启。
+Test: python3 -B -m unittest test_bot test_owner_bot test_multi_accounts"""
 
 import base64
 from collections import OrderedDict, deque
@@ -29,15 +29,13 @@ _SECRET = re.compile(
 
 
 def _allowed_users(cfg):
-    """返回配置的唯一 TG ID；缺失、空值和无效配置均无可用操作者。
-    """
+    """解析配置操作者集合；非法值保留拒绝态，不转换为不限用户。"""
     owner = configured_owner(cfg)
     return {owner} if _positive(owner) else set()
 
 
 def allowed_actor(tg_id, cfg):
-    """仅允许配置的唯一正整数 TG ID，不兼容空白或多人白名单。
-    """
+    """按实时配置核对正整数 TG 身份；空配置没有任何获准操作者。"""
     return (_positive(tg_id) and bool(_allowed_users(cfg))
             and owner_permitted(cfg, tg_id))
 
@@ -83,8 +81,7 @@ def _page(value):
 
 
 def _html_pages(text, limit=HTML_LIMIT):
-    """按 UTF-16 长度分页，并在分页边界闭合和恢复受支持的 HTML 标签。
-    """
+    """按可发送长度分割 HTML 文本，保留标签闭合；不把标签长度当可见文字长度。"""
     stack, parts, pages = [], [], []
     size = 0
     for match in re.finditer(r"</?(?:b|i|code|pre|u|s)>|&(?:#\d+|#x[0-9a-fA-F]+|[A-Za-z]+);|.",
@@ -114,8 +111,7 @@ def _html_pages(text, limit=HTML_LIMIT):
 
 
 class TgError(Exception):
-    """Telegram 调用失败的公共错误容器；默认文案不含请求 URL 或响应正文。
-    """
+    """脱敏 Telegram 请求错误；保留重试时间等控制字段，不公开请求 Token 或响应体。"""
     def __init__(self, message="Telegram 请求失败，请稍后再试。", code=None,
                  retry_after=0, not_modified=False):
         super().__init__(message)
@@ -125,6 +121,7 @@ class TgError(Exception):
 
 
 class TG:
+    """标准库 Telegram 客户端；响应读取有上限，使用 urllib 默认重定向行为。"""
     METHODS = {"getMe", "getUpdates", "sendMessage", "editMessageText",
                "answerCallbackQuery", "deleteMessage", "setMyCommands", "getMyCommands",
                "setChatMenuButton", "getChatMenuButton", "getWebhookInfo"}
@@ -141,6 +138,7 @@ class TG:
         return bool(self.token)
 
     def _api(self, method, payload=None, timeout=POLL_TIMEOUT + 15):
+        """发送一次 Bot API 请求并核验 JSON，输出脱敏错误；不自动重放未知结果的请求。"""
         if not self.token or method not in self.METHODS:
             raise TgError("Telegram 未配置或请求方法无效。")
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
@@ -177,8 +175,7 @@ class TG:
         return result
 
     def send(self, chat_id, text, keyboard=None):
-        """按 HTML 分页发送；失败抛 TgError，前面已发出的页不会撤回。
-        """
+        """分段发送正文，只有末段带键盘；失败不重新执行已触发的账号业务。"""
         pages = _html_pages(text)
         result = None
         for index, page in enumerate(pages):
@@ -190,6 +187,7 @@ class TG:
         return result
 
     def edit(self, chat_id, msg_id, text, keyboard=None):
+        """编辑现有消息，过长内容先编辑首段再发送余段；退回发送不重做业务。"""
         pages = _html_pages(text)
         payload = {"chat_id": chat_id, "message_id": msg_id, "text": pages[0],
                    "parse_mode": "HTML", "disable_web_page_preview": True,
@@ -219,9 +217,7 @@ class TG:
 
 
 class _Jobs:
-    """首次入队才启动固定数量 worker，待办与运行中任务合计受 capacity 限制。
-
-    """
+    """按键去重的容量队列；待办与执行中一起计数，首次提交才创建 worker。"""
     def __init__(self, workers, capacity, synchronous=False):
         self.workers = max(1, int(workers))
         self.capacity = max(self.workers, int(capacity))
@@ -234,10 +230,7 @@ class _Jobs:
         self.accepting = True
 
     def submit(self, key, function, priority=False):
-        """按调用方提供的 key 抑制重复待办；False 表示重复、满容量或拒收。
-
-        去重不等于非幂等操作的恰好一次执行。
-        """
+        """拒收、重复键或满容量返回 False；成功占用名额直到任务 finally 释放。"""
         key = object() if key is None else key
         with self.condition:
             if self.closed or not self.accepting or key in self.keys or len(self.keys) >= self.capacity:
@@ -257,6 +250,7 @@ class _Jobs:
         return True
 
     def _execute(self, key, function):
+        """执行任务，捕获并脱敏普通异常，finally 始终归还容量。"""
         try:
             function()
         except Exception:
@@ -283,6 +277,7 @@ class _Jobs:
             self.accepting = False
 
     def stop(self, discard=True):
+        """停止接收；discard=True 清空待办，不强杀正在执行的 Python 任务。"""
         with self.condition:
             self.closed = True
             self.accepting = False
@@ -300,6 +295,7 @@ class _Jobs:
             self.condition.notify_all()
 
     def join(self, timeout=None):
+        """等待已占容量的任务完成；不 join 线程，超时返回 False。"""
         deadline = None if timeout is None else time.monotonic() + max(0, timeout)
         with self.condition:
             while self.keys:
@@ -368,12 +364,12 @@ COMMANDS = (
 
 
 def command_menu():
-    """Telegram BotCommand：名称无斜杠，仅小写字母、数字、下划线。
-    """
+    """从同一命令清单生成 Telegram 菜单，菜单可见性不等于操作授权。"""
     return [{"command": name, "description": description} for name, description in COMMANDS]
 
 
 class Bot:
+    """管理一个 Token 身份的长轮询和任务队列；配置替换前先收尾旧身份。"""
     REQUIRED_METHODS = ("ensure_user", "user", "primary_account", "begin_login", "login_pending", "cancel_login",
                         "finish_login", "login_with_token", "owned", "active", "switch", "set_account",
                         "set_preferences", "issue_code", "redeem", "links", "toggle_link",
@@ -415,8 +411,7 @@ class Bot:
         return not self.stop_event.is_set()
 
     def begin_drain(self):
-        """停止接收后续更新并暂停新业务入队；不在本函数等待任务结束。
-        """
+        """拒收新动作并停止轮询，已执行动作由守卫和队列收尾，不立即杀线程。"""
         self.drain_event.set()
         self._jobs.pause()
 
@@ -475,6 +470,9 @@ class Bot:
         return self.me["username"]
 
     def run(self):
+        """验证身份后长轮询，持久 offset 成功才接收对应动作。
+
+        快速空返回或失败会退避；消息重发与 offset 不是业务恰好一次提交保证。"""
         if not self.tg.enabled() or not self._run_lock.acquire(blocking=False):
             return
         self._poll_thread = threading.current_thread()
@@ -521,7 +519,7 @@ class Bot:
                         self._handle(update)
                     delay = self.retry_base
                     if not updates:
-                        # 空轮询连续提前返回时退避，避免代理或本地 API 把长轮询退化为忙循环。
+                        # 代理快速空返回不能退化成无限忙轮询。
                         empty_runs += 1
                         if empty_runs > 3:
                             self.stop_event.wait(min(3.0, 0.2 * empty_runs))
@@ -546,10 +544,9 @@ class Bot:
         return self._control.submit(None, guarded, priority)
 
     def _handle(self, update):
-        """先持久化 offset，再校验和安排更新；恢复时不会重放已确认的 update。
+        """先验证私聊操作者再处理回传或输入，入队前冻结当前选择和登录代际。
 
-        offset 与业务提交并非同一事务，确认后崩溃可能丢掉尚未完成的动作。
-        """
+        密钥消息尽力删除；删除失败不把消息内容记入运行日志。"""
         if self.stop_event.is_set() or self.drain_event.is_set() or not isinstance(update, dict):
             return
         uid = update.get("update_id")
@@ -601,14 +598,14 @@ class Bot:
         data = callback.get("data", "") if callback else None
         if callback and (not isinstance(data, str) or len(data.encode("utf-8")) > 64):
             return
-        # 入队前冻结数据库选择，避免 worker 等待期间切换账号后签错目标。
+        # 先冻结到达时选择，worker 延迟执行不能签到后来切换的账号。
         user_at_arrival = self.accounts.user(tg_id) or {}
         root_at_arrival = user_at_arrival.get("active_account_id") or 0
         login_at_arrival = user_at_arrival.get("login_until", 0)
         login_revision = user_at_arrival.get('login_revision', 0)
         with self._state_lock:
             input_at_arrival = self._guided.get(tg_id)
-        # 只有已验权的消息进入密钥处理；所有回传和 token 待填都尽力删除。
+        # 密钥处理在验权之后；尽力删原消息，失败不记录密钥正文。
         sensitive_input = (not callback and not text.startswith('/') and (
             bool(input_at_arrival and input_at_arrival[0] in {'token', 'link'})
             or user_at_arrival.get('input_kind') in {'token', 'link'}))
@@ -693,8 +690,7 @@ class Bot:
             self._logout_confirmations.pop(tg_id, None)
 
     def _show_logout(self, tg_id, chat_id, expected, all_accounts=False, msg_id=None):
-        """发退出确认；记下登录版本与时限，账号被重新登录后旧确认自动失效。
-        """
+        """生成绑定范围、选择和登录代际的短期确认；这里只展示，不清 Token。"""
         if not allowed_actor(tg_id, self.store.cfg_all()):
             raise DomainError('只允许配置的 TG 用户操作。')
         account = self._selection(tg_id, expected)
@@ -718,8 +714,7 @@ class Bot:
                            msg_id)
 
     def _confirm_logout(self, tg_id, chat_id, expected, scope, nonce, msg_id=None):
-        """核对 nonce、登录版本和时限后执行退出；只撤销凭证，保留账号与日志。
-        """
+        """核对并一次性消费退出确认，再调用账号域清除本地凭据。"""
         self._selection(tg_id, expected)
         with self._state_lock:
             pending = self._logout_confirmations.get(tg_id)
@@ -750,10 +745,7 @@ class Bot:
         return self._reply(chat_id, view[0], view[1], msg_id)
 
     def _show_login(self, tg_id, chat_id, msg_id=None, expected=None, official_id=None):
-        """优先使用已登记主号 ID，否则读取 EMOS_USER_ID；显式参数只作本次覆盖。
-
-        固定选择后登记待授权请求并返回官方 Bot 链接，不在聊天中索要缺失配置。
-        """
+        """从 .env 取得官方账号 ID 并生成官方 Bot 授权入口；不在聊天里再索要 ID。"""
         if not allowed_actor(tg_id, self.store.cfg_all()):
             raise DomainError('只允许配置的 TG 用户操作。')
         account = self._active(tg_id)
@@ -803,6 +795,7 @@ class Bot:
                             [{'text': '取消授权', 'callback_data': 'cancel'}]], msg_id)
 
     def _show_web(self, tg_id, chat_id, expected):
+        """只给获准且主号有效的操作者签发一次性个人网页入口。"""
         self._root(tg_id, expected)
         opener = getattr(self.store, 'web_login', None)
         if not callable(opener):
@@ -838,6 +831,7 @@ class Bot:
         return rows[page * PAGE_SIZE:(page + 1) * PAGE_SIZE], page, last, nav
 
     def _view_accounts(self, tg_id, page=0):
+        """按账号域可见范围分页，分别展示可用余额和最近单次所得，不输出 Token。"""
         rows = self.accounts.owned(tg_id)
         active = self._active(tg_id)
         root = active["id"] if active else 0
@@ -962,7 +956,7 @@ class Bot:
         expires = int(issued["expires_at"])
         ttl = min(600, max(0, expires - int(time.time())))
         payload = self._association_payload(target, code)
-        # 关联码只回复给私聊中的签发人，不写入他人的账号视图。
+        # 关联码仅在历史模式私聊回复，不进入其他账号视图。
         text = ("<b>🔑 当前账号的一次性代签授权</b>\n\n目标官方 ID：<code>%s</code>\n"
                 "一次性码：<code>%s</code>\n剩余最多 %d 秒（不超过 10 分钟），只能使用一次。\n"
                 "重新生成会替换旧码。仅把本条交给你同意的代签方。\n\n"
@@ -998,10 +992,7 @@ class Bot:
                     [[{"text": "取消输入", "callback_data": "cancel"}]], msg_id)
 
     def _guide_token(self, tg_id, chat_id, msg_id=None):
-        """要求主号有效，固定当前选择并登记有期限的 Token 输入。
-
-        远端其他账号的 TG 绑定不参与添加判定；重启不恢复内存中的输入上下文。
-        """
+        """主号有效后开启 Token 待填状态，只引导读取本人账号的官方密钥。"""
         self._require_primary(tg_id)
         account = self._root(tg_id)
         self.accounts.cancel_login(tg_id)
@@ -1014,10 +1005,9 @@ class Bot:
                            [[{'text': '取消', 'callback_data': 'cancel'}]], msg_id)
 
     def _add_by_token(self, tg_id, chat_id, token, expected):
-        """先核验 Token 的官方资料，再在写事务复验操作者、选择和登录代际。
+        """向官方核验独立 Token，写回前重验操作者、当前根和登录代际。
 
-        不回显凭据；域事务保留主号证明，不把独立账号变为新主号。
-        """
+        额外号无需相同 TG 绑定，不能用本路径替换官方主号证明。"""
         self._require_primary(tg_id)
         self._selection(tg_id, expected)
         if not isinstance(token, str) or not re.fullmatch(r'[A-Za-z0-9_-]{8,256}', token):
@@ -1080,8 +1070,7 @@ class Bot:
         return self._time(tg_id, chat_id, expected, text)
 
     def _finish_login(self, tg_id, chat_id, token, expected, login_until, login_revision):
-        """处理官方回传 token；核对请求未过期、登录版本未变，再验官方身份落库。
-        """
+        """向官方核验回传 Token，再在账号域事务消费匹配的首登请求。"""
         self._selection(tg_id, expected)
         user = self.accounts.user(tg_id) or {}
         requested_id = user.get('login_emos_id')
@@ -1136,8 +1125,7 @@ class Bot:
                     (_esc(account.get("name")), _esc(account.get("emos_id"))), menu_kb(account))
 
     def _run_and_report(self, tg_id, chat_id, expected, content=None, all_accounts=False):
-        """按明确范围签到并汇报；默认只签当前账号，提示后再次复核选择。
-        """
+        """按明确当前或全部范围执行并返回脱敏报告；返回前重新查询可见账号。"""
         root = self._root(tg_id, expected)
         if not _flag(root.get("enabled")) or root.get("last_status") == "invalid":
             raise DomainError("当前账号已失效，请重新登录。")
@@ -1164,7 +1152,7 @@ class Bot:
         if self.stop_event.is_set():
             return
         self._root(tg_id, expected)
-        # 返回结果前复核当前 owner 的可见账号，配置变化不继续展示旧结果。
+        # 等待官方响应期间权限可能变化，展示前再查可见范围。
         visible = {account["id"] for account in self.accounts.visible(tg_id)}
         rows = [row for row in rows if isinstance(row, dict) and row.get('id') in visible
                 and (all_accounts or row.get('id') == expected)]
@@ -1186,8 +1174,7 @@ class Bot:
 
     def _on_command(self, tg_id, chat_id, text, expected, login_until=0, input_state=None,
                     login_revision=0):
-        """解析斜杠命令并分发；expected/login_until 来自落库状态，不信任消息本身。
-        """
+        """分派已验权并绑定到达时选择的命令；未识别输入不当作任意账号操作。"""
         if not allowed_actor(tg_id, self.store.cfg_all()):
             raise DomainError("只允许配置的 TG 用户操作。")
         if not text.startswith("/"):
@@ -1293,8 +1280,7 @@ class Bot:
             return self._show(chat_id, self._view_logs(tg_id))
 
     def _on_callback(self, tg_id, chat_id, msg_id, data, arrival_root):
-        """处理按钮回调；arrival_root 是点击时选中的账号，与当前不符即拒绝。
-        """
+        """核对按钮载荷和到达时当前根后分派；旧按钮不能修改新选择。"""
         if not allowed_actor(tg_id, self.store.cfg_all()):
             raise DomainError("只允许配置的 TG 用户操作。")
         if not isinstance(data, str) or not 1 <= len(data.encode('utf-8')) <= 64:
@@ -1438,8 +1424,7 @@ class Bot:
 
 
 def start(token, store, **options):
-    """启动 Bot 轮询线程，返回可 stop/join 的实例；由 app 管理生命周期。
-    """
+    """创建并启动当前进程内的轮询线程；调用方负责持有实例并按期限 join。"""
     if not (token or "").strip():
         return None
     bot = Bot(token, store, **options)

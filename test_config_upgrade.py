@@ -1,9 +1,7 @@
-"""配置只读加载、缺项补内存、网页保存与旧库迁移的回归。
+"""回归部署配置读取、内存补项、原子保存与旧库迁移。
 
-程序不创建 .env：缺文件必须报错且不落盘；缺键只补进内存，文件字节不变；
-只有网页保存（update）才写回文件。夹具只使用临时目录。
-Test: python3 -B -m unittest test_config_upgrade
-"""
+仅用隔离目录、合成身份或 localhost；正式授权和真实生产资源不在此验收。
+Test: python3 -B -m unittest test_config_upgrade"""
 import json
 from pathlib import Path
 import tempfile

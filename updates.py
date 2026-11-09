@@ -1,8 +1,8 @@
-"""同 PID 更新事务、成功源码快照和启动失败恢复。
+"""同 PID 更新事务与成功源码快照。
 
-配置导入前恢复 pending，再固定源码；就绪后提交，不运行常驻 watchdog。
-Runtime: Python 3.10+ / 标准库；由生成入口与 app 调用。
-"""
+pending 在配置导入前由干净解释器恢复；候选真正就绪后提交。
+只临时执行预检和 exec 引导，不创建常驻 watchdog；任意部署代码不是沙箱。
+Runtime: Python 3.10+ / POSIX 标准库。"""
 
 # 公共实现同时内嵌进 -c bootstrap；恢复绝不导入磁盘上的 updates.py。
 _COMMON_SOURCE = r'''
@@ -53,6 +53,7 @@ def _locations(entry, config):
 
 
 def _private(path, directory=False):
+    """校验事务副本的属主、类型和精确私有权限，不跟随符号链接。"""
     info = os.lstat(path)
     correct_type = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
     if (not correct_type or info.st_uid != os.geteuid() or
@@ -87,6 +88,7 @@ def _sync_directory(path):
 
 
 def _atomic_bytes(path, value):
+    """同目录写入并刷盘，再原子替换和同步目录；替换后 fsync 失败不能当没发布。"""
     _regular_if_present(path)
     parent = os.path.dirname(path)
     descriptor, temporary = tempfile.mkstemp(prefix='.update-write-', dir=parent)
@@ -145,6 +147,9 @@ def _valid_absolute(path):
 
 
 def _validate_state(state, entry, config, state_path):
+    """先验证事务身份、目录同源和路径冲突，再允许恢复指定目标。
+
+    pending 要求完整私有副本；无法确认的事务拒绝恢复，不猜路径。"""
     required = {'version', 'status', 'nonce', 'entry', 'config_path', 'state_path',
                 'last_good', 'stage', 'source_copy', 'config', 'databases'}
     expected_state, expected_good = _locations(entry, config)
@@ -203,6 +208,7 @@ def _validate_state(state, entry, config, state_path):
 
 
 def _load_state(entry, config, state_path):
+    """有限读取并拒绝重复 JSON 键；任何无效记录停止恢复而不是跳过。"""
     try:
         _private(state_path)
     except FileNotFoundError:
@@ -234,10 +240,9 @@ def _cleanup_quiet(state):
 
 
 def _snapshot_db(path, copy, timeout=30):
-    """用 SQLite backup 复制包含已提交 WAL 的一致数据；目标须不存在。
+    """以 SQLite backup 复制已提交数据，包括仍在 WAL 的事务。
 
-    进度回调控制等待预算；任何异常都关闭已创建的源和副本连接。
-    """
+    目标必须不存在，进度回调限定等待时间；所有异常路径关闭源和副本连接。"""
     descriptor = os.open(copy, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     os.close(descriptor)
     original = backup = None
@@ -272,6 +277,9 @@ def _restore_absent(path, stage, name):
 
 def _restore_transaction(state):
     # 只由 exec 后的干净 Python 调用：候选的线程和 SQLite 连接已经消失。
+    """只在干净 exec 解释器恢复源码、原配置和数据库快照。
+
+    SQLite 备份保证逻辑内容一致，不承诺恢复后数据库页布局逐字节相同。"""
     old_image = _read_image(state['source_copy'])
     _atomic_bytes(state['entry'], old_image)
     _atomic_bytes(state['last_good'], old_image)
@@ -436,11 +444,9 @@ _READY_ENTRIES = set()
 
 
 def recover_entry(entry):
-    """在任何配置导入和线程启动前调用；pending 恢复先 exec 清理旧句柄。
+    """启动前核对事务；无 pending 返回 False，未完成事务同 PID exec 恢复器。
 
-    无事务/当前 active nonce 返回 False；committed/rolledback 只清临时目录。
-    普通启动发现 pending 时不返回：同 PID exec 恢复器并执行 last-good。
-    """
+    当前 active nonce 的候选不重入恢复；其他 pending 必须先恢复旧代码和数据。"""
     try:
         entry = _absolute(entry)
         config = _config_for(entry)
@@ -466,10 +472,9 @@ def recover_entry(entry):
 
 
 def capture_image(entry, source=None):
-    """固定正在启动的源码 bytes；显式 source 优先，已捕获且无 source 不读磁盘。
+    """固定正在启动的源码 bytes，显式内存镜像优先。
 
-    普通首次启动读入口最多 2 MiB + 1 字节，不自动运行 main 或 mark_ready。
-    """
+    同入口已捕获且无新 source 不再读磁盘；最多 2 MiB，不自行启动应用。"""
     try:
         entry = _absolute(entry)
         if source is None and entry in _IMAGES:
@@ -487,8 +492,9 @@ def capture_image(entry, source=None):
 
 
 def mark_ready(entry, config_path):
-    """仅在实际初始化、bind 和核心线程启动成功后原子提交当前内存源码。
-    """
+    """初始化、监听和核心线程成功后持久提交当前源码。
+
+    先更新成功快照和事务状态再调用就绪 hook；相同快照不重复写盘。"""
     try:
         entry, config = _absolute(entry), _absolute(config_path)
         if entry not in _IMAGES:
@@ -526,11 +532,10 @@ def mark_ready(entry, config_path):
 
 
 def exec_update(image, entry, config_path, db_paths):
-    """消费可信候选 TemporaryFile，在当前 PID 启动候选；成功调用不返回。
+    """主线程消费可信临时镜像，在原 PID 启动候选；正常切换不返回。
 
-    调用方必须主线程排空任务并关闭数据库连接。失败抛泛型 OSError/RuntimeError，
-    删除本次 pending/stage，不回写当前源码、配置或数据库，候选句柄始终关闭。
-    """
+    调用方先排空并关闭连接；源码、原始配置和包含 WAL 的数据库备份形成 pending。
+    准备失败清理本次事务和句柄，不把旧数据恢复覆盖到尚未切换的应用。"""
     state = None
     prepared = None
     published = False
@@ -653,6 +658,7 @@ def exec_update(image, entry, config_path, db_paths):
 
 def _copy_config_raw(source, destination):
     # 旧配置可能由现有应用以宽权限写出；只限制新备份为 0600，不改旧配置。
+    """按原字节备份现有配置；收紧备份权限，不标准化或修改部署者原文件。"""
     _regular_if_present(source)
     with open(source, 'rb') as handle:
         raw = handle.read()
@@ -660,10 +666,9 @@ def _copy_config_raw(source, destination):
 
 
 def restore_missing_entry(entry, config_path):
-    """只在入口缺失时恢复成功快照；并发出现的上传文件不会被覆盖。
+    """仅为缺失入口排他发布可信成功快照，上传并发完成则不覆盖。
 
-    快照与事务都位于配置目录。返回恢复路径；无可信快照或读写失败返回 None。
-    """
+    快照位于配置目录；失败返回 None，语法坏文件不属于自动恢复对象。"""
     temporary = None
     try:
         entry, config = _absolute(entry), _absolute(config_path)
