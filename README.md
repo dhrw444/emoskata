@@ -2,19 +2,21 @@
 
 **专用 TG Bot：首个账号官方授权，后续 emos Token 添加，全部账号统一签到。**
 
-Python 3.10+，零第三方 Python 依赖。可以上传生成的 `emoskata.py`，也可以上传分模块源码并启动 `app.py`。调度、Bot 和网页服务在一个应用进程内运行；重启预检会临时创建子进程。
+Python 3.10+，零第三方 Python 依赖（仓库里的 `requirements.txt` 是空的，只为满足托管平台的检查）。可以上传生成的 `emoskata.py`，也可以上传分模块源码并启动 `app.py`。调度、Bot 和网页服务在一个应用进程内运行；重启预检会临时创建子进程。
 
 > 当前版本已按单人方案接通 Token 引导、全部账号操作、余额展示和个人网页权限。历史跨 TG 共享数据保留但入口关闭。更新先隔离初始化预检；就绪前启动失败由事务恢复旧代码、配置和数据库；见 [验证记录](VALIDATION.md) 和 [维护地图](MAINTENANCE.md)。
 
 ## 配置：只有 `.env` 一个运行来源
 
-运行配置写在 `.env`（默认入口文件同目录）。**只在首次创建文件时**继承显式提供的同名进程环境变量；之后以 `.env` 为准。`EMOS_ENV_FILE` 只选择配置路径，不充当第二套业务配置。
+运行配置写在 `.env`（默认入口文件同目录）。**程序只读，不创建也不自动改写它**：`.env` 由你复制仓库里的 [`.env.example`](.env.example) 填好后与程序一起上传，权限设 `0600`。`EMOS_ENV_FILE` 只选择配置路径，不充当第二套业务配置。
 
-首次启动自动补全 `.env`（权限 0600，缺少管理员密码时生成随机值）。新数据库首次启动会打印初始密码；已有数据库重新生成配置的情况不能依赖日志取回密码。配置可在管理员网页保存，也可直接编辑文件；标为“重启生效”的项需重启，其余在后续读取时更新。
+进程环境里的同名变量**不会**被继承成配置——`.env` 是唯一来源。缺 `.env` 时程序直接停下并提示复制模板，不会替你生成。
+
+文件里少写的键按默认值补进**内存**，原文件字节不变，所以升级新增字段不需要程序改写配置。真正写文件的只有一处：**管理员网页点保存**。保存是加锁 + 校验 + 原子替换，校验失败时旧文件一个字节都不动。标为“重启生效”的项保存后需重启核心，其余在下一次读取时生效。
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `PANEL_PASSWORD` | 首次随机生成 | 管理员密码，至少 8 字符 |
+| `PANEL_PASSWORD` | 空（必须自己填） | 管理员密码，至少 8 字符；开网页时为空拒绝启动 |
 | `HTTP_ENABLED` | `1` | `0` 关闭网页面板，只留 Bot 与调度（此时必须配 `TG_BOT_TOKEN`） |
 | `HTTP_HOST` | `0.0.0.0` | 监听地址 |
 | `PORT` | `8080` | 监听端口 |
@@ -115,8 +117,15 @@ query content：说点什么进行随机签到以获得更多萝卜
 ```sh
 mkdir -p config data runtime
 cp emoskata.py runtime/
-printf 'TG_BOT_TOKEN="你的BotToken"\nTG_ALLOWED_USER_IDS="你的数字TGID"\n' > config/.env
+cp .env.example config/.env        # 然后编辑它：填 PANEL_PASSWORD / TG_BOT_TOKEN / TG_ALLOWED_USER_IDS
+chmod 600 config/.env
 docker compose up -d
+```
+
+`config/.env` 必须由你自己准备；程序不会生成它。上传/写好后可以先只校验不改文件：
+
+```sh
+EMOS_ENV_FILE=config/.env python3 runtime/emoskata.py --check-config
 ```
 
 `docker-compose.yml` 已配好三个挂载：
@@ -127,7 +136,7 @@ docker compose up -d
 | `data/` | `data.db`（账号、官方主号证明、会话、日志及保留历史） |
 | `runtime/` | `emoskata.py` |
 
-`prepare_docker.sh` 只在文件不存在时复制，不覆盖已有 `.env` 和已有 `runtime/emoskata.py`。
+`prepare_docker.sh` 只在文件不存在时复制 `.env.example` 与 `runtime/emoskata.py`，不覆盖已有文件；`config/.env` 缺失时它直接报错退出，不会替你创建。
 
 ### 纯 Bot（不开网页）
 
@@ -137,7 +146,7 @@ docker compose up -d
 EMOS_ENV_FILE=/app/config/.env python3 /app/runtime/emoskata.py
 ```
 
-`HTTP_ENABLED` 应写进 `.env`；进程环境仅在首次创建文件时继承，之后不再用于覆盖运行配置。没有唯一 TG ID 不启动 Bot；启动校验还会拒绝“关闭网页且没有 Bot Token”的组合。纯 Bot 模式目前没有等价的 Bot 重启命令。
+`HTTP_ENABLED` 应写进 `.env`；进程环境不参与配置，`.env` 是唯一来源。没有唯一 TG ID 不启动 Bot；启动校验还会拒绝“关闭网页且没有 Bot Token”的组合。纯 Bot 模式目前没有等价的 Bot 重启命令。
 
 ### 分文件
 
@@ -151,7 +160,7 @@ python3 app.py
 
 | 对象 | 缺失时 | 已存在时 |
 |---|---|---|
-| `.env` | 首次初始化生成默认配置 | 保留已有值，只补新增键；显式默认值和清空密钥仍优先 |
+| `.env` | **不生成**，程序拒绝启动并提示复制 `.env.example` | 只读：缺键补内存，文件不动；网页保存时才写回 |
 | `data/data.db` | 自动创建数据库、表和索引 | 按新版 schema 补表、列和索引，不重置账号、Token、设置或会话 |
 | 内嵌模块、网页、脚本 | 已在单文件里，不生成旁边源码 | 重启后整套替换为上传版本 |
 | 成功快照 | 正常启动就绪后创建 | 记录当前就绪的程序，不替代配置和数据库 |

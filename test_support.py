@@ -1,18 +1,28 @@
 """创建隔离配置、数据库与应用导入，供正式回归测试使用。
 
 默认夹具显式去掉 owner 键以覆盖历史模式；single_owner=True 覆盖生产权限。
-所有凭据为夹具值，不读取或覆盖实际部署配置。
+配置一律由夹具自己写盘（程序不再创建 .env）；凭据均为夹具值，不读取实际部署配置。
 """
 import importlib.util
 import os
 from pathlib import Path
 from unittest.mock import patch
 
-from envconfig import ConfigStore, CFG_TO_ENV
+from envconfig import ConfigStore, CFG_TO_ENV, serialize_env, template_values
 
 ROOT = Path(__file__).resolve().parent
 BUILD_FILES = ('build_single.py', 'updates.py', 'envconfig.py', 'runtime_info.py', 'emos.py',
                'accounts.py', 'webui.py', 'bot.py', 'app.py')
+FIXTURE_PASSWORD = 'fixture_password'
+
+
+def write_env(path, password=FIXTURE_PASSWORD, **overrides):
+    """按部署者视角写一份完整 .env：先落文件，再交给程序读取。"""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(serialize_env(template_values(password, **overrides)), encoding='utf-8')
+    path.chmod(0o600)
+    return path
 
 
 def configure(app, **values):
@@ -24,13 +34,11 @@ def configure(app, **values):
 
 def fixture_app(case, directory, name, entry=None, single_owner=False):
     directory = Path(directory)
-    with patch.dict(os.environ, {'TG_BOT_TOKEN': '', 'TG_ALLOWED_USER_IDS': ''}):
-        config = ConfigStore(directory / '.env', create=True)
-    config.update({'PANEL_PASSWORD': 'fixture_password', 'DATA_DIR': str(directory / 'data'),
-                   'HTTP_HOST': '127.0.0.1', 'EMOS_BASE_URL': 'http://127.0.0.1:1',
-                   'SIGN_TIMEZONE': 'UTC',
-                   'TG_BOT_TOKEN': '', 'TG_ALLOWED_USER_IDS': '101' if single_owner else ''},
-                  clear_secrets=['TG_BOT_TOKEN'])
+    path = write_env(directory / '.env', FIXTURE_PASSWORD,
+                     DATA_DIR=str(directory / 'data'), HTTP_HOST='127.0.0.1',
+                     EMOS_BASE_URL='http://127.0.0.1:1', SIGN_TIMEZONE='UTC',
+                     TG_BOT_TOKEN='', TG_ALLOWED_USER_IDS='101' if single_owner else '')
+    config = ConfigStore(path)
     environment = patch.dict(os.environ, {'EMOS_ENV_FILE': str(config.path)})
     environment.start()
     case.addCleanup(environment.stop)

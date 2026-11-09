@@ -18,7 +18,7 @@ from http.client import HTTPConnection
 from unittest.mock import patch
 
 from envconfig import ConfigStore, EnvConfigError
-from test_support import fixture_app
+from test_support import fixture_app, write_env
 
 ROOT = Path(__file__).resolve().parent
 
@@ -73,14 +73,12 @@ class UpdateTests(unittest.TestCase):
         with socket.socket() as probe:
             probe.bind(('127.0.0.1', 0))
             self.port = probe.getsockname()[1]
-        # 不让真实 App 环境凭据播种到隔离测试。
-        with patch.dict(os.environ, {'TG_BOT_TOKEN': '', 'TG_ALLOWED_USER_IDS': ''}):
-            self.config = ConfigStore(self.root / 'config' / '.env', create=True)
-        self.config.update({'DATA_DIR': './data', 'PANEL_PASSWORD': 'fixture_password',
-                           'HTTP_HOST': '127.0.0.1', 'PORT': str(self.port),
-                           'SIGN_TIME': '23:59', 'SCHEDULER_INTERVAL': '300',
-                           'TG_BOT_TOKEN': '', 'TG_ALLOWED_USER_IDS': '101'},
-                          clear_secrets=['TG_BOT_TOKEN'])
+        # 部署者视角：先写完整 .env，再让程序只读加载。
+        self.config = ConfigStore(write_env(
+            self.root / 'config' / '.env', 'fixture_password',
+            DATA_DIR='./data', HTTP_HOST='127.0.0.1', PORT=str(self.port),
+            SIGN_TIME='23:59', SCHEDULER_INTERVAL='300',
+            TG_BOT_TOKEN='', TG_ALLOWED_USER_IDS='101'))
         self.process = None
         self.log = None
 

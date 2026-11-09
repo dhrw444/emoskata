@@ -5,6 +5,8 @@ __pycache__/
 config.json
 .env
 .env.*
+# 模板要进仓库，其它 .env 变体（如 .env.local）仍忽略。
+!.env.example
 *.db
 *.db-wal
 *.db-shm

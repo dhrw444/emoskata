@@ -39,7 +39,12 @@ _STARTUP_PROBE = os.environ.get('EMOS_STARTUP_PROBE') == '1'
 _CORE_START_GATE = threading.Event()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG = ConfigStore(config_path(__file__), create=True)
+try:
+    CONFIG = ConfigStore(config_path(__file__))
+except EnvConfigError as _config_error:
+    # .env 由部署者提供；缺失时给出一句能照做的提示，不打印堆栈也不代为创建。
+    print('[config] %s' % _config_error)
+    raise SystemExit(2) from None
 _RUNTIME_CONFIG = CONFIG.app_config()
 _data = Path(_RUNTIME_CONFIG['data_dir']).expanduser()
 DATA_DIR = str(_data if _data.is_absolute() else Path(BASE_DIR) / _data)
@@ -340,12 +345,12 @@ LEGACY_SETTING_KEYS = (
 
 
 def import_legacy_config():
-    """一次性导入旧 settings，仅补用户未提供的字段。
+    """一次性把旧 SQLite settings 补进 .env 里缺失的键；老库升级用，不创建文件。
 
-    .env 中的显式默认值和空密钥同样优先，不用数值猜配置来源。
-    密码及进程环境只由 ConfigStore 首次建文件处理；非法旧值逐项拒绝。
+    只写文件里没有的键，已有值（包括显式默认值和空 Token）一律不动；
+    非法旧值逐项拒绝，不拖垮启动。迁移完成即打标记，之后不再触发。
     """
-    state = {'imported': [], 'untouched': [], 'rejected': [], 'password_inherited': False}
+    state = {'imported': [], 'untouched': [], 'rejected': []}
     if get_setting('legacy_config_imported') == '1':
         return state
     current, _ = CONFIG.snapshot()
@@ -365,7 +370,6 @@ def import_legacy_config():
             state['imported'].append(key)
     state['untouched'] = [key for _, key in LEGACY_SETTING_KEYS
                           if key not in changes and key not in state['rejected']]
-    state['password_inherited'] = 'PANEL_PASSWORD' in state['imported']
     set_setting('legacy_config_imported', '1')
     return state
 
@@ -430,9 +434,9 @@ def verify_password(pw):
 
 
 def init_password():
-    """把当前配置密码同步为 scrypt 校验值；密码变化时清除管理员会话。
+    """把 .env 里的密码同步成 scrypt 校验值；密码变化时清除管理员会话。
 
-    只有首次创建配置才返回用于一次性展示的密码。
+    密码由部署者在 .env 里自己填写，程序不再生成或打印明文。
     """
     source = CONFIG.password()
     if not verify_password(source):
@@ -441,7 +445,6 @@ def init_password():
                          'ON CONFLICT(key) DO UPDATE SET value=excluded.value',
                          ('panel_pw_hash', hash_password(source)))
             conn.execute('DELETE FROM sessions')
-    return source if CONFIG.created else None
 
 
 # 会话
@@ -1686,9 +1689,8 @@ def main():
             cfg = cfg_all()
         if legacy['rejected'] and not _STARTUP_PROBE:
             print('[config] 部分旧配置无效，请在管理页检查。')
-        generated = init_password() if cfg['http_enabled'] else None
-        if legacy['password_inherited']:
-            generated = None
+        if cfg['http_enabled']:
+            init_password()
         if not cfg['http_enabled'] and (not cfg['tg_bot_token'] or configured_owner(cfg) is None):
             raise EnvConfigError('纯 Bot 模式需要 Bot Token 和唯一 TG ID。')
         _shutdown.clear()
@@ -1704,8 +1706,6 @@ def main():
             _HTTP_SERVER = server
             if not _STARTUP_PROBE:
                 print('管理入口：http://%s:%d/admin' % (_CONTAINER_IP, cfg['port']))
-                if generated:
-                    print('首次管理员密码（仅此一次）：%s' % generated)
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, lambda *_: _shutdown.set())
         _start_core_threads()

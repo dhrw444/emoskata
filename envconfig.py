@@ -12,7 +12,6 @@ import json
 import os
 from pathlib import Path
 import re
-import secrets
 import stat
 import tempfile
 import threading
@@ -168,7 +167,9 @@ def validate_env(values, allow_unset_password=False):
         if not field.secret:
             value = value.strip()
         if key == 'PANEL_PASSWORD':
-            if (not value and not allow_unset_password) or (value and len(value) < 8):
+            if not value and not allow_unset_password:
+                raise EnvConfigError('PANEL_PASSWORD 未设置：请在 .env 填写至少 8 个字符的管理员密码。')
+            if value and len(value) < 8:
                 raise EnvConfigError('PANEL_PASSWORD 至少 8 个字符。')
         elif key == 'TG_BOT_TOKEN':
             if value and not re.fullmatch(r'[0-9]{3,20}:[A-Za-z0-9_-]{6,200}', value):
@@ -264,24 +265,46 @@ def serialize_env(values):
     return '\n'.join(lines) + '\n'
 
 
-def _seed_from_environ(environ=None):
-    """仅在首次建 .env 时从 SCHEMA 对应环境变量播种。
+def complete_values(parsed):
+    """把文件里出现的值合并到 schema 默认值上，只补内存，不回写文件。
 
-    已存在的文件不再读取环境值。默认允许为空的字段保留显式空值，
-    防止之后由旧库补回；其余必填字段的空环境值不替换有效默认值。
+    关闭网页时不要求管理员密码：纯 Bot 模式不用网页面板，空密码不构成风险。
     """
-    environ = os.environ if environ is None else environ
-    seeded = {}
-    for key in SCHEMA:
-        raw = environ.get(key)
-        if raw is not None and (raw != '' or SCHEMA[key].default == ''):
-            seeded[key] = raw
-    return seeded
-
-
-def template_values(password=None, **overrides):
     values = {key: field.default for key, field in SCHEMA.items()}
-    values['PANEL_PASSWORD'] = password or secrets.token_urlsafe(24)
+    values.update(parsed)
+    enabled = str(values['HTTP_ENABLED']).strip().lower()
+    return validate_env(values, allow_unset_password=enabled in ('0', 'false', 'off'))
+
+
+# 仓库根目录的 .env.example 由 render_env_example() 生成；缺失 .env 时的报错文案同源。
+TEMPLATE_NAME = '.env.example'
+
+
+def render_env_example():
+    """生成仓库里的 .env.example：键与 SCHEMA 完全一致，凭据一律留空。
+
+    模板本身不必能通过校验（密码留空就是要人去填），只保证键集合正确。
+    """
+    lines = ['# emoskata 系统配置模板。复制为 .env，填好后与程序一起上传。',
+             '# 程序不会创建或自动改写 .env；只有管理员网页保存时才写回文件。',
+             '# 文件权限应为 0600。标“重启生效”的项修改后要重启核心。']
+    for key, field in SCHEMA.items():
+        suffix = '（重启生效）' if field.restart else ''
+        lines.extend(('', '# %s%s：%s' % (field.label, suffix, field.description),
+                      key + '=' + json.dumps(field.default, ensure_ascii=False)))
+    return '\n'.join(lines) + '\n'
+
+
+def missing_config_message(path):
+    return ('配置文件 %s 不存在。请把 %s 复制为 .env，填写 PANEL_PASSWORD、'
+            'TG_BOT_TOKEN、TG_ALLOWED_USER_IDS 后与程序一起上传；'
+            '程序不再自动生成配置。' % (path, TEMPLATE_NAME))
+
+
+def template_values(password, **overrides):
+    """测试与演练用的完整配置字典；密码必须显式给出，不再随机生成。"""
+    values = {key: field.default for key, field in SCHEMA.items()}
+    values['PANEL_PASSWORD'] = password
     unknown = set(overrides) - set(SCHEMA)
     if unknown:
         raise EnvConfigError('未知配置项：' + ', '.join(sorted(unknown)))
@@ -304,44 +327,28 @@ def _read(path):
 
 
 class ConfigStore:
-    def __init__(self, path, create=False):
-        """读取配置；create=True 时创建目录和缺失文件，或补齐缺少的 schema 项。
+    def __init__(self, path):
+        """只读加载部署者提供的 .env；文件缺失即报错，绝不代为创建。
 
-        原有合法值优先，内容齐全且无标准化变化时不重写；缺失管理员密码才生成。
-        provided_keys 区分用户显式提供与自动默认项，供旧库迁移判断。
+        文件里缺的 schema 键按默认值补进内存，原文件保持字节不变，
+        因此升级新增字段不需要程序改写配置。只有 update() 会写回文件。
+        provided_keys 是文件里真实出现的键，供旧库迁移判断谁说了算。
         """
         self.path = Path(path).absolute()
         self.lock = threading.RLock()
         self._fingerprint, self._cache, self._revision = None, None, None
         self._app_cache, self._app_stamp = None, None
-        self.created = False
         self.provided_keys = set(SCHEMA)
-        if create:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self._writer():
-                if not self.path.exists():
-                    # 首次建文件时播种并持久化环境值；此后只读取文件。
-                    seeded = {key: value for key, value in _seed_from_environ().items()}
-                    self.provided_keys = set(seeded)
-                    self._atomic(template_values(**seeded))
-                    self.created = True
-                else:
-                    info = self.path.lstat()
-                    if not stat.S_ISREG(info.st_mode):
-                        raise EnvConfigError('.env 必须是可写普通文件；不支持符号链接或单文件 secret 挂载。')
-                    try:
-                        os.chmod(self.path, 0o600)
-                    except OSError:
-                        raise EnvConfigError('无法将 .env 权限设置为 0600。') from None
-                    _, existing = _read(self.path)
-                    self.provided_keys = set(existing)
-                    values = {key: field.default for key, field in SCHEMA.items()}
-                    values.update(existing)
-                    values = validate_env(values, allow_unset_password=True)
-                    if not values['PANEL_PASSWORD']:
-                        values['PANEL_PASSWORD'] = secrets.token_urlsafe(24)
-                    if set(existing) != set(SCHEMA) or values != existing:
-                        self._atomic(validate_env(values))
+        try:
+            info = self.path.lstat()
+        except FileNotFoundError:
+            raise EnvConfigError(missing_config_message(self.path)) from None
+        except OSError:
+            raise EnvConfigError('无法读取配置文件，请检查 .env 路径与权限。') from None
+        if not stat.S_ISREG(info.st_mode):
+            raise EnvConfigError('.env 必须是普通文件；不支持符号链接或单文件 secret 挂载。')
+        _, existing = _read(self.path)
+        self.provided_keys = set(existing)
         self.snapshot()
 
     @contextmanager
@@ -389,7 +396,7 @@ class ConfigStore:
     def snapshot(self, force=False):
         """返回独立配置字典与原文件 SHA256；指纹变化或 force 时重新读取。
 
-        不在运行期随意补齐损坏文件；解析与校验失败明确抛错。
+        文件里缺的键按 schema 默认值补进内存，不回写；解析或校验失败明确抛错。
         """
         with self.lock:
             try:
@@ -399,7 +406,7 @@ class ConfigStore:
             stamp = (info.st_ino, info.st_mtime_ns, info.st_ctime_ns, info.st_size)
             if force or stamp != self._fingerprint:
                 raw, parsed = _read(self.path)
-                values = validate_env(parsed)
+                values = complete_values(parsed)
                 self._cache = values
                 self._revision = hashlib.sha256(raw).hexdigest()
                 self._fingerprint = stamp

@@ -528,19 +528,18 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn('ux_accounts_emos_id', [row[1] for row in
                                                   conn.execute('PRAGMA index_list(accounts)')])
 
-    def test_first_boot_inherits_explicit_env_values(self):
-        # 首次建配置必须继承显式环境值，此后不再作为覆盖来源。
-        from envconfig import _seed_from_environ, template_values
-        seeded = _seed_from_environ({'TG_ALLOWED_USER_IDS': '101',
-                                     'PORT': '9000', 'NOT_A_KEY': 'x'})
-        self.assertEqual(seeded, {'TG_ALLOWED_USER_IDS': '101', 'PORT': '9000'})
-        values = template_values(**seeded)
-        self.assertEqual(values['TG_ALLOWED_USER_IDS'], '101')
-        self.assertEqual(values['PORT'], '9000')
-        # 空值不等于显式配置，不能被继承成空串以外的东西
-        self.assertNotIn('TG_BOT_TOKEN', seeded)
+    def test_process_environment_does_not_seed_configuration(self):
+        # .env 是唯一来源：进程环境同名值既不建文件，也不覆盖已有文件。
+        from envconfig import ConfigStore, template_values
+        port_before = self.app.CONFIG.snapshot()[0]['PORT']
+        with patch.dict(os.environ, {'TG_ALLOWED_USER_IDS': '999', 'PORT': '9000'}):
+            self.assertEqual(self.app.cfg_all()['port'], int(port_before))
+            path = Path(self.temp.name) / 'no-env-here' / '.env'
+            with self.assertRaises(envconfig.EnvConfigError):
+                ConfigStore(path)
+            self.assertFalse(path.exists())
         with self.assertRaises(envconfig.EnvConfigError):
-            template_values(NOT_A_KEY='x')
+            template_values('fixture_password', NOT_A_KEY='x')
 
     def test_allowlist_config_rejects_malformed_ids(self):
         # 单个 owner 的非法配置在保存时拒绝。
@@ -572,7 +571,7 @@ class RuntimeTests(unittest.TestCase):
         legacy_env.write_text(''.join(key + '=' + json.dumps(value) + '\n'
                                       for key, value in values.items() if key not in missing))
         legacy_env.chmod(0o600)
-        self.app.CONFIG = ConfigStore(legacy_env, create=True)
+        self.app.CONFIG = ConfigStore(legacy_env)
         self.assertTrue(missing.isdisjoint(self.app.CONFIG.provided_keys))
         self.app.set_setting('tg_bot_token', '123456789:legacyfixture')
         self.app.set_setting('sign_time', '07:30')
@@ -607,7 +606,7 @@ class RuntimeTests(unittest.TestCase):
         legacy_env.write_text(''.join(key + '=' + json.dumps(value) + '\n'
                                       for key, value in values.items() if key != 'TG_BOT_TOKEN'))
         legacy_env.chmod(0o600)
-        self.app.CONFIG = ConfigStore(legacy_env, create=True)
+        self.app.CONFIG = ConfigStore(legacy_env)
         self.assertNotIn('TG_BOT_TOKEN', self.app.CONFIG.provided_keys)
         self.app.set_setting('tg_bot_token', 'not-a-valid-token')
         state = self.app.import_legacy_config()

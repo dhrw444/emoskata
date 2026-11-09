@@ -139,24 +139,19 @@ class SingleFileUpgradeTests(unittest.TestCase):
             time.sleep(0.08)
         self.fail('isolated application readiness timed out')
 
-    def config_values(self):
+    def config_values(self, **overrides):
         return template_values(PASSWORD, PORT=str(self.port), HTTP_HOST='127.0.0.1',
                                DATA_DIR='./data', SIGN_TIME='08:00', GAP_SECONDS='8',
                                SIGN_TIMEZONE='UTC', SCHEDULER_INTERVAL='300',
-                               TG_BOT_TOKEN='', TG_ALLOWED_USER_IDS='101', EMOS_USER_ID='ePrimary')
+                               TG_BOT_TOKEN='', TG_ALLOWED_USER_IDS='101', EMOS_USER_ID='ePrimary',
+                               **overrides)
 
-    def start(self, source=None, existing_config=True):
+    def start(self, source=None):
+        """只放程序文件启动；.env 必须由测试预先写好（程序不再生成）。"""
         self.entry.write_bytes(source if source is not None else (ROOT / 'emoskata.py').read_bytes())
         environment = dict(os.environ)
         for name in SCHEMA:
             environment.pop(name, None)
-        values = self.config_values()
-        if existing_config:
-            self.config.parent.mkdir()
-            self.config.write_text(serialize_env(values))
-            self.config.chmod(0o600)
-        else:
-            environment.update(values)
         environment.pop('EMOS_UPDATE_ACTIVE', None)
         environment.pop('EMOS_STARTUP_PROBE', None)
         environment.pop('EMOS_PROBE_REUSE_BIND', None)
@@ -237,14 +232,37 @@ class SingleFileUpgradeTests(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_only_py_creates_missing_config_data_and_backup(self):
+    def write_config(self, **overrides):
+        """部署者视角写完整 .env；程序本身不再生成配置。"""
+        self.config.parent.mkdir(parents=True, exist_ok=True)
+        self.config.write_text(serialize_env(self.config_values(**overrides)))
+        self.config.chmod(0o600)
+
+    def test_missing_config_stops_startup_and_creates_nothing(self):
+        # 没有 .env 必须立刻停下：不建配置、不建数据库、不留任何文件。
+        self.assertFalse(self.config.exists())
+        self.entry.write_bytes((ROOT / 'emoskata.py').read_bytes())
+        environment = dict(os.environ, EMOS_ENV_FILE=str(self.config),
+                           PYTHONDONTWRITEBYTECODE='1')
+        for name in SCHEMA:
+            environment.pop(name, None)
+        result = subprocess.run([sys.executable, '-I', '-S', '-u', str(self.entry)],
+                                cwd=self.root, env=environment, stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('.env.example', result.stdout + result.stderr)
         self.assertFalse(self.config.exists())
         self.assertFalse(self.db.exists())
-        self.start(existing_config=False)
-        self.assertTrue(self.config.is_file())
+        self.assertFalse((self.config.parent / '.emoskata.py.last-good').exists())
+
+    def test_only_py_plus_env_creates_database_and_backup(self):
+        # 程序 + 已填好的 .env：建库、留成功快照，配置字节保持不变。
+        self.assertFalse(self.db.exists())
+        self.write_config()
+        before = self.config.read_bytes()
+        self.start()
+        self.assertEqual(self.config.read_bytes(), before)
         self.assertTrue(self.db.is_file())
-        self.assertEqual(set(env_values(self.config)), set(SCHEMA))
-        self.assertEqual(env_values(self.config)['PANEL_PASSWORD'], PASSWORD)
         _, rows = self.data()
         self.assertIn('accounts', rows)
         self.assertIn('web_sessions', rows)
@@ -255,6 +273,7 @@ class SingleFileUpgradeTests(unittest.TestCase):
         self.assertEqual(self.process.wait(timeout=10), 0)
 
     def test_one_file_updates_all_modules_pages_and_docs_preserving_accounts(self):
+        self.write_config()
         self.start(image('v1'))
         self.seed()
         sid = self.seed_web_login()
@@ -277,22 +296,31 @@ class SingleFileUpgradeTests(unittest.TestCase):
         self.assertFalse((self.runtime / 'accounts.py').exists())
         self.assertEqual((self.config.parent / '.emoskata.py.last-good').read_bytes(), self.entry.read_bytes())
 
-    def test_new_schema_creates_missing_fields_not_resetting_old_values(self):
+    def test_new_schema_fields_appear_in_memory_without_rewriting_env(self):
+        # 升级新增的配置键只补进内存：.env 保持部署者上传的字节，
+        # 旧值一个不变，新键在网页接口里可见可保存。
+        self.write_config()
         self.start(image('v1'))
         self.seed()
         sid = self.seed_web_login()
+        env_before = self.config.read_bytes()
         config_before = env_values(self.config)
         columns, before = self.data()
         self.restart(image('v2', expand=True), 'v2')
-        config_after = env_values(self.config)
-        self.assertEqual({key: config_after[key] for key in config_before}, config_before)
-        self.assertEqual(config_after['UPGRADE_TEST_OPTION'], 'fixture-added')
+        self.assertEqual(self.config.read_bytes(), env_before)
+        self.assertEqual(env_values(self.config), config_before)
         self.assertEqual(self.data(columns)[1], before)
         with sqlite3.connect(self.db) as conn:
             self.assertEqual(conn.execute('SELECT upgrade_test_column FROM accounts ORDER BY id').fetchall(), [(7,), (7,)])
             self.assertEqual(conn.execute('SELECT COUNT(*) FROM upgrade_test_items').fetchone()[0], 0)
         self.assertEqual(self.request('/api/config')[2]['upgrade_test_option'], 'fixture-added')
         self.assertEqual(self.dashboard(sid, '/api/web/me')[0], 200)
+        # 网页保存新增键时才真正落盘，且旧值不动。
+        status, _, outcome = self.request('/api/config', {'changes': {'UPGRADE_TEST_OPTION': 'saved-by-panel'}})
+        self.assertEqual(status, 200, outcome)
+        on_disk = env_values(self.config)
+        self.assertEqual(on_disk['UPGRADE_TEST_OPTION'], 'saved-by-panel')
+        self.assertEqual({key: on_disk[key] for key in config_before}, config_before)
         expanded_before = self.config.read_bytes()
         current_columns, expanded_rows = self.data()
         self.restart(image('v2', expand=True), 'v2')
@@ -300,6 +328,7 @@ class SingleFileUpgradeTests(unittest.TestCase):
         self.assertEqual(self.data(current_columns)[1], expanded_rows)
 
     def test_failed_new_schema_restores_config_accounts_and_existing_sessions(self):
+        self.write_config()
         self.start(image('v1'))
         self.seed()
         sid = self.seed_web_login()
@@ -323,9 +352,7 @@ class SingleFileUpgradeTests(unittest.TestCase):
         for name, source in stale.items():
             (self.runtime / name).write_bytes(source)
         self.entry.write_bytes(image('v1'))
-        self.config.parent.mkdir()
-        self.config.write_text(serialize_env(self.config_values()))
-        self.config.chmod(0o600)
+        self.write_config()
         environment = dict(os.environ, EMOS_ENV_FILE=str(self.config))
         self.log = (self.root / 'process.log').open('wb')
         self.process = subprocess.Popen([sys.executable, '-I', '-S', '-u', str(self.entry)], cwd=self.root,

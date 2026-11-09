@@ -86,8 +86,9 @@ _SOURCES.clear()
 del _source
 
 if __name__ == '__main__':
-    if _sys.argv[1:] == ['--init-config']:
-        print('唯一配置文件 .env 已准备，凭据不回显；数据库在实际启动时初始化。')
+    if _sys.argv[1:] == ['--check-config']:
+        # 只校验部署者上传的 .env：不建文件、不改文件、不启动服务。
+        print('配置通过校验：%d 项' % len(app.CONFIG.snapshot(force=True)[0]))
     else:
         main()
 '''

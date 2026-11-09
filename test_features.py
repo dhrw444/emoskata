@@ -161,8 +161,9 @@ class FeatureTests(unittest.TestCase):
         path=Path(self.tmp.name)/'legacy' /'.env'
         path.parent.mkdir()
         path.write_text('PANEL_PASSWORD="fixture_password"\nTG_BOT_TOKEN=""\n')
-        path.chmod(0o644)
-        config=ConfigStore(path,create=True)
+        path.chmod(0o600)
+        # 程序只读：缺项补内存，不改文件，也不替部署者改权限。
+        config=ConfigStore(path)
         self.assertEqual(path.stat().st_mode & 0o777,0o600)
         from envconfig import SCHEMA
         self.assertEqual(set(config.snapshot()[0]),set(SCHEMA))
