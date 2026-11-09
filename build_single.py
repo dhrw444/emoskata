@@ -56,8 +56,11 @@ _package.__path__ = []
 _package.__file__ = __file__
 _sys.modules[_package_name] = _package
 _check_config = __name__ == '__main__' and _sys.argv[1:] == ['--check-config']
+_prepare_host = __name__ == '__main__' and _sys.argv[1:] == ['--prepare-host']
 for _name, _source in _SOURCES.items():
     if _check_config and _name != 'envconfig':
+        continue
+    if _prepare_host and _name != 'runtime_info':
         continue
     _qualified = _package_name + '.' + _name
     _module = _types.ModuleType(_qualified)
@@ -71,6 +74,15 @@ for _name, _source in _SOURCES.items():
         # 在配置与数据库模块导入前处理上次未完成的更新。
         _module.recover_entry(__file__)
         _module.capture_image(__file__, globals().get('__emos_image__'))
+
+if _prepare_host:
+    try:
+        for _path, _created in _package.runtime_info.prepare_requirements(__file__):
+            print('[deploy] requirements.txt %s：%s' % ('已创建' if _created else '已保留', _path))
+    except OSError:
+        print('[deploy] 无法准备 requirements.txt，请与 emoskata.py 一起上传到运行目录。')
+        raise SystemExit(2) from None
+    raise SystemExit(0)
 
 if _check_config:
     try:

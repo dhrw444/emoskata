@@ -5,7 +5,6 @@ Test: python3 -B -m unittest test_update"""
 import json
 import os
 from pathlib import Path
-import shutil
 import socket
 import sqlite3
 import subprocess
@@ -18,7 +17,7 @@ from http.client import HTTPConnection
 from unittest.mock import patch
 
 from envconfig import ConfigStore, EnvConfigError
-from test_support import fixture_app, write_env
+from test_support import fixture_app, write_env, without_public_probe
 
 ROOT = Path(__file__).resolve().parent
 
@@ -69,7 +68,7 @@ class UpdateTests(unittest.TestCase):
         self.runtime = self.root / 'runtime'
         self.runtime.mkdir()
         self.entry = self.runtime / 'emoskata.py'
-        shutil.copyfile(ROOT / 'emoskata.py', self.entry)
+        self.entry.write_bytes(without_public_probe((ROOT / 'emoskata.py').read_bytes()))
         with socket.socket() as probe:
             probe.bind(('127.0.0.1', 0))
             self.port = probe.getsockname()[1]
@@ -162,12 +161,12 @@ class UpdateTests(unittest.TestCase):
         self.assertIn('已从最近一次成功启动的快照恢复', data['error'])
         self.assertEqual(self.entry.read_bytes(), (self.config.path.parent / '.emoskata.py.last-good').read_bytes())
         self.assertIsNone(self.process.poll())
-        shutil.copyfile(ROOT / 'emoskata.py', self.entry)
+        self.entry.write_bytes(without_public_probe((ROOT / 'emoskata.py').read_bytes()))
         with self.entry.open('ab') as handle:
             handle.write(b'\ndef broken(:\n')
         self.assertEqual(request(self.port, '/api/restart', {'confirm': True}, self.cookie)[0], 400)
         self.assertEqual(request(self.port, '/api/health')[0], 200)
-        shutil.copyfile(ROOT / 'emoskata.py', self.entry)
+        self.entry.write_bytes(without_public_probe((ROOT / 'emoskata.py').read_bytes()))
         self.assertEqual(request(self.port, '/api/restart', {'confirm': True}, self.cookie)[0], 202)
         # 请求接受后即删除入口，验证 exec 仍读取已验过的临时镜像。
         self.entry.unlink()
@@ -178,7 +177,7 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(self.dump_data(), before)
         self.assertEqual(self.config.path.read_bytes(), config_before)
         self.assertEqual(request(self.port, '/api/config', cookie=self.cookie)[0], 200)
-        shutil.copyfile(ROOT / 'emoskata.py', self.entry)
+        self.entry.write_bytes(without_public_probe((ROOT / 'emoskata.py').read_bytes()))
         self.assertEqual(request(self.port, '/api/restart', {'confirm': True}, self.cookie)[0], 202)
         self.wait(lambda: request(self.port, '/api/runtime', cookie=self.cookie)[2].get('restart_status') == 'running')
         self.assertEqual(self.dump_data(), before)

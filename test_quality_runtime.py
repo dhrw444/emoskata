@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from test_support import BUILD_FILES, ROOT, fixture_app
+from test_support import BUILD_FILES, ROOT, fixture_app, configure
 
 
 class QualityRuntimeTests(unittest.TestCase):
@@ -82,6 +82,10 @@ class QualityRuntimeTests(unittest.TestCase):
         entry = stage/'app.py'
         module = fixture_app(self, self.root/'modular-config', 'quality_modular_fixture', entry)
         self.addCleanup(module.close_idle_db)
+        holder = module._BoundedHTTPServer(('127.0.0.1', 0), module.Handler, 1, 1)
+        self.addCleanup(holder.server_close)
+        module._HTTP_SERVER = holder
+        configure(module, port=holder.server_port)
         before = module.CONFIG.path.read_bytes()
         with patch.dict(os.environ, {'PYTHONPATH': '/path/which/does/not/exist'}):
             image = module._prepare_core()

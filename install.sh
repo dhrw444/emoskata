@@ -11,8 +11,16 @@ python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)' || {
     echo '需要 Python 3.10 或更新版本。'; exit 1;
 }
 mkdir -p "$DIR/data"
+DIR=$(CDPATH='' cd -- "$DIR" && pwd)
 if [ "$HERE" != "$DIR" ]; then
     cp "$HERE/emoskata.py" "$DIR/emoskata.py"
+fi
+if [ ! -f "$DIR/requirements.txt" ]; then
+    if [ -f "$HERE/requirements.txt" ]; then
+        cp "$HERE/requirements.txt" "$DIR/requirements.txt"
+    else
+        (cd "$DIR" && python3 "$HERE/emoskata.py" --prepare-host)
+    fi
 fi
 chmod 700 "$DIR/data"
 # 程序不再生成配置：只补一份模板，缺 .env 就明确停下。

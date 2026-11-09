@@ -1,7 +1,7 @@
 """账号域：官方主号、独立 Token、当前选择和 SQLite 事务。
 
-本地 owner 是本 Bot 操作者，额外账号无需相同远端 TG 绑定。
-旧共享数据保留但单人入口拒绝扩展授权；这里不执行官方网络请求。
+本地 owner 是账号登记操作者，额外账号无需相同远端 TG 绑定。
+公开与指定入口均只管理本人账号，不恢复历史跨 TG 共享；这里不执行官方网络请求。
 Test: python3 -B -m unittest test_accounts test_owner_accounts test_multi_accounts"""
 
 import hashlib
@@ -14,7 +14,7 @@ from contextlib import closing, contextmanager
 from typing import Optional
 
 from emos import clamp_sign_time as _clamp_time
-from envconfig import configured_owner as _configured_owner
+from envconfig import tg_access_owner
 
 
 class DomainError(Exception):
@@ -38,7 +38,7 @@ _ROOT = """
     SELECT a.id FROM tg_users u JOIN accounts a ON a.id=u.active_account_id
     WHERE u.tg_id=? AND a.owner_tg_id=?
 """
-# 旧共享视图只查一跳；单人模式不用这个范围扩展规则。
+# 历史夹具共享视图只查一跳；公开和指定生产模式均不用这条范围扩展规则。
 _VISIBLE_IDS = """
     SELECT id FROM root
     UNION
@@ -113,9 +113,9 @@ class AccountService:
         self._owner_lock = threading.Lock()
 
     def _owner_id(self):
-        """返回唯一操作者；0 表示拒绝，None 仅表示尚未见过 owner 配置的历史模式。
+        """返回配置策略；None 为公开，正整数为指定用户，0 为拒绝。
 
-        一旦进入单人模式，之后配置键缺失也拒绝，不回退为开放访问。"""
+        只有从未见过生产权限键的旧夹具保留历史共享语义；显式空值始终是公开隔离模式。"""
         try:
             cfg = self._cfg()
         except Exception:
@@ -127,29 +127,32 @@ class AccountService:
             if 'tg_allowed_user_ids' not in cfg:
                 return 0 if self._owner_mode_seen else None
             self._owner_mode_seen = True
-        return _configured_owner(dict(cfg)) or 0
+        return tg_access_owner(dict(cfg))
 
     def _actor(self, tg_id):
-        owner = self._owner_id()
-        if owner is not None and owner != tg_id:
-            raise DomainError('仅配置的 Telegram 用户可操作；请检查唯一 TG ID')
-        return owner
+        tg_id = _positive_id(tg_id)
+        policy = self._owner_id()
+        if policy == 0 or (policy is not None and policy != tg_id):
+            raise DomainError('当前 TG 用户不在访问范围内，请检查 TG 访问限制')
+        with self._owner_lock:
+            current_mode = self._owner_mode_seen
+        return (tg_id if current_mode else None), policy
 
     @contextmanager
     def _access(self, tg_id, write=False, links=False):
-        """数据库访问前、借用后及返回前核对 owner，配置变化使写事务回滚。
+        """在事务前后核对操作者与策略；公开模式也只授予当前用户自己的账号。
 
-        links=True 在单人模式拒绝；不能因等待连接期间权限改变而继续提交。"""
-        owner = self._actor(tg_id)
+        策略改变使写事务回滚；现代入口不恢复历史跨 TG 共享授权。"""
+        access = self._actor(tg_id)
+        owner, _ = access
         if links and owner is not None:
-            raise DomainError('单人模式不支持账号共享或关联；请使用官方 token 添加账号')
+            raise DomainError('账号共享或关联已关闭；请使用官方 token 添加自己的账号')
         context = self._write() if write else closing(self._db())
         with context as conn:
-            # 验证可能等待的数据库访问前后，写入后的变化在提交前触发回滚。
-            if self._actor(tg_id) != owner:
+            if self._actor(tg_id) != access:
                 raise DomainError('账号访问配置已变化，请重试')
             yield conn, owner
-            if self._actor(tg_id) != owner:
+            if self._actor(tg_id) != access:
                 raise DomainError('账号访问配置已变化，请重试')
 
     @staticmethod
@@ -464,7 +467,7 @@ class AccountService:
 
     def login_with_token(self, tg_id, token, profile, base_url='', expected_root=None,
                          expected_login_revision=None) -> dict:
-        """保存经调用方官方核验的独立 Token；单人模式先要求有效官方主号。
+        """保存经调用方官方核验的独立 Token；公开/指定模式均先要求本人的有效官方主号。
 
         本地操作者与额外号远端 TG 绑定分离，不建立或替换 primary；
         网络校验后的当前选择和登录代际必须在写事务中仍然一致。"""
@@ -651,7 +654,7 @@ class AccountService:
                                       (tg_id,)).fetchone())
 
     def issue_code(self, tg_id, expected_root=None) -> dict:
-        """为历史关联授权生成一次性码，库内只存摘要；单人模式禁止调用。"""
+        """为历史关联授权生成一次性码，库内只存摘要；公开和指定生产模式禁止调用。"""
         tg_id = _positive_id(tg_id)
         with self._access(tg_id, write=True, links=True) as (conn, _):
             self._expected(conn, tg_id, expected_root)
@@ -692,7 +695,7 @@ class AccountService:
     def redeem(self, tg_id, target_emos_id, code, expected_root=None) -> dict:
         """在事务中消费一次性码并创建待目标确认申请，尚不建立代签授权。
 
-        历史路径失败受次数限制；单人模式禁止，最终授权由 review_link() 决定。"""
+        历史路径失败受次数限制；生产公开和指定模式禁止，最终授权由 review_link() 决定。"""
         tg_id = _positive_id(tg_id)
         self._redemption_limit(tg_id)
         try:
@@ -853,7 +856,7 @@ class AccountService:
             conn.execute('DELETE FROM link_requests WHERE source_id=? AND target_id=?',(source_id,target_id))
 
     def run_scope(self, tg_id, include_links=True) -> dict:
-        """返回当前根和有效账号 ID；单人模式 True 是全部号，False 仅当前号。
+        """返回当前根和有效账号 ID；生产 True 是本人全部号，False 仅当前号。
 
         历史参数 include_links 保留名称；旧模式仅根和已授权一跳，不递归。"""
         tg_id = _positive_id(tg_id)
@@ -895,7 +898,7 @@ class AccountService:
     def can_run(self, tg_id, root_id, target_id) -> bool:
         """每个请求前复核当前根、目标凭据和本地授权，检查失败返回 False。
 
-        单人模式只准同 owner 且主号有效；不在此发官方网络请求。"""
+        公开和指定模式只准同操作者账号且本人主号有效；不在此发官方网络请求。"""
         try:
             tg_id, root_id, target_id = map(_positive_id, (tg_id, root_id, target_id))
             with self._access(tg_id) as (conn, owner):
@@ -924,9 +927,9 @@ class AccountService:
             return False
 
     def admin_overview(self) -> list:
-        """返回脱敏管理投影；单人模式只选配置 owner 的保留账号。
+        """返回管理员脱敏投影；指定模式只选该 ID，公开模式返回全部登记账号。
 
-        管理员认证由调用方负责，owner 缺失或读取期间变化不返回账号。"""
+        管理员认证由调用方负责，非法或读取期间变化的策略不返回账号。"""
         owner = self._owner_id()
         if owner == 0:
             return []
@@ -947,7 +950,7 @@ class AccountService:
         return result
 
     def visible(self, tg_id) -> list:
-        """按实时授权返回脱敏账号列表；单人模式仅同 owner，旧模式根及一跳。"""
+        """按实时授权返回脱敏账号列表；生产仅本人，历史夹具保留根及一跳。"""
         tg_id = _positive_id(tg_id)
         sql = ("WITH root AS (" + _ROOT + "), visible AS (" + _VISIBLE_IDS + ") "
                "SELECT a.* FROM accounts a JOIN visible v ON v.id=a.id "
@@ -996,7 +999,7 @@ class AccountService:
         return result
 
     def set_input(self, tg_id, kind, ttl=600) -> None:
-        """记录白名单输入类型和期限；Token 输入在单人模式要求主号仍有效。"""
+        """记录白名单输入类型和期限；生产 Token 输入要求本人的主号仍有效。"""
         tg_id = _positive_id(tg_id)
         if kind not in ("link", "time", "login", "token") or not isinstance(kind, str):
             raise DomainError("输入会话类型无效")
@@ -1043,13 +1046,18 @@ class AccountService:
         owner = self._owner_id()
         if owner == 0:
             return []
+        with self._owner_lock:
+            current_mode = self._owner_mode_seen
         with closing(self._db()) as conn:
-            if owner is not None:
-                rows = conn.execute(
-                    'SELECT u.* FROM tg_users u JOIN accounts a ON a.owner_tg_id=u.tg_id '
-                    'WHERE u.tg_id=? AND u.chat_id=u.tg_id AND a.id=? '
-                    "AND a.emos_id IS NOT NULL AND a.emos_id<>''",
-                    (owner, account_id)).fetchall()
+            if current_mode:
+                sql = ('SELECT u.* FROM tg_users u JOIN accounts a ON a.owner_tg_id=u.tg_id '
+                       'WHERE u.chat_id=u.tg_id AND a.id=? '
+                       "AND a.emos_id IS NOT NULL AND a.emos_id<>''")
+                params = (account_id,)
+                if owner is not None:
+                    sql += ' AND u.tg_id=?'
+                    params += (owner,)
+                rows = conn.execute(sql, params).fetchall()
             else:
                 rows = conn.execute("""
                     WITH recipients(tg_id) AS (

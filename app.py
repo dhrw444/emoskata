@@ -24,8 +24,9 @@ import sys
 from pathlib import Path
 
 from envconfig import (ConfigStore, EnvConfigError, CFG_TO_ENV, SCHEMA, config_path,
-                       FIXED_ZONE_OFFSETS, configured_owner, owner_permitted)
-from runtime_info import container_ip, snapshot as resource_snapshot
+                       FIXED_ZONE_OFFSETS, owner_permitted, tg_access_owner)
+from runtime_info import (container_ip, snapshot as resource_snapshot, prepare_requirements,
+                          start_public_ip_probe, public_ip_status, management_url)
 from emos import EmosClient, EmosError, clamp_sign_time, pick_content
 from accounts import AccountService, DomainError
 from webui import WebService, render_page
@@ -538,6 +539,24 @@ def public_base(handler=None):
     return 'http://127.0.0.1:%d' % _RUNTIME_CONFIG['port']
 
 
+def _management_address():
+    """配置域名/CDN 决定访问入口，独立公网 IP 缓存仅作源站诊断和无域名回退。"""
+    cfg = cfg_all()
+    return management_url(cfg.get('public_base'), public_ip_status()['server_public_ip'],
+                          _RUNTIME_CONFIG['port'])
+
+
+def _report_public_address(address):
+    print('服务器公网 IP：%s' % (address or '探测失败（不使用容器内网 IP 代替）'))
+    entry = _management_address()
+    if entry:
+        print('管理入口：%s' % entry)
+        if not cfg_all().get('public_base'):
+            print('[web] 公网 IP 是出口地址；访问需宿主映射端口和防火墙放行，CDN 域名填 PUBLIC_BASE。')
+    else:
+        print('[web] 未确定公网管理入口，请在 .env 的 PUBLIC_BASE 填写你的域名或公开地址。')
+
+
 def _esc(s):
     return html.escape(str(s if s is not None else ''))
 
@@ -586,7 +605,7 @@ def _queue_result(row, cfg):
 
 
 def _deliver_notification(task):
-    """发送前再核对订阅和唯一操作者；返回 False 表示已无权或无凭据发送。"""
+    """发送前核当前 TG 策略和本人订阅；False 表示无权或缺少发送凭据。"""
     from bot import TG
     account_id, tg_id, preference, row = task
     current = next((user for user in Store().accounts.watchers(account_id) if user['tg_id'] == tg_id), None)
@@ -599,7 +618,7 @@ def _deliver_notification(task):
     token = str(cfg.get('tg_bot_token') or '')
     if not token:
         return False
-    recipient = configured_owner(cfg) if owner_mode else current['chat_id']
+    recipient = tg_id if owner_mode else current['chat_id']
     TG(token, Store()).send(recipient, build_report([row], 0, 0))
     return True
 
@@ -808,7 +827,7 @@ def _run_ids(cfg, account_ids, trigger='manual', actor=None, root_id=None, scope
 def run_user(tg_id, include_links=True, expected_root=None, content=None):
     """验 owner、当前选择和明确范围后执行签到；拒收状态不接受新任务。
 
-    include_links 为历史参数名，单人模式 True 表示全部有效号，False 仅当前号。"""
+    include_links 为历史参数名，生产 True 表示本人全部有效号，False 仅当前号。"""
     live = cfg_all()
     if 'tg_allowed_user_ids' in live and not owner_permitted(live, tg_id):
         raise DomainError('只允许配置的 TG 用户操作。')
@@ -852,20 +871,28 @@ def _eligible(account, now, cfg, automatic):
 def scheduler_tick(cfg=None):
     """只查本地库决定当天未完成范围，存在候选才调用官方接口。
 
-    单人模式无有效主号返回空列表，不使用历史共享授权扩展范围。"""
+    公开和指定模式逐用户核有效主号，不使用历史共享授权扩展范围。"""
     if _draining.is_set():
         return []
     cfg = cfg or cfg_all()
     now = now_local(cfg)
     scopes = {}
     owner_mode = 'tg_allowed_user_ids' in cfg
-    owner = configured_owner(cfg) if owner_mode else None
-    if owner_mode and (owner is None or not Store().accounts.has_primary_account(owner)):
+    owner = tg_access_owner(cfg) if owner_mode else None
+    if owner_mode and (owner == 0 or (owner is not None and not Store().accounts.has_primary_account(owner))):
         return []
     with db() as conn:
         if owner_mode:
-            all_accounts = [dict(row) for row in conn.execute(
-                'SELECT * FROM accounts WHERE enabled=1 AND owner_tg_id=? ORDER BY id', (owner,))]
+            if owner is None:
+                all_accounts = [dict(row) for row in conn.execute(
+                    'SELECT a.* FROM accounts a JOIN tg_users u ON u.tg_id=a.owner_tg_id '
+                    'JOIN accounts p ON p.id=u.primary_account_id AND p.owner_tg_id=u.tg_id '
+                    "WHERE a.enabled=1 AND p.enabled=1 AND TRIM(COALESCE(p.token,''))<>'' "
+                    "AND p.emos_id IS NOT NULL AND p.emos_id<>'' "
+                    "AND COALESCE(p.last_status,'')<>'invalid' ORDER BY a.id")]
+            else:
+                all_accounts = [dict(row) for row in conn.execute(
+                    'SELECT * FROM accounts WHERE enabled=1 AND owner_tg_id=? ORDER BY id', (owner,))]
             grants = []
         else:
             all_accounts = [dict(row) for row in conn.execute('SELECT * FROM accounts WHERE enabled=1 ORDER BY id')]
@@ -942,7 +969,7 @@ async function go(ev){
 </script></body></html>"""
 
 
-PAGE = '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>emoskata · 核心管理</title><style>\n:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#101318;color:#eef2f7;font:14px/1.6 system-ui,sans-serif}main{max-width:960px;margin:auto;padding:22px 16px 60px}h1{font-size:24px}h2{font-size:17px;margin-top:0}section{background:#191f28;border:1px solid #303a49;border-radius:12px;padding:20px;margin:16px 0}label{display:block;margin-top:12px}input,select{width:100%;padding:9px;background:#111722;color:inherit;border:1px solid #303a49;border-radius:8px;font:inherit}button{padding:9px 14px;margin:12px 8px 0 0;border:0;border-radius:8px;background:#76a7ff;color:#111722;font:600 14px system-ui;cursor:pointer}button.secondary{background:#2b3646;color:inherit}button.danger{background:#51323a;color:#ffc1c7}.muted,small{color:#9caabd}small{display:block}.check{display:flex;gap:8px;align-items:center}.check input{width:auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:12px}.grid label{margin:0;padding:10px;border-bottom:1px solid #303a49}#message{white-space:pre-wrap;color:#a7d8bc}#runtime{white-space:pre-wrap}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:8px;border-bottom:1px solid #303a49}.scroll{overflow:auto}.top{display:flex;align-items:center;justify-content:space-between}\n</style></head><body><main><div class="top"><h1>🥕 emoskata · 核心管理</h1><button id="logout" class="secondary">退出</button></div><p class="muted">系统参数只读写同一份 .env。账号、签到设置和通知保存在 SQLite；历史共享数据保留但不启用；管理员密码不能用于个人登录。</p>\n<section><h2>Bot 服务</h2><label>Telegram Bot Token<input id="token" type="password" autocomplete="off" placeholder="留空保留，不回显"></label><label class="check"><input id="clear-token" type="checkbox">明确清除 Bot Token</label><p id="configured" class="muted"></p><p class="muted">emos 用户 ID 在下方系统参数的 EMOS_USER_ID 配置；填写后 Bot 的 /login 直接跳转官方授权，不再索要。官方授权后按账号 ID 与 TG 绑定核验。</p><label>个人网页公开地址<input id="web-base" placeholder="https://sign.example.com"></label><small>公网 HTTPS；仅填写域名和可选端口，不含路径。</small></section>\n<section><h2>全部系统参数</h2><p class="muted">带“重启生效”的参数保存后点击下面的核心重启。改变 DATA_DIR 会切换数据库位置，不会搬迁数据；仅更新程序时保持原目录。</p><div id="fields" class="grid"></div><button id="save">保存到 .env</button><button id="reload" class="secondary">重新读取配置</button></section><div id="message" role="status" aria-live="polite"></div>\n<section><h2>应用核心</h2><div id="runtime">正在读取…</div><button id="refresh-runtime" class="secondary">刷新运行信息</button><button id="restart" class="danger">重启应用核心</button><p class="muted">不重启宿主机，不需要 root。先删除旧 emoskata.py，再把新文件上传到同一路径，确认上传完成后点击重启。文件缺失或语法错误会拒绝重启并保留旧核心。</p></section>\n<section><h2>账号运行状态 · 只读</h2><div class="scroll"><table><thead><tr><th>账号</th><th>官方 ID</th><th>状态</th><th>可用余额</th><th>本次所得</th><th>最近签到</th></tr></thead><tbody id="rows"></tbody></table></div><p class="muted">首号官方授权、其他账号 Token 添加及账号设置请从 TG Bot 进入。旧版账号和记录不会因更新被清空。</p></section></main><script>\nconst $=id=>document.getElementById(id);let revision=\'\',controls=new Map();\nasync function api(path,body){const r=await fetch(\'/api/\'+path,{credentials:\'same-origin\',method:body===undefined?\'GET\':\'POST\',headers:{\'Content-Type\':\'application/json\'},body:body===undefined?undefined:JSON.stringify(body)});const j=await r.json();if(r.status===401){location.replace(\'/login\');throw Error(\'管理员会话已失效\');}if(!r.ok)throw Error(j.error||\'操作失败\');return j;}\nfunction say(text){$(\'message\').textContent=text||\'\';}\nasync function runtime(){const s=await api(\'runtime\');$(\'runtime\').textContent=\'核心 PID：\'+s.pid+\' · 线程：\'+s.threads+\'\\n当前内存：\'+(s.rss_bytes==null?\'不可读取\':(s.rss_bytes/1048576).toFixed(1)+\' MiB\')+\' · 峰值：\'+(s.max_rss_bytes==null?\'不可读取\':(s.max_rss_bytes/1048576).toFixed(1)+\' MiB\')+\'\\n监听：\'+s.bind_host+\':\'+s.port+\' · 容器 IP：\'+s.container_ip+\'\\n状态：\'+s.restart_status+\' · 网页待办：\'+s.pending_web_jobs+\' · 通知待办：\'+s.notification_queue+(s.restart_error?\'\\n\'+s.restart_error:\'\');}\nasync function load(){const c=await api(\'config\');revision=c.revision;controls=new Map([[\'TG_BOT_TOKEN\',$(\'token\')],[\'WEB_BASE_URL\',$(\'web-base\')]]);$(\'token\').value=\'\';$(\'clear-token\').checked=false;$(\'web-base\').value=c.web_base_url||\'\';$(\'configured\').textContent=c.tg_bot_configured?\'Token 已配置。留空保存保持不变。\':\'尚未配置 Token。\';$(\'fields\').replaceChildren();for(const f of c.fields){if(controls.has(f.key))continue;const label=document.createElement(\'label\');label.append(document.createTextNode(f.label+(f.restart?\' · 重启生效\':\'\')));const input=document.createElement(f.kind===\'bool\'?\'select\':\'input\');if(f.kind===\'bool\'){for(const [value,text] of [[\'1\',\'开启\'],[\'0\',\'关闭\']]){const option=document.createElement(\'option\');option.value=value;option.textContent=text;input.append(option);}}else{input.type=f.secret?\'password\':f.kind===\'int\'?\'number\':\'text\';if(f.kind===\'int\'){input.min=f.minimum;input.max=f.maximum;}if(f.secret){input.autocomplete=\'new-password\';input.placeholder=f.configured?\'已配置，留空保留\':\'留空保留\';}}input.value=f.value;input.dataset.key=f.key;label.append(input);const detail=document.createElement(\'small\');detail.textContent=f.description;label.append(detail);$(\'fields\').append(label);controls.set(f.key,input);}const rows=await api(\'accounts\');$(\'rows\').replaceChildren();for(const row of rows){const tr=document.createElement(\'tr\');for(const text of [row.name,row.emos_id||\'待重新授权\',row.last_status||\'未运行\',Number.isInteger(row.carrot)?row.carrot:\'未知\',Number.isInteger(row.last_carrot)?\'+\'+row.last_carrot:\'—\',row.last_run||\'—\']){const td=document.createElement(\'td\');td.textContent=text;tr.append(td);}$(\'rows\').append(tr);}await runtime();}\nasync function operation(fn){document.querySelectorAll(\'button\').forEach(b=>b.disabled=true);try{await fn();}catch(e){say(e.message||\'操作失败\');}finally{document.querySelectorAll(\'button\').forEach(b=>b.disabled=false);}}\n$(\'save\').onclick=()=>operation(async()=>{const changes={};for(const [key,control] of controls)changes[key]=control.value;const clear_secrets=$(\'clear-token\').checked?[\'TG_BOT_TOKEN\']:[];const result=await api(\'config\',{changes,revision,clear_secrets});say(\'已保存到唯一配置文件 .env。\'+(result.restart_required.length?\'\\n重启生效：\'+result.restart_required.join(\', \'):\'\'));if(result.changed.includes(\'PANEL_PASSWORD\'))location.replace(\'/login\');else await load();});\n$(\'reload\').onclick=()=>operation(load);$(\'refresh-runtime\').onclick=()=>operation(runtime);\n$(\'restart\').onclick=()=>operation(async()=>{if(!confirm(\'确认新 py 已上传完成？这只重启应用核心，账号和配置不删除。\'))return;const r=await api(\'restart\',{confirm:true});say(r.message+\'\\n网络任务收尾后重启，可稍后刷新运行信息。\');});\n$(\'logout\').onclick=()=>operation(async()=>{await api(\'logout\',{});location.replace(\'/login\');});load().catch(e=>say(e.message));\n</script></body></html>\n'
+PAGE = '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>emoskata · 核心管理</title><style>\n:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#101318;color:#eef2f7;font:14px/1.6 system-ui,sans-serif}main{max-width:960px;margin:auto;padding:22px 16px 60px}h1{font-size:24px}h2{font-size:17px;margin-top:0}section{background:#191f28;border:1px solid #303a49;border-radius:12px;padding:20px;margin:16px 0}label{display:block;margin-top:12px}input,select{width:100%;padding:9px;background:#111722;color:inherit;border:1px solid #303a49;border-radius:8px;font:inherit}button{padding:9px 14px;margin:12px 8px 0 0;border:0;border-radius:8px;background:#76a7ff;color:#111722;font:600 14px system-ui;cursor:pointer}button.secondary{background:#2b3646;color:inherit}button.danger{background:#51323a;color:#ffc1c7}.muted,small{color:#9caabd}small{display:block}.check{display:flex;gap:8px;align-items:center}.check input{width:auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:12px}.grid label{margin:0;padding:10px;border-bottom:1px solid #303a49}#message{white-space:pre-wrap;color:#a7d8bc}#runtime{white-space:pre-wrap}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:8px;border-bottom:1px solid #303a49}.scroll{overflow:auto}.top{display:flex;align-items:center;justify-content:space-between}\n</style></head><body><main><div class="top"><h1>🥕 emoskata · 核心管理</h1><button id="logout" class="secondary">退出</button></div><p class="muted">系统参数只读写同一份 .env。账号、签到设置和通知保存在 SQLite；历史共享数据保留但不启用；管理员密码不能用于个人登录。</p>\n<section><h2>Bot 服务</h2><label>Telegram Bot Token<input id="token" type="password" autocomplete="off" placeholder="留空保留，不回显"></label><label class="check"><input id="clear-token" type="checkbox">明确清除 Bot Token</label><p id="configured" class="muted"></p><p class="muted">emos 用户 ID 在下方系统参数的 EMOS_USER_ID 配置；填写后 Bot 的 /login 直接跳转官方授权，不再索要。官方授权后按账号 ID 与 TG 绑定核验。</p><label>个人网页公开地址<input id="web-base" placeholder="https://sign.example.com"></label><small>公网 HTTPS；仅填写域名和可选端口，不含路径。</small></section>\n<section><h2>全部系统参数</h2><p class="muted">带“重启生效”的参数保存后点击下面的核心重启。改变 DATA_DIR 会切换数据库位置，不会搬迁数据；仅更新程序时保持原目录。</p><div id="fields" class="grid"></div><button id="save">保存到 .env</button><button id="reload" class="secondary">重新读取配置</button></section><div id="message" role="status" aria-live="polite"></div>\n<section><h2>应用核心</h2><div id="runtime">正在读取…</div><button id="refresh-runtime" class="secondary">刷新运行信息</button><button id="restart" class="danger">重启应用核心</button><p class="muted">不重启宿主机，不需要 root。先删除旧 emoskata.py，再把新文件上传到同一路径，确认上传完成后点击重启。文件缺失或语法错误会拒绝重启并保留旧核心。</p></section>\n<section><h2>账号运行状态 · 只读</h2><div class="scroll"><table><thead><tr><th>账号</th><th>官方 ID</th><th>状态</th><th>可用余额</th><th>本次所得</th><th>最近签到</th></tr></thead><tbody id="rows"></tbody></table></div><p class="muted">首号官方授权、其他账号 Token 添加及账号设置请从 TG Bot 进入。旧版账号和记录不会因更新被清空。</p></section></main><script>\nconst $=id=>document.getElementById(id);let revision=\'\',controls=new Map();\nasync function api(path,body){const r=await fetch(\'/api/\'+path,{credentials:\'same-origin\',method:body===undefined?\'GET\':\'POST\',headers:{\'Content-Type\':\'application/json\'},body:body===undefined?undefined:JSON.stringify(body)});const j=await r.json();if(r.status===401){location.replace(\'/login\');throw Error(\'管理员会话已失效\');}if(!r.ok)throw Error(j.error||\'操作失败\');return j;}\nfunction say(text){$(\'message\').textContent=text||\'\';}\nasync function runtime(){const s=await api(\'runtime\');$(\'runtime\').textContent=\'核心 PID：\'+s.pid+\' · 线程：\'+s.threads+\'\\n当前内存：\'+(s.rss_bytes==null?\'不可读取\':(s.rss_bytes/1048576).toFixed(1)+\' MiB\')+\' · 峰值：\'+(s.max_rss_bytes==null?\'不可读取\':(s.max_rss_bytes/1048576).toFixed(1)+\' MiB\')+\'\\n服务器公网 IP：\'+(s.server_public_ip||(s.public_ip_status===\'pending\'?\'探测中\':\'不可获取\'))+\'\\n管理访问地址：\'+(s.management_url||\'请配置 PUBLIC_BASE\')+\'\\n容器监听：\'+s.bind_host+\':\'+s.port+\' · 内网 IP（仅诊断）：\'+s.container_ip+\'\\n状态：\'+s.restart_status+\' · 网页待办：\'+s.pending_web_jobs+\' · 通知待办：\'+s.notification_queue+(s.restart_error?\'\\n\'+s.restart_error:\'\');}\nasync function load(){const c=await api(\'config\');revision=c.revision;controls=new Map([[\'TG_BOT_TOKEN\',$(\'token\')],[\'WEB_BASE_URL\',$(\'web-base\')]]);$(\'token\').value=\'\';$(\'clear-token\').checked=false;$(\'web-base\').value=c.web_base_url||\'\';$(\'configured\').textContent=c.tg_bot_configured?\'Token 已配置。留空保存保持不变。\':\'尚未配置 Token。\';$(\'fields\').replaceChildren();for(const f of c.fields){if(controls.has(f.key))continue;const label=document.createElement(\'label\');label.append(document.createTextNode(f.label+(f.restart?\' · 重启生效\':\'\')));const input=document.createElement(f.kind===\'bool\'?\'select\':\'input\');if(f.kind===\'bool\'){for(const [value,text] of [[\'1\',\'开启\'],[\'0\',\'关闭\']]){const option=document.createElement(\'option\');option.value=value;option.textContent=text;input.append(option);}}else{input.type=f.secret?\'password\':f.kind===\'int\'?\'number\':\'text\';if(f.kind===\'int\'){input.min=f.minimum;input.max=f.maximum;}if(f.secret){input.autocomplete=\'new-password\';input.placeholder=f.configured?\'已配置，留空保留\':\'留空保留\';}}input.value=f.value;input.dataset.key=f.key;label.append(input);const detail=document.createElement(\'small\');detail.textContent=f.description;label.append(detail);$(\'fields\').append(label);controls.set(f.key,input);}const rows=await api(\'accounts\');$(\'rows\').replaceChildren();for(const row of rows){const tr=document.createElement(\'tr\');for(const text of [row.name,row.emos_id||\'待重新授权\',row.last_status||\'未运行\',Number.isInteger(row.carrot)?row.carrot:\'未知\',Number.isInteger(row.last_carrot)?\'+\'+row.last_carrot:\'—\',row.last_run||\'—\']){const td=document.createElement(\'td\');td.textContent=text;tr.append(td);}$(\'rows\').append(tr);}await runtime();}\nasync function operation(fn){document.querySelectorAll(\'button\').forEach(b=>b.disabled=true);try{await fn();}catch(e){say(e.message||\'操作失败\');}finally{document.querySelectorAll(\'button\').forEach(b=>b.disabled=false);}}\n$(\'save\').onclick=()=>operation(async()=>{const changes={};for(const [key,control] of controls)changes[key]=control.value;const clear_secrets=$(\'clear-token\').checked?[\'TG_BOT_TOKEN\']:[];const result=await api(\'config\',{changes,revision,clear_secrets});say(\'已保存到唯一配置文件 .env。\'+(result.restart_required.length?\'\\n重启生效：\'+result.restart_required.join(\', \'):\'\'));if(result.changed.includes(\'PANEL_PASSWORD\'))location.replace(\'/login\');else await load();});\n$(\'reload\').onclick=()=>operation(load);$(\'refresh-runtime\').onclick=()=>operation(runtime);\n$(\'restart\').onclick=()=>operation(async()=>{if(!confirm(\'确认新 py 已上传完成？这只重启应用核心，账号和配置不删除。\'))return;const r=await api(\'restart\',{confirm:true});say(r.message+\'\\n网络任务收尾后重启，可稍后刷新运行信息。\');});\n$(\'logout\').onclick=()=>operation(async()=>{await api(\'logout\',{});location.replace(\'/login\');});load().catch(e=>say(e.message));\n</script></body></html>\n'
 
 
 # HTTP 入口
@@ -1198,8 +1225,21 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/logs":
             if "tg_allowed_user_ids" in cfg_all():
-                owner = configured_owner(cfg_all())
-                return self._send(200, Store().accounts.logs(owner, limit=100) if owner else [])
+                policy = tg_access_owner(cfg_all())
+                if policy == 0:
+                    return self._send(200, [])
+                if policy is not None:
+                    return self._send(200, Store().accounts.logs(policy, limit=100))
+                with db() as conn:
+                    rows = [dict(row) for row in conn.execute(
+                        'SELECT l.id,l.account_id,l.name,l.ts,l.status,l.message,l.carrot,'
+                        'a.token AS account_token FROM logs l JOIN accounts a ON a.id=l.account_id '
+                        'WHERE a.owner_tg_id IS NOT NULL ORDER BY l.id DESC LIMIT 120')]
+                for row in rows:
+                    token = row.pop('account_token') or ''
+                    for key in ('name', 'message'):
+                        row[key] = str(row[key] or '').replace(token, '[凭证已隐藏]') if token else str(row[key] or '')
+                return self._send(200, rows)
             with db() as conn:
                 rows = [dict(r) for r in conn.execute(
                     "SELECT * FROM logs ORDER BY id DESC LIMIT 120").fetchall()]
@@ -1214,8 +1254,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == '/api/runtime':
             info = resource_snapshot()
+            info.update(public_ip_status())
             info.update(restart_status=_restart_status, restart_error=_restart_error,
                         accepting_tasks=not _draining.is_set(), container_ip=_CONTAINER_IP,
+                        management_url=_management_address(),
                         bind_host=_RUNTIME_CONFIG['http_host'], port=_RUNTIME_CONFIG['port'],
                         pending_web_jobs=len(_web_service.pending) if _web_service else 0,
                         notification_queue=_notifications.qsize())
@@ -1318,7 +1360,7 @@ class Handler(BaseHTTPRequestHandler):
 def bot_supervisor():
     """监听配置身份变化并收尾旧 Bot，才启动替换轮询线程。
 
-    没有有效 Token 或唯一 TG ID 不起 Bot；监督仍每五秒读取缓存配置。"""
+    无 Token 或策略非法不起 Bot；TG ID 留空公开，监督每五秒读取缓存配置。"""
     global _active_bot
     from bot import Bot
     identity, current = None, None
@@ -1332,7 +1374,7 @@ def bot_supervisor():
                     _shutdown.wait(1)
                     continue
                 wanted = (cfg['tg_bot_token'], cfg['tg_api_base_url'], cfg['tg_poll_timeout'],
-                          cfg['bot_workers'], cfg['bot_max_jobs'], configured_owner(cfg))
+                          cfg['bot_workers'], cfg['bot_max_jobs'], tg_access_owner(cfg))
                 dead = current is not None and current._poll_thread is not None and not current._poll_thread.is_alive()
                 if wanted != identity or (wanted[0] and dead):
                     if current:
@@ -1345,16 +1387,17 @@ def bot_supervisor():
                             _shutdown.wait(5)
                             continue
                     identity, current = wanted, None
-                    if wanted[0] and wanted[-1] is not None:
+                    if wanted[0] and wanted[-1] != 0:
                         current = Bot(wanted[0], Store(), workers=cfg['bot_workers'], max_jobs=cfg['bot_max_jobs'])
                         thread = threading.Thread(target=current.run, name='emos-bot-poll', daemon=True)
                         current._poll_thread = thread
                         with _active_bot_lock:
                             _active_bot = current
                         thread.start()
-                        print('[bot] 官方首登、Token 多账号及网页入口已启用。')
+                        mode = '公开私聊' if wanted[-1] is None else '指定 TG ID'
+                        print('[bot] %s模式：官方首登、Token 多账号及网页入口已启用。' % mode)
                     else:
-                        print('[bot] 请在 .env 配置 Bot Token 和唯一 TG ID。')
+                        print('[bot] 请配置 Bot Token；TG ID 留空公开，填一个正整数限制访问。')
             except Exception:
                 print('[bot] 当前配置或网络暂不可用，稍后重试。')
             _shutdown.wait(5)
@@ -1683,6 +1726,11 @@ def main():
     restart_deadline = None
     try:
         cfg = cfg_all()
+        if not _STARTUP_PROBE:
+            try:
+                prepare_requirements(__file__)
+            except OSError:
+                print('[deploy] requirements.txt 无法写入；不影响标准库运行，请手动上传清单。')
         init_db()
         legacy = import_legacy_config()
         if legacy['imported']:
@@ -1693,8 +1741,8 @@ def main():
             print('[config] 部分旧配置无效，请在管理页检查。')
         if cfg['http_enabled']:
             init_password()
-        if not cfg['http_enabled'] and (not cfg['tg_bot_token'] or configured_owner(cfg) is None):
-            raise EnvConfigError('纯 Bot 模式需要 Bot Token 和唯一 TG ID。')
+        if not cfg['http_enabled'] and (not cfg['tg_bot_token'] or tg_access_owner(cfg) == 0):
+            raise EnvConfigError('纯 Bot 模式需要 Bot Token 和有效访问策略；TG ID 留空为公开。')
         _shutdown.clear()
         _notification_wakeup.clear()
         _draining.clear()
@@ -1707,7 +1755,7 @@ def main():
             server.timeout = 1
             _HTTP_SERVER = server
             if not _STARTUP_PROBE:
-                print('管理入口：http://%s:%d/admin' % (_CONTAINER_IP, cfg['port']))
+                print('[web] 已监听 %s:%d；此为容器监听，不是公网访问地址。' % (cfg['http_host'], cfg['port']))
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, lambda *_: _shutdown.set())
         _start_core_threads()
@@ -1718,6 +1766,11 @@ def main():
         # 提交成功快照后放行业务，失败候选不能提前发送签到或 Telegram 请求。
         mark_ready(os.path.abspath(__file__), str(CONFIG.path))
         _CORE_START_GATE.set()
+        if cfg['http_enabled']:
+            prepare = _management_address()
+            if prepare:
+                print('管理入口：%s' % prepare)
+            start_public_ip_probe(_CONTAINER_IP, _shutdown, _report_public_address)
         while not _shutdown.is_set():
             if _restart_requested.is_set():
                 if restart_deadline is None:

@@ -38,6 +38,11 @@ class InstallerTests(unittest.TestCase):
             self.assertFalse((root / 'config' / '.env').exists())
             self.assertTrue((root / 'config' / '.env.example').is_file())
             self.assertTrue((root / 'runtime' / 'emoskata.py').is_file())
+            requirements = root / 'runtime' / 'requirements.txt'
+            self.assertTrue(requirements.is_file())
+            self.assertFalse(any(line.strip() and not line.lstrip().startswith('#')
+                                 for line in requirements.read_text().splitlines()))
+            requirements.write_text('# host-supplied list must remain unchanged\n')
             # 部署者填好后：只读校验通过，文件字节不变，不建数据库。
             config_path = fill_env(root / 'config' / '.env')
             before = config_path.read_bytes()
@@ -56,6 +61,7 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(runtime.read_bytes(), program)
             self.assertEqual(config_path.read_bytes(), before)
+            self.assertEqual(requirements.read_text(), '# host-supplied list must remain unchanged\n')
 
     def test_prepare_docker_rejects_invalid_env_without_rewriting_it(self):
         with tempfile.TemporaryDirectory(prefix='emos-prep-bad-') as directory:
@@ -90,6 +96,9 @@ class InstallerTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse((target / '.env').exists())
             self.assertTrue((target / '.env.example').is_file())
+            requirements = target / 'requirements.txt'
+            self.assertTrue(requirements.is_file())
+            requirements.write_text('# supplied requirements preserved\n')
             config_path = fill_env(target / '.env')
             before = config_path.read_bytes()
             result = subprocess.run(['sh', str(root / 'install.sh'), str(target)], cwd=root,
@@ -100,6 +109,7 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(ConfigStore(config_path).snapshot()[0]['PANEL_PASSWORD'],
                              FIXTURE_PASSWORD)
             self.assertEqual(set(ConfigStore(config_path).snapshot()[0]), set(SCHEMA))
+            self.assertEqual(requirements.read_text(), '# supplied requirements preserved\n')
 
     def test_prepare_scripts_have_valid_shell_syntax(self):
         for script in ('install.sh', 'prepare_docker.sh'):

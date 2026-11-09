@@ -17,6 +17,13 @@ if [ ! -f runtime/emoskata.py ]; then
 else
     echo 'runtime/emoskata.py 已存在，未覆盖；更新时只删除并重新上传这一个 py。'
 fi
+if [ ! -f runtime/requirements.txt ]; then
+    if [ -f requirements.txt ]; then
+        cp requirements.txt runtime/requirements.txt
+    else
+        (cd "$HERE/runtime" && python3 "$HERE/emoskata.py" --prepare-host)
+    fi
+fi
 if [ ! -f config/.env.example ]; then
     cp .env.example config/.env.example
 fi

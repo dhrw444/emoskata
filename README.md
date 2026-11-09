@@ -1,10 +1,10 @@
 # emoskata
 
-**专用 TG Bot：首个账号官方授权，后续 emos Token 添加，全部账号统一签到。**
+**TG 签到 Bot：留空 TG ID 公开使用，填写 ID 限定本人；每位用户的账号独立管理。**
 
-Python 3.10+，零第三方 Python 依赖（`requirements.txt` 只含注释，没有需安装的包）。单文件部署只需上传 `emoskata.py` 和你填好的 `.env`；不需要上传维护模块或 Node。也可上传分模块源码并启动 `app.py`。调度、Bot 和网页服务在一个应用进程内运行；重启预检会临时创建子进程。
+Python 3.10+，零第三方 Python 依赖。运行核心只需 `emoskata.py` 与你填好的 `.env`；托管平台首次检查依赖文件时，还要把仓库的 `requirements.txt` 放在实际运行目录。该文件只含注释，没有需安装的包。Node 和旁边的维护模块不是运行依赖。调度、Bot 和网页服务在一个应用进程内运行；重启预检会临时创建子进程。
 
-> 当前版本已按单人方案接通 Token 引导、全部账号操作、余额展示和个人网页权限。历史跨 TG 共享数据保留但入口关闭。更新先隔离初始化预检；就绪前启动失败由事务恢复旧代码、配置和数据库；见 [验证记录](VALIDATION.md) 和 [维护地图](MAINTENANCE.md)。
+> 公开使用不等于共享账号或公开管理员面板：每个 TG 用户先通过官方授权建立自己的主号，再添加本人持有 Token 的其他账号。历史跨 TG 共享入口保持关闭。服务器公网 IP 独立探测；CDN 域名只决定访问链接，配置域名不取消探测。更新及数据保留见 [验证记录](VALIDATION.md) 和 [维护地图](MAINTENANCE.md)。
 
 ## 配置：只有 `.env` 一个运行来源
 
@@ -22,13 +22,13 @@ Python 3.10+，零第三方 Python 依赖（`requirements.txt` 只含注释，�
 | `PORT` | `8080` | 监听端口 |
 | `DATA_DIR` | `./data` | SQLite 数据目录 |
 | `TG_BOT_TOKEN` | 空 | BotFather 签发的 Token |
-| `TG_ALLOWED_USER_IDS` | 空 | 历史变量名沿用，但现在**只填一个正整数 TG ID**；同时为通知接收人。空值关闭 Bot/个人网页入口，多 ID 拒绝配置 |
+| `TG_ALLOWED_USER_IDS` | 空 | **留空公开使用，填写一个正整数仅允许该 TG ID**；非法值和多个 ID 拒绝。公开模式通知发各账号本人 |
 | `TG_API_BASE_URL` | `https://api.telegram.org` | Telegram API 地址 |
-| `EMOS_USER_ID` | 空 | emos 用户 ID（官网账号卡片上的 ID，**不是 Token**）。填写后 `/login` 直接跳官方授权，不再索要；面板可改 |
+| `EMOS_USER_ID` | 空 | 指定 TG ID 模式下 `/login` 的默认本人 emos ID；公开模式各用户输入自己的 ID，不能共用管理员默认 ID |
 | `EMOS_AUTH_BOT` | `emospg_bot` | emos 官方授权 Bot 用户名，不含 `@`；官方换名只改这里 |
 | `EMOS_BASE_URL` | `https://emos.best` | emos API 地址；也是 Bot 里「在官网查看」的链接；自定义站不向公共站降级 |
-| `WEB_BASE_URL` | 空 | 个人网页公开地址（反代时填） |
-| `PUBLIC_BASE` | 空 | 管理员网页公开地址 |
+| `WEB_BASE_URL` | 空 | 个人网页的 HTTPS 域名/CDN 入口，不影响服务器公网 IP 探测 |
+| `PUBLIC_BASE` | 空 | 管理员 HTTPS 域名/CDN 入口；公网 IP 仍独立探测和显示 |
 | `SIGN_TIME` | `08:00` | 默认签到时间，强制不早于 `01:00` |
 | `SIGN_TIMEZONE` | `Asia/Shanghai` | 调度与日期判定时区 |
 | `GAP_SECONDS` | `8` | 多账号之间的间隔秒数 |
@@ -48,7 +48,7 @@ Python 3.10+，零第三方 Python 依赖（`requirements.txt` 只含注释，�
 
 ## 登录：首个账号官方授权，后续 Token 添加
 
-1. 在 `.env` 或管理员面板填写 `EMOS_USER_ID`。私聊本 Bot 输入 `/login`，直接获得官方授权链接，不再聊天索要 ID。
+1. 私聊 `/login`。公开模式会提示发送**你自己的** emos ID，也可直接 `/login 你的ID`；指定 TG ID 模式可在 `.env` 填 `EMOS_USER_ID` 后直接获得授权链接。这里填写官网账号卡片的 ID，不是 Token。
 2. Bot 调用 `getMe` 获得用户名，生成官方协议链接：
 
    ```text
@@ -58,7 +58,7 @@ Python 3.10+，零第三方 Python 依赖（`requirements.txt` 只含注释，�
    ```
 
 3. 在 `@emospg_bot` 同意后返回。应用核验 `GET /api/user` 的账号 ID、TG 绑定及待授权时限，事务内建立官方主账号证明。
-4. 其他账号输入 `/token` 后粘贴该账号的**官方 emos Token**，或使用 `/token Token`。每个 Token 对应一个独立 emos 账号，不要求这些账号绑定同一个 TG，未绑定 TG 的账号也可添加。操作权限仍只授予配置的 TG ID。
+4. 其他账号输入 `/token` 后粘贴该账号的**官方 emos Token**，或使用 `/token Token`。每个 Token 对应一个独立 emos 账号，不要求这些账号绑定同一个 TG；同一官方账号不能被另一个 TG 用户重复占用。公开模式每个人只管理自己登记的账号，指定模式仅配置的 ID 能操作。
 5. 所有登记的账号都能查看、切换、分别修改签到设置。`/accounts` 选择账号，`/sign` 只签当前账号；`/signall` 签全部有效账号。Bot 与网页都有「签到当前账号」「签到全部账号」两个按钮。
 6. 已有主账号后，`/login` 只重新授权该主账号。切换到其他账号也不会把它误当作主账号；更新其他账号 Token 使用 `/token`。
 
@@ -66,7 +66,7 @@ Python 3.10+，零第三方 Python 依赖（`requirements.txt` 只含注释，�
 
 ### Telegram 的 `/` 命令菜单
 
-`setMyCommands` 只为配置 owner 的私聊作用域注册；`setChatMenuButton` 把菜单按钮设为指令列表。权限仍在每次消息/回调中核对 `from.id` 和私聊 ID，菜单范围不是访问控制。
+公开模式的 `setMyCommands` 注册全部私聊作用域，菜单按钮为指令列表；指定模式只为配置 ID 的私聊作用域注册。权限仍在每次消息/回调中核对 `from.id` 和私聊 ID，菜单范围不是访问控制。
 
 ```text
 /start /menu /login /token /sign /signall /accounts
@@ -105,10 +105,10 @@ query content：说点什么进行随机签到以获得更多萝卜
 
 - `/accounts` 显示全部账号、官方 ID 和缓存余额。未知余额写“余额未知”，不拿 0 冒充；真实 0 正常显示。
 - `carrot` 是官方可用余额；`last_carrot` 是最近单次所得。网页和管理表格分别标注，不把单次 +3 写成总余额 3。
-- `/web` 发一次性入口链接。兑换、会话认证、设置、记录和签到逐次检查当前 owner；修改/清空 TG ID 后旧个人会话立即无权操作。
-- 管理员网页依然用 `PANEL_PASSWORD`，只展示当前 owner 的账号与记录，不从其他 TG 保留数据中组装总览。
+- `/web` 发一次性入口链接。兑换、认证、设置和签到逐次核对当前访问策略及账户归属；改成指定 ID 后其他人的旧会话立即无权，改回留空公开不会删除任何人数据。
+- 管理员网页始终需要 `PANEL_PASSWORD`。公开模式显示脱敏管理总览，指定模式只显示指定 ID 的账号；TG 公开不等于公开管理员权限。
 - `/link`、`/links`、`/code` 以及历史关联回调关闭；原 SQLite 链接、码、申请和账号不硬删除，调度忽略旧跨 TG 授权。
-- 没有仍具有效本地登录的官方主号时，禁止 Token 添加和自动签到。退出保留首号证明，但证明不等于有效登录。自动签到仅选择当前 owner 的有效账号。
+- 每个 TG 用户没有仍具有效本地登录的官方主号时，禁止添加额外 Token 和自动签到。退出保留首号证明，但证明不等于有效登录。公开模式调度每个人自己的有效账号，不采用历史跨 TG 共享关系。
 
 ## 部署
 
@@ -116,8 +116,9 @@ query content：说点什么进行随机签到以获得更多萝卜
 
 ```sh
 cp .env.example .env
-# 编辑 .env：填 PANEL_PASSWORD、TG_BOT_TOKEN、TG_ALLOWED_USER_IDS
+# 编辑 .env：填 PANEL_PASSWORD、TG_BOT_TOKEN；TG_ALLOWED_USER_IDS 留空公开或填一个指定 ID
 chmod 600 .env
+python3 emoskata.py --prepare-host
 python3 emoskata.py --check-config
 python3 emoskata.py
 ```
@@ -128,8 +129,8 @@ python3 emoskata.py
 
 ```sh
 mkdir -p config data runtime
-cp emoskata.py runtime/
-cp .env.example config/.env        # 然后编辑它：填 PANEL_PASSWORD / TG_BOT_TOKEN / TG_ALLOWED_USER_IDS
+cp emoskata.py requirements.txt runtime/
+cp .env.example config/.env        # 填密码、Bot Token；TG ID 留空公开或填一个指定 ID
 chmod 600 config/.env
 docker compose up -d
 ```
@@ -146,9 +147,9 @@ EMOS_ENV_FILE="$PWD/config/.env" python3 runtime/emoskata.py --check-config
 |---|---|
 | `config/` | `.env`（唯一配置） |
 | `data/` | `data.db`（账号、官方主号证明、会话、日志及保留历史） |
-| `runtime/` | `emoskata.py` |
+| `runtime/` | `emoskata.py` 与 `requirements.txt` |
 
-`prepare_docker.sh` 只在文件不存在时复制 `.env.example` 与 `runtime/emoskata.py`，不覆盖已有文件；`config/.env` 缺失时它直接报错退出，不会替你创建。
+`prepare_docker.sh` 只补缺失的 `.env.example`、`runtime/emoskata.py` 和 `runtime/requirements.txt`，不覆盖已有文件；`config/.env` 缺失时直接报错退出，不会替你创建。
 
 ### 纯 Bot（不开网页）
 
@@ -158,13 +159,32 @@ EMOS_ENV_FILE="$PWD/config/.env" python3 runtime/emoskata.py --check-config
 EMOS_ENV_FILE=/app/config/.env python3 /app/runtime/emoskata.py
 ```
 
-`HTTP_ENABLED` 应写进 `.env`；进程环境不参与配置，`.env` 是唯一来源。没有唯一 TG ID 不启动 Bot；启动校验还会拒绝“关闭网页且没有 Bot Token”的组合。纯 Bot 模式目前没有等价的 Bot 重启命令。
+`HTTP_ENABLED` 应写进 `.env`；进程环境不参与配置。纯 Bot 必须有 Token，TG ID 留空即可公开；非法 ID 拒绝启动。纯 Bot 模式目前没有等价的 Bot 核心重启命令。
 
 ### 分文件
 
 ```sh
 python3 app.py
 ```
+
+## 公网 IP、容器 IP 与 CDN
+
+三个地址独立，不能混用：
+
+- **服务器公网 IP**：正常启动就绪后独立探测一次。配置了域名或 CDN 仍执行；探测结果只作源站/出口 IP 显示，不修改 `.env`，不自动改 CDN DNS。
+- **管理访问地址**：有 `PUBLIC_BASE` 时使用你的 HTTPS 域名/CDN；没填时用探测到的公网 IP 与监听端口。`WEB_BASE_URL` 单独决定个人登录链接。
+- **容器内网 IP**：`172.19.*` 等仅保留为诊断信息，不再当“管理入口”打印。
+
+公网探测使用两个固定 HTTPS 服务、短超时及响应上限，成功/失败都缓存，不按面板刷新反复请求。NAT 出口 IP 不是入站可达性的证明；宿主端口映射、防火墙与 CDN 回源端口仍需真实连通。Compose 默认发布 `8080:8080`，支持公网 IP 直连；只允许反代访问时可自行改为 `127.0.0.1:8080:8080`。
+
+## 托管平台的 requirements.txt
+
+日志“requirements.txt 文件不存在”不是 `ModuleNotFoundError`：平台在执行 py **之前**检查依赖清单。零包项目仍需这个文件。
+
+- 首次上传：把 `requirements.txt` 与 `emoskata.py` 放进平台实际运行目录。
+- 或先在终端执行 `python3 emoskata.py --prepare-host`，仅补齐入口目录和工作目录的清单；不需要 `.env`、不建库、不发网络请求。
+- 正常启动也会补缺失清单，但程序不能消除已经在它启动前打印的第一次提示。
+- 安装脚本、容器镜像和 `runtime/` 挂载目录都携带清单，已有内容不覆盖。不自动下载任何不存在的 Python 包，也不生成 `.env`。
 
 ## 更新：只替换 py
 

@@ -1,6 +1,6 @@
 """Telegram 入口：官方首登、独立 Token、菜单和有界任务。
 
-仅处理唯一操作者的私聊；接收、排队执行和网络结果落库分别核验权限。
+留空 TG ID 接受公开私聊，填写时仅指定用户；接收、排队执行和网络落库分别核验权限。
 长轮询和 worker 属于当前应用进程，不承担后台常驻或自动进程重启。
 Test: python3 -B -m unittest test_bot test_owner_bot test_multi_accounts"""
 
@@ -17,7 +17,7 @@ import urllib.request
 
 from accounts import DomainError
 from emos import EmosClient, EmosError, pick_content
-from envconfig import SCHEMA, configured_owner, owner_permitted
+from envconfig import SCHEMA, tg_access_owner, owner_permitted
 
 POLL_TIMEOUT = 30
 PAGE_SIZE = 8
@@ -29,15 +29,14 @@ _SECRET = re.compile(
 
 
 def _allowed_users(cfg):
-    """解析配置操作者集合；非法值保留拒绝态，不转换为不限用户。"""
-    owner = configured_owner(cfg)
-    return {owner} if _positive(owner) else set()
+    """None 表示显式公开；指定 ID 返回单元素集合，非法配置返回空集合。"""
+    owner = tg_access_owner(cfg)
+    return None if owner is None else {owner} if owner else set()
 
 
 def allowed_actor(tg_id, cfg):
-    """按实时配置核对正整数 TG 身份；空配置没有任何获准操作者。"""
-    return (_positive(tg_id) and bool(_allowed_users(cfg))
-            and owner_permitted(cfg, tg_id))
+    """留空允许任意合法 TG 私聊用户，填写时仅允许指定用户；每次读取当前配置。"""
+    return owner_permitted(cfg, tg_id)
 
 
 def _carrot_text(account):
@@ -491,14 +490,17 @@ class Bot:
                 return
             print("[bot] @%s 已上线" % self.me["username"])
             try:
-                owner = configured_owner(self.store.cfg_all())
-                if owner is not None:
+                owner = tg_access_owner(self.store.cfg_all())
+                if owner != 0:
+                    scope = ({"type": "all_private_chats"} if owner is None
+                             else {"type": "chat", "chat_id": owner})
                     self.tg._api("setMyCommands", {
-                        "commands": command_menu(), "scope": {"type": "chat", "chat_id": owner}
+                        "commands": command_menu(), "scope": scope
                     }, timeout=12)
-                    self.tg._api("setChatMenuButton", {
-                        "chat_id": owner, "menu_button": {"type": "commands"}
-                    }, timeout=12)
+                    button = {"menu_button": {"type": "commands"}}
+                    if owner is not None:
+                        button['chat_id'] = owner
+                    self.tg._api("setChatMenuButton", button, timeout=12)
             except Exception:
                 print("[bot] 斜杠菜单注册失败；命令仍可直接输入，未计作注册成功。")
             delay = self.retry_base
@@ -745,7 +747,7 @@ class Bot:
         return self._reply(chat_id, view[0], view[1], msg_id)
 
     def _show_login(self, tg_id, chat_id, msg_id=None, expected=None, official_id=None):
-        """从 .env 取得官方账号 ID 并生成官方 Bot 授权入口；不在聊天里再索要 ID。"""
+        """为当前用户生成官方授权；公开模式首登填写本人 ID，指定模式可用 .env 默认值。"""
         if not allowed_actor(tg_id, self.store.cfg_all()):
             raise DomainError('只允许配置的 TG 用户操作。')
         account = self._active(tg_id)
@@ -759,8 +761,19 @@ class Bot:
                 raise DomainError('已有官方主账号；其他账号请使用 /token 添加。')
             official_id = primary['emos_id']
         if official_id is None:
-            # 未显式传参时以 .env 为唯一来源，不再向用户索要 emos 用户 ID。
-            configured = str(self.store.cfg_all().get('emos_user_id') or '').strip()
+            cfg = self.store.cfg_all()
+            if tg_access_owner(cfg) is None:
+                self.accounts.cancel_login(tg_id)
+                self._clear_input(tg_id)
+                self.accounts.set_input(tg_id, 'login', ttl=600)
+                user = self.accounts.user(tg_id)
+                with self._state_lock:
+                    self._guided[tg_id] = ('login', root, user['input_until'])
+                return self._reply(chat_id, '<b>🔐 第一个账号：官方 Bot 授权</b>\n\n'
+                                   '请发送你自己的 emos 用户 ID（官网账号卡片上的 ID，不是 Token）。\n'
+                                   '也可发送 <code>/login 你的emosID</code>。输入 10 分钟有效。',
+                                   [[{'text': '取消', 'callback_data': 'cancel'}]], msg_id)
+            configured = str(cfg.get('emos_user_id') or '').strip()
             if not configured:
                 self.accounts.cancel_login(tg_id)
                 self._clear_input(tg_id)
@@ -809,7 +822,7 @@ class Bot:
                      [{'text': '返回菜单', 'callback_data': 'menu'}]])
 
     def _show_menu(self, tg_id, chat_id, msg_id=None):
-        primary = self.accounts.primary_account(tg_id)
+        primary = self.accountmary = self.accounts.primary_account(tg_id)
         account = self._active(tg_id)
         if not primary or not account:
             return self._show_login(tg_id, chat_id, msg_id)
@@ -925,7 +938,7 @@ class Bot:
 
     @staticmethod
     def _association_payload(target, code):
-        """历史关联凭证编码；生产单人路由不暴露此入口。
+        """历史关联凭证编码；生产公开和指定路由均不暴露此入口。
 
         """
         target, code = Bot._link_args(target, code)

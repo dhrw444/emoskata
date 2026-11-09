@@ -19,6 +19,7 @@ from http.client import HTTPConnection
 
 from build_single import build
 from envconfig import SCHEMA, serialize_env, template_values
+from test_support import without_public_probe
 
 
 ROOT = Path(__file__).resolve().parent
@@ -28,7 +29,7 @@ PASSWORD = 'single_upgrade_fixture_password'
 def image(version, expand=False, fail=False):
     """基于真实生成器构造两版演练镜像；只额外注入观察标记和演练 schema。
     """
-    source = build(write=False)
+    source = without_public_probe(build(write=False))
     tree = ast.parse(source)
     node = next(node for node in tree.body if isinstance(node, ast.Assign)
                 and any(isinstance(target, ast.Name) and target.id == '_SOURCES'
@@ -148,7 +149,7 @@ class SingleFileUpgradeTests(unittest.TestCase):
 
     def start(self, source=None):
         """只放程序文件启动；.env 必须由测试预先写好（程序不再生成）。"""
-        self.entry.write_bytes(source if source is not None else (ROOT / 'emoskata.py').read_bytes())
+        self.entry.write_bytes(source if source is not None else without_public_probe((ROOT / 'emoskata.py').read_bytes()))
         environment = dict(os.environ)
         for name in SCHEMA:
             environment.pop(name, None)

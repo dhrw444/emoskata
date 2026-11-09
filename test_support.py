@@ -2,6 +2,7 @@
 
 夹具先写 .env 再导入应用，清理时自动关闭连接池并恢复环境。
 single_owner=False 仅锁定历史测试语义，不代表生产开放多用户。"""
+import ast
 import importlib.util
 import os
 from pathlib import Path
@@ -32,10 +33,27 @@ def configure(app, **values):
     return app.CONFIG.update({keys.get(name, name): value for name, value in values.items()})
 
 
+def without_public_probe(source):
+    """集成回归隔离外网：只向真实内嵌资源模块追加空探测源，不改应用/更新引导。"""
+    is_bytes = isinstance(source, bytes)
+    text = source.decode('utf-8') if is_bytes else source
+    tree = ast.parse(text)
+    node = next(node for node in tree.body if isinstance(node, ast.Assign)
+                and any(isinstance(target, ast.Name) and target.id == '_SOURCES' for target in node.targets))
+    modules = ast.literal_eval(node.value)
+    if '_PUBLIC_IP_URLS = ()' not in modules['runtime_info']:
+        modules['runtime_info'] += '\n_PUBLIC_IP_URLS = ()  # localhost-only integration fixture\n'
+    lines = text.splitlines(keepends=True)
+    lines[node.lineno - 1:node.end_lineno] = ['_SOURCES = ' + repr(modules) + '\n']
+    text = ''.join(lines)
+    compile(text, 'isolated-entry.py', 'exec')
+    return text.encode('utf-8') if is_bytes else text
+
+
 def fixture_app(case, directory, name, entry=None, single_owner=False):
     """导入隔离应用或生成入口，注册环境与连接池清理。
 
-    历史模式包装只作用于此夹具，生产仍由真实配置唯一 owner 核权。"""
+    历史模式包装只作用于此夹具；生产由显式公开/指定/拒绝策略核权。"""
     directory = Path(directory)
     path = write_env(directory / '.env', FIXTURE_PASSWORD,
                      DATA_DIR=str(directory / 'data'), HTTP_HOST='127.0.0.1',

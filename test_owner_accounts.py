@@ -237,11 +237,11 @@ class OwnerAccountCase(unittest.TestCase):
             self.service.run_scope(OWNER)
         self.assertIsNotNone(self.service.primary_account(OWNER))
 
-    def test_empty_invalid_owner_change_and_key_removal_deny_without_data_loss(self):
+    def test_invalid_owner_change_and_key_removal_deny_without_data_loss(self):
         primary = self.official()
         self.add_log(primary)
         before = self.snapshot()
-        for owner in ('', ' ', None, True, False, 0, -1, '0', '101,202', '101 202',
+        for owner in (None, True, False, 0, -1, '0', '101,202', '101 202',
                       '101,101', '101,', '１０１', '01', '1.0', 2**63, [], {}, str(OTHER)):
             self.store.config['tg_allowed_user_ids'] = owner
             with self.subTest(owner=owner):

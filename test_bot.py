@@ -458,8 +458,13 @@ class BotTests(unittest.TestCase):
         self.uid = 0
         self.b = self.make_bot()
 
-    def test_allowed_users_empty_denies_all(self):
-        for value in (None, ''):
+    def test_allowed_users_blank_string_is_public_and_invalid_types_deny(self):
+        for value in ('', ' '):
+            self.store.config['tg_allowed_user_ids'] = value
+            self.assertIsNone(bot._allowed_users(self.store.cfg_all()))
+            self.assertTrue(bot.allowed_actor(101, self.store.cfg_all()))
+            self.assertTrue(bot.allowed_actor(202, self.store.cfg_all()))
+        for value in (None, False, True, [], {}, '0', '101,202'):
             self.store.config['tg_allowed_user_ids'] = value
             self.assertEqual(bot._allowed_users(self.store.cfg_all()), set())
             self.assertFalse(bot.allowed_actor(101, self.store.cfg_all()))

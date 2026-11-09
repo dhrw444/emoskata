@@ -4,7 +4,7 @@ services:
     container_name: emoskata
     restart: unless-stopped
     ports:
-      - "127.0.0.1:8080:8080"
+      - "8080:8080"
     environment:
       EMOS_ENV_FILE: /app/config/.env
     volumes:

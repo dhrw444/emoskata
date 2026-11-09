@@ -1,7 +1,7 @@
 """个人网页域：一次性入口、SQLite 会话、账号视图与按需任务。
 
 HTTP 监听属于 app；账号与会话持久化，签到任务和退出确认仅保存在内存。
-每次访问核 owner 和主号；前端模板不读取磁盘上的额外网页文件。
+每次访问核 TG 策略、本人账号和主号；前端模板不读取额外磁盘网页文件。
 Test: python3 -B -m unittest test_web test_owner_web test_multi_accounts"""
 import hashlib
 import hmac
@@ -22,7 +22,7 @@ WEB_CODE_TTL = 120
 WEB_SESSION_TTL = 7 * 86400
 WEB_JOB_TTL = 600
 
-# 生产单人视图文案；降级文案保留用于历史测试兼容。
+# 生产个人视图文案；历史共享降级文案仅供旧夹具兼容。
 _STATUS_TEXT = {'signed': '签到成功', 'already': '今日已签到', 'network': '网络异常',
                 'blocked': '接口访问受阻', 'rate': '接口限流', 'invalid': '登录凭证已失效',
                 'failed': '签到失败', 'revoked': '授权已撤销'}
@@ -87,7 +87,7 @@ class WebService:
         self.stopping = threading.Event()
 
     def _owner(self, tg_id, conn=None):
-        """核对实时唯一操作者和有效本地主号；可复用现有事务，禁止嵌套借连接。"""
+        """核对实时 TG 策略、本人归属及有效主号；可复用事务，禁止嵌套借连接。"""
         cfg = self.cfg()
         if 'tg_allowed_user_ids' in cfg:
             if not owner_permitted(cfg, tg_id):

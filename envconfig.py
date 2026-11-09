@@ -37,14 +37,14 @@ class Field:
 SCHEMA = {
     'PANEL_PASSWORD': Field('', '管理员密码', '至少 8 字符；空白保存保留现值。', secret=True),
     'PORT': Field('8080', '网页监听端口', '容器内端口；宿主端口映射需在容器配置中对应修改。', 'int', 1, 65535, restart=True),
-    'HTTP_HOST': Field('0.0.0.0', '监听地址', '0.0.0.0 监听所有网卡；容器 IP 自动识别仅用于显示。', 'host', restart=True),
+    'HTTP_HOST': Field('0.0.0.0', '监听地址', '0.0.0.0 监听所有网卡；公网 IP、CDN 入口和容器内网地址分别显示。', 'host', restart=True),
     'HTTP_ENABLED': Field('1', '启用网页', '关闭后网页无法操作，只保留 Bot 和调度。', 'bool', restart=True),
     'DATA_DIR': Field('./data', '数据目录', '相对路径以入口文件目录为基准；内含账号密钥，需持久化。', restart=True),
     'TG_BOT_TOKEN': Field('', 'Telegram Bot Token', 'BotFather 签发；空白保存保留，勾选清除才删除。', secret=True),
     'TG_API_BASE_URL': Field('https://api.telegram.org', 'Telegram API 地址', '官方地址或可信 Bot API 服务，不包含 /bot 或 Token。', 'origin', restart=True),
     'EMOS_BASE_URL': Field('https://emos.best', 'emos API 地址', '官方主站与 api.emos.best 互为备用；自定义站不向公共站发送密钥。', 'url'),
-    'WEB_BASE_URL': Field('', '个人网页公开地址', '公网必须 HTTPS，仅填写域名与可选端口，不含路径。', 'optional_origin'),
-    'PUBLIC_BASE': Field('', '管理员网页公开地址', '可选；反向代理时填写可信 HTTPS 地址供同源与 Cookie 判断。', 'optional_origin'),
+    'WEB_BASE_URL': Field('', '个人网页公开地址', '个人登录链接使用的 HTTPS 域名或 CDN 地址，不含路径；不代替服务器公网 IP 探测。', 'optional_origin'),
+    'PUBLIC_BASE': Field('', '管理员访问域名 / CDN', '可选 HTTPS 访问入口，用于面板、同源与 Cookie；填了仍独立探测服务器公网 IP。', 'optional_origin'),
     'SIGN_TIME': Field('08:00', '默认签到时间', '格式 HH:MM；官方禁止 0 点，范围 01:00–23:59。', 'time'),
     'SIGN_TIMEZONE': Field('Asia/Shanghai', '签到时区', 'IANA 时区；系统需安装 tzdata，固定偏移常用区支持兜底。', 'timezone'),
     'GAP_SECONDS': Field('8', '账号间隔（秒）', '避免账号请求集中；范围 2–300 秒。', 'int', 2, 300),
@@ -52,10 +52,10 @@ SCHEMA = {
     'RETRY_DELAYS': Field('300,900,2700', '失败退避（秒）', '1–5 档递增，每档至少 300 秒；当天耗尽后停止。', 'delays'),
     'BOT_WORKERS': Field('2', 'Bot 操作线程数', '默认 2；1 更省内存，最多 8。', 'int', 1, 8, restart=True),
     'BOT_MAX_JOBS': Field('16', 'Bot 待办上限', '包含正在运行任务；达到上限后明确拒绝新操作。', 'int', 4, 128, restart=True),
-    'TG_ALLOWED_USER_IDS': Field('', '唯一 TG 用户 ID',
-                                 '只填一个正整数 ID；同时作为通知接收人。留空关闭 Bot 和个人网页入口。', 'owner_id'),
+    'TG_ALLOWED_USER_IDS': Field('', 'TG 访问限制',
+                                 '留空公开使用；填写一个正整数仅允许该 TG ID。公开用户只管理自己的账号，通知发送给本人。', 'owner_id'),
     'EMOS_USER_ID': Field('', 'emos 用户 ID',
-                          'emos 官网账号卡片上的用户 ID；填写后 /login 直接跳转官方 Bot，不再要求输入。', 'emos_id'),
+                          '仅指定 TG ID 模式的 /login 默认账号 ID；公开模式首登由各用户发送自己的 ID。', 'emos_id'),
     'EMOS_AUTH_BOT': Field('emospg_bot', 'emos 官方授权 Bot',
                            '官方授权入口的 Bot 用户名，不含 @；官方变更时只改这里。', 'tg_bot'),
     'TG_POLL_TIMEOUT': Field('45', 'TG 长轮询等待（秒）', '延长空闲等待减少连接与 CPU；范围 10–50。', 'int', 10, 50, restart=True),
@@ -208,7 +208,7 @@ def validate_env(values, allow_unset_password=False):
                 if value not in FIXED_ZONE_OFFSETS:
                     raise EnvConfigError('SIGN_TIMEZONE 不可用，请安装 tzdata 或选常用固定时区。') from None
         elif field.kind == 'owner_id':
-            # 允许部署文件留空，但空身份始终表示拒绝，不表示开放访问。
+            # 留空显式开启公开使用；非法非空值不能降级为公开模式。
             if value and (not re.fullmatch(r'[1-9][0-9]{0,18}', value) or int(value) >= 2**63):
                 raise EnvConfigError('%s 只能填一个正整数 TG 用户 ID。' % key)
         elif field.kind == 'tg_bot':
@@ -243,20 +243,35 @@ def validate_env(values, allow_unset_password=False):
     return normalized
 
 
+def tg_access_owner(cfg):
+    """返回访问策略：None 为显式留空公开，正整数为指定用户，0 为非法配置。
+
+    缺键和非字符串空值不表示公开；生产配置由 schema 提供该键。"""
+    if not isinstance(cfg, dict) or 'tg_allowed_user_ids' not in cfg:
+        return 0
+    raw = cfg['tg_allowed_user_ids']
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            return None
+        if not re.fullmatch(r'[1-9][0-9]{0,18}', raw):
+            return 0
+        raw = int(raw)
+    return raw if type(raw) is int and 0 < raw < 2**63 else 0
+
+
 def configured_owner(cfg):
-    """解析唯一 TG 操作者 ID；缺失、空值或非法配置返回 None，不解释为开放访问。"""
-    if not isinstance(cfg, dict):
-        return None
-    raw = str(cfg.get('tg_allowed_user_ids') or '').strip()
-    if not re.fullmatch(r'[1-9][0-9]{0,18}', raw):
-        return None
-    value = int(raw)
-    return value if value < 2**63 else None
+    """仅返回指定 TG ID；公开或非法配置没有固定操作者，需另用访问策略判断。"""
+    owner = tg_access_owner(cfg)
+    return owner if owner else None
 
 
 def owner_permitted(cfg, tg_id):
-    """核对正整数操作者与实时配置 ID；账号登记本身不构成访问授权。"""
-    return type(tg_id) is int and tg_id > 0 and configured_owner(cfg) == tg_id
+    """公开模式准许合法 TG 私聊身份；指定模式只准该 ID，非法配置一律拒绝。"""
+    if type(tg_id) is not int or not 0 < tg_id < 2**63:
+        return False
+    owner = tg_access_owner(cfg)
+    return owner is None or owner == tg_id
 
 
 def serialize_env(values):

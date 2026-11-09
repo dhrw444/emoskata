@@ -61,6 +61,36 @@ class OwnerBotTests(unittest.TestCase):
         self.assertIsNotNone(row, self.text())
         return row
 
+    def test_public_login_uses_each_users_id_not_global_emos_user_id(self):
+        configure(self.app, tg_allowed_user_ids='', emos_user_id='UNUSED_GLOBAL_ID')
+        self.profiles['second_public_token_123'] = {
+            'user_id': 'eSecond', 'telegram_user_id': 202, '_carrot': 70}
+        self.message('/login', actor=101)
+        self.message('/login', actor=202)
+        service = self.app.Store().accounts
+        self.assertEqual(service.input_state(101), 'login')
+        self.assertEqual(service.input_state(202), 'login')
+        self.assertEqual(self.requests, [])
+        self.assertNotIn('UNUSED_GLOBAL_ID', self.text())
+        self.message('ePrimary', actor=101)
+        self.message('eSecond', actor=202)
+        self.assertEqual(service.user(101)['login_emos_id'], 'ePrimary')
+        self.assertEqual(service.user(202)['login_emos_id'], 'eSecond')
+        urls = [button['url'] for action in self.tg.actions if action[0] in {'send', 'edit'}
+                for row in action[3] or [] for button in row if 'url' in button]
+        self.assertIn('https://t.me/emospg_bot?start=link_ePrimary-emos_test_bot', urls)
+        self.assertIn('https://t.me/emospg_bot?start=link_eSecond-emos_test_bot', urls)
+        self.message('/start emosLinkAgree-primary_token_123', actor=202)
+        self.assertIsNone(service.primary_account(202))
+        self.message('/start emosLinkAgree-primary_token_123', actor=101)
+        self.message('/start emosLinkAgree-second_public_token_123', actor=202)
+        self.assertEqual(service.primary_account(101)['emos_id'], 'ePrimary')
+        self.assertEqual(service.primary_account(202)['emos_id'], 'eSecond')
+        self.assertEqual(len(service.owned(101)), 1)
+        self.assertEqual(len(service.owned(202)), 1)
+        for token in self.profiles:
+            self.assertNotIn(token, self.text())
+
     def test_token_requires_official_primary_without_network_request(self):
         self.message('/token')
         self.message('/token extra_token_12345')
