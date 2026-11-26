@@ -77,6 +77,16 @@ class DeployTests(unittest.TestCase):
             self.assertEqual(conn.execute('SELECT COUNT(*) FROM accounts').fetchone()[0], 0)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM settings WHERE key LIKE 'oauth_%'").fetchone()[0], 0)
 
+    def test_runtime_exposes_running_version_fingerprint(self):
+        """页面用版本指纹确认换 py 后到底在跑哪一版。"""
+        with self.panel() as server:
+            cookie = self.cookie(server)
+            code, _, data = self.request(server, '/api/runtime', headers={'Cookie': cookie})
+            self.assertEqual(code, 200)
+            version = json.loads(data)['version']
+            self.assertRegex(version, r'^[0-9a-f]{8}$')
+            self.assertEqual(version, self.app.VERSION)
+
     def test_logged_in_management_lists_no_raw_credentials(self):
         configure(self.app, tg_bot_token='123456:fixture_bot_secret')
         service = self.app.Store().accounts

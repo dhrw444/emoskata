@@ -980,7 +980,11 @@ class AccountService:
             crowded = {}
             for item in conn.execute(
                     'SELECT id,name,emos_id,owner_tg_id FROM accounts ORDER BY id').fetchall():
-                crowded.setdefault(item['owner_tg_id'], []).append(
+                key = item['owner_tg_id']
+                # 旧库可能把 ID 存成文本；统一成整数键，避免清单对不上号。
+                if isinstance(key, str) and key.isdigit():
+                    key = int(key)
+                crowded.setdefault(key, []).append(
                     {'id': item['id'], 'name': item['name'] or '',
                      'emos_id': item['emos_id'] or ''})
         result = []
