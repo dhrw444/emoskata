@@ -53,7 +53,7 @@ SCHEMA = {
     'BOT_WORKERS': Field('2', 'Bot 操作线程数', '默认 2；1 更省内存，最多 8。', 'int', 1, 8, restart=True),
     'BOT_MAX_JOBS': Field('16', 'Bot 待办上限', '包含正在运行任务；达到上限后明确拒绝新操作。', 'int', 4, 128, restart=True),
     'TG_ALLOWED_USER_IDS': Field('', '允许使用的 TG 用户 ID',
-                                 '留空公开使用；填一个正整数仅允许该 ID；可用逗号分隔多个 ID。', 'owner_id'),
+                                 '留空公开使用；填一个或多个正整数限制访问，多个用逗号分隔。', 'owner_id'),
     'EMOS_USER_ID': Field('', 'emos 用户 ID',
                           '仅指定 TG ID 模式的 /login 默认账号 ID；公开模式首登由各用户发送自己的 ID。', 'emos_id'),
     'EMOS_AUTH_BOT': Field('emospg_bot', 'emos 官方授权 Bot',

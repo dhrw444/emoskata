@@ -22,7 +22,7 @@ Python 3.10+，零第三方 Python 依赖。运行核心只需 `emoskata.py` 与
 | `PORT` | `8080` | 监听端口 |
 | `DATA_DIR` | `./data` | SQLite 数据目录 |
 | `TG_BOT_TOKEN` | 空 | BotFather 签发的 Token |
-| `TG_ALLOWED_USER_IDS` | 空 | **留空公开使用，填写一个正整数仅允许该 TG ID**；非法值和多个 ID 拒绝。公开模式通知发各账号本人 |
+| `TG_ALLOWED_USER_IDS` | 空 | **留空公开使用；填一个或多个正整数（逗号分隔）仅允许这些 TG ID**；非法值拒绝。公开模式通知发各账号本人 |
 | `TG_API_BASE_URL` | `https://api.telegram.org` | Telegram API 地址 |
 | `EMOS_USER_ID` | 空 | 指定 TG ID 模式下 `/login` 的默认本人 emos ID；公开模式各用户输入自己的 ID，不能共用管理员默认 ID |
 | `EMOS_AUTH_BOT` | `emospg_bot` | emos 官方授权 Bot 用户名，不含 `@`；官方换名只改这里 |
