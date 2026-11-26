@@ -533,6 +533,22 @@ class ConfigStore:
         return {'fields': fields, 'revision': revision, 'source': '.env'}
 
 
+def permission_warning(path):
+    """返回部署文件权限过宽的提示；不判断属主，不阻止启动。
+
+    只检查组和其他用户的可读/可写/可执行位；文件缺失或非普通文件不在此报错。"""
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        return None
+    mode = stat.S_IMODE(info.st_mode)
+    if mode & 0o077:
+        return '配置文件 %s 权限为 %03o，其他用户可读；建议 chmod 600。' % (path, mode)
+    return None
+
+
 def config_path(entry_file, environ=None):
     """EMOS_ENV_FILE 只选择部署文件路径；相对路径以入口目录为基准。"""
     environ = os.environ if environ is None else environ

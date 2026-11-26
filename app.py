@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 
 from envconfig import (ConfigStore, EnvConfigError, CFG_TO_ENV, SCHEMA, config_path,
-                       FIXED_ZONE_OFFSETS, owner_permitted, tg_access_owners)
+                       permission_warning, FIXED_ZONE_OFFSETS, owner_permitted, tg_access_owners)
 from runtime_info import (container_ip, snapshot as resource_snapshot, prepare_requirements,
                           start_public_ip_probe, public_ip_status, management_url)
 from emos import EmosClient, EmosError, clamp_sign_time, pick_content
@@ -1811,6 +1811,9 @@ def main():
     try:
         cfg = cfg_all()
         if not _STARTUP_PROBE:
+            warning = permission_warning(CONFIG.path)
+            if warning:
+                print('[config] ' + warning)
             try:
                 prepare_requirements(__file__)
             except OSError:

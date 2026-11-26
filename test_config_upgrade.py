@@ -194,5 +194,21 @@ class ConfigUpgradeTests(unittest.TestCase):
         self.assertEqual(complete_values(parse_env(serialize_env(values))), values)
         self.assertEqual(missing_config_message('/x/.env').count('.env.example'), 1)
 
+    def test_permission_warning_only_flags_other_user_bits(self):
+        """644/640/666 提示，600/400 不提示；缺失文件不抛错。"""
+        from envconfig import permission_warning
+        with tempfile.TemporaryDirectory(prefix='emos-perm-') as tmp:
+            path = Path(tmp) / '.env'
+            path.write_text('PANEL_PASSWORD=fixture_password\n')
+            for mode, warned in ((0o600, False), (0o400, False), (0o640, True),
+                                 (0o644, True), (0o666, True)):
+                path.chmod(mode)
+                hint = permission_warning(path)
+                self.assertEqual(bool(hint), warned, oct(mode))
+                if warned:
+                    self.assertIn('chmod 600', hint)
+                    self.assertIn('%03o' % mode, hint)
+            self.assertIsNone(permission_warning(Path(tmp) / 'missing.env'))
+
 if __name__ == '__main__':
     unittest.main()
