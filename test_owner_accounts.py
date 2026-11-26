@@ -114,9 +114,9 @@ class OwnerAccountCase(unittest.TestCase):
 
     def test_official_first_login_matches_pending_id_and_telegram_binding(self):
         self.service.begin_login(OWNER, '00123', expected_root=0)
-        wrong = [self.profile('123'), self.profile('00123', OTHER),
-                 self.profile('00123', True), self.profile('00123', None),
-                 self.profile('00123', '101.0')]
+        # 官方换绑后账号 ID 可以变化；但 Telegram 绑定不属于本人仍必须拒绝。
+        wrong = [self.profile('123', OTHER), self.profile('00123', True),
+                 self.profile('00123', None), self.profile('00123', '101.0')]
         for profile in wrong:
             with self.subTest(profile=profile), self.assertRaises(DomainError):
                 self.service.finish_login(OWNER, 'fake-first-secret', profile)
@@ -165,20 +165,16 @@ class OwnerAccountCase(unittest.TestCase):
         self.assertEqual(self.service.logs(OWNER)[0]['message'], '历史保留')
         self.assertEqual(len(self.service.owned(OWNER)), 2)
 
-    def test_extra_oauth_rejected_at_begin_and_finish_without_replacing_primary(self):
+    def test_official_rebinding_replaces_primary_and_token_account_stays_independent(self):
         primary = self.official()
-        self.token('EXTRA')
-        before = self.snapshot()
-        with self.assertRaisesRegex(DomainError, 'token'):
-            self.service.begin_login(OWNER, 'EXTRA')
-        self.assertEqual(self.snapshot(), before)
-        self.service.begin_login(OWNER, 'PRIMARY')
-        self.mutate("UPDATE tg_users SET login_emos_id='EXTRA' WHERE tg_id=?", (OWNER,))
-        before = self.snapshot()
-        with self.assertRaisesRegex(DomainError, 'token'):
-            self.service.finish_login(OWNER, 'fake-new-oauth', self.profile('EXTRA'))
-        self.assertEqual(self.snapshot(), before)
-        self.assertEqual(self.service.primary_account(OWNER)['id'], primary['id'])
+        extra = self.token('EXTRA')
+        # 官方换绑：授权另一个 emos 账号，应迁移主号而不是报错或新建第三行。
+        self.service.begin_login(OWNER, 'EXTRA')
+        rebound = self.service.finish_login(OWNER, 'fake-new-oauth', self.profile('EXTRA'))
+        self.assertEqual(rebound['id'], extra['id'])
+        self.assertEqual(self.service.primary_account(OWNER)['emos_id'], 'EXTRA')
+        self.assertEqual(len(self.service.owned(OWNER)), 2)
+        self.assertNotEqual(self.service.primary_account(OWNER)['id'], primary['id'])
 
     def test_two_token_accounts_cover_owner_visibility_logs_and_run_not_foreign_links(self):
         primary = self.official()
@@ -241,8 +237,9 @@ class OwnerAccountCase(unittest.TestCase):
         primary = self.official()
         self.add_log(primary)
         before = self.snapshot()
-        for owner in (None, True, False, 0, -1, '0', '101,202', '101 202',
-                      '101,101', '101,', '１０１', '01', '1.0', 2**63, [], {}, str(OTHER)):
+        # 多 ID 已是合法配置；非法值仍整体拒绝。
+        for owner in (True, False, 0, -1, '0', '１０１', '01', '1.0',
+                      2**63, [], {}, '101,abc'):
             self.store.config['tg_allowed_user_ids'] = owner
             with self.subTest(owner=owner):
                 self.assertIsNone(self.service.primary_account(OWNER))
@@ -259,7 +256,12 @@ class OwnerAccountCase(unittest.TestCase):
                     with self.assertRaises(DomainError):
                         operation()
                 self.assertEqual(self.snapshot(), before)
-        del self.store.config['tg_allowed_user_ids']
+        # 缺键仍按非法处理，不能降级成公开。
+        self.store.config.pop('tg_allowed_user_ids', None)
+        self.assertIsNone(self.service.primary_account(OWNER))
+        with self.assertRaises(DomainError):
+            self.service.ensure_user(OWNER)
+        self.store.config.pop('tg_allowed_user_ids', None)
         self.assertIsNone(self.service.primary_account(OWNER))
         with self.assertRaises(DomainError):
             self.service.visible(OTHER)

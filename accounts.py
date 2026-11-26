@@ -14,7 +14,7 @@ from contextlib import closing, contextmanager
 from typing import Optional
 
 from emos import clamp_sign_time as _clamp_time
-from envconfig import tg_access_owner
+from envconfig import tg_access_owners
 
 
 class DomainError(Exception):
@@ -112,8 +112,8 @@ class AccountService:
         self._owner_mode_seen = False
         self._owner_lock = threading.Lock()
 
-    def _owner_id(self):
-        """返回配置策略；None 为公开，正整数为指定用户，0 为拒绝。
+    def _policy(self):
+        """返回访问策略：() 为公开，非空元组为允许的 ID，0 为非法配置。
 
         只有从未见过生产权限键的旧夹具保留历史共享语义；显式空值始终是公开隔离模式。"""
         try:
@@ -127,12 +127,15 @@ class AccountService:
             if 'tg_allowed_user_ids' not in cfg:
                 return 0 if self._owner_mode_seen else None
             self._owner_mode_seen = True
-        return tg_access_owner(dict(cfg))
+        owners = tg_access_owners(dict(cfg))
+        return 0 if owners is None else owners
 
     def _actor(self, tg_id):
         tg_id = _positive_id(tg_id)
-        policy = self._owner_id()
-        if policy == 0 or (policy is not None and policy != tg_id):
+        policy = self._policy()
+        if policy == 0:
+            raise DomainError('TG 访问限制配置无效，已拒绝全部操作')
+        if policy and tg_id not in policy:
             raise DomainError('当前 TG 用户不在访问范围内，请检查 TG 访问限制')
         with self._owner_lock:
             current_mode = self._owner_mode_seen
@@ -180,10 +183,12 @@ class AccountService:
         return bool(primary and primary['logged_in'])
 
     def _official_primary(self, conn, tg_id, official):
-        primary = self._primary(conn, tg_id)
-        if primary is not None and primary['emos_id'] != official:
-            raise DomainError('已有官方主账号；其他账号请使用官方 token 添加')
-        return primary
+        """返回已登记主号；官方换绑时允许新 ID 接管这一行主号证明。
+
+        主号只表示“首号走官方授权”，换绑后仍是同一个本地主号，保留余额与日志。
+        其他账号仍必须走 token 添加，不能用官方授权新增第二个主号。
+        """
+        return self._primary(conn, tg_id)
 
     def _require_primary(self, conn, tg_id):
         """要求已登记主号仍有有效本地凭据；保留的证明本身不代表登录。
@@ -417,10 +422,12 @@ class AccountService:
             if (expected_login_until is not None and pending['login_until'] != expected_login_until
                     or expected_login_revision is not None and pending['login_revision'] != expected_login_revision):
                 raise DomainError('登录授权请求已变化，请重新发起')
-            if pending['login_emos_id'] != official:
-                raise DomainError('官方回传账号 ID 与本次填写的 ID 不一致，账号未保存')
+            # 发起时登记的 ID 只用于确认本次登录已发起；官方换绑后以回传 ID 为准。
             primary = self._official_primary(conn, tg_id, official) if owner is not None else None
             row = conn.execute("SELECT * FROM accounts WHERE emos_id=?", (official,)).fetchone()
+            # 官方换绑：回传 ID 与旧主号不同时，就地更新该主号行而不是新建账号。
+            if primary is not None and row is None and primary['owner_tg_id'] == tg_id:
+                row = primary
             matches = conn.execute("SELECT * FROM accounts WHERE token=? ORDER BY id",
                                    (token,)).fetchall()
             if row is not None:
@@ -435,8 +442,6 @@ class AccountService:
                     raise DomainError("凭证与已登记的官方账号 ID 不一致")
             if row is None and matches:
                 row = matches[0]
-            if primary is not None and (row is None or row['id'] != primary['id']):
-                raise DomainError('官方主账号身份已变化，请重新授权')
             balance = profile.get('_carrot')
             balance_at = now if balance is not None else 0
             if row is None:
@@ -458,8 +463,9 @@ class AccountService:
                 conn.execute("UPDATE accounts SET retry_day='' WHERE id=? AND owner_tg_id=?",
                              (account_id, tg_id))
             if owner is not None:
+                # 官方刚授权的那一行就是主号；换绑时随之迁移，不能停在旧账号。
                 conn.execute('UPDATE tg_users SET primary_account_id=? WHERE tg_id=?',
-                             (primary['id'] if primary is not None else account_id, tg_id))
+                             (account_id, tg_id))
             conn.execute("UPDATE tg_users SET active_account_id=?,login_until=0,login_emos_id='',"
                          "login_revision=login_revision+1 WHERE tg_id=?", (account_id, tg_id))
             return _account(conn.execute("SELECT * FROM accounts WHERE id=?",
@@ -930,17 +936,18 @@ class AccountService:
         """返回管理员脱敏投影；指定模式只选该 ID，公开模式返回全部登记账号。
 
         管理员认证由调用方负责，非法或读取期间变化的策略不返回账号。"""
-        owner = self._owner_id()
-        if owner == 0:
+        policy = self._policy()
+        if policy == 0:
             return []
         with closing(self._db()) as conn:
             sql = "SELECT * FROM accounts WHERE emos_id IS NOT NULL AND emos_id<>'' "
             params = ()
-            if owner is not None:
-                sql += 'AND owner_tg_id=? '
-                params = (owner,)
+            if policy:
+                marks = ','.join('?' * len(policy))
+                sql += 'AND owner_tg_id IN (%s) ' % marks
+                params = tuple(policy)
             rows = conn.execute(sql + 'ORDER BY owner_tg_id,id', params).fetchall()
-        if self._owner_id() != owner:
+        if self._policy() != policy:
             return []
         result = []
         for row in rows:
@@ -948,6 +955,96 @@ class AccountService:
             item['owner_tg_id'] = row['owner_tg_id']
             result.append(item)
         return result
+
+    def owners_overview(self) -> list:
+        """管理员视图：所有登记过使用者的 TG 及各自账号数量，供迁移选择。
+
+        只返回可对外展示的字段；不含 Token，也不判断当前 owner 配置。
+        """
+        with closing(self._db()) as conn:
+            rows = conn.execute(
+                "SELECT u.tg_id,u.chat_id,u.primary_account_id AS primary_id,"
+                "COUNT(a.id) AS accounts "
+                "FROM tg_users u LEFT JOIN accounts a ON a.owner_tg_id=u.tg_id "
+                "GROUP BY u.tg_id ORDER BY u.tg_id").fetchall()
+            known = {row['tg_id'] for row in rows}
+            orphans = conn.execute(
+                "SELECT owner_tg_id AS tg_id,COUNT(*) AS accounts FROM accounts "
+                "WHERE owner_tg_id IS NOT NULL AND owner_tg_id NOT IN "
+                "(SELECT tg_id FROM tg_users) GROUP BY owner_tg_id").fetchall()
+        result = []
+        for row in rows:
+            result.append({'tg_id': row['tg_id'], 'chat_id': row['chat_id'],
+                           'accounts': int(row['accounts'] or 0),
+                           'is_primary_owner': row['primary_id'] is not None})
+        for row in orphans:
+            if row['tg_id'] not in known:
+                result.append({'tg_id': row['tg_id'], 'chat_id': None,
+                               'accounts': int(row['accounts'] or 0),
+                               'is_primary_owner': False})
+        return result
+
+    def transfer_account(self, account_id, target_tg_id) -> dict:
+        """把单个账号迁到目标 TG 名下；主号身份随迁移清除。
+
+        主号证明绑定的是原 TG，迁走后若继续当主号会让新使用者登录失败，所以
+        只保留为普通账号。旧 TG 若已无账号则删除其行，网页会话随外键级联失效。
+        """
+        account_id = _positive_id(account_id)
+        target = _positive_id(target_tg_id)
+        with self._write() as conn:
+            row = conn.execute('SELECT * FROM accounts WHERE id=?', (account_id,)).fetchone()
+            if row is None or not str(row['emos_id'] or '').strip():
+                raise DomainError('账号不存在或尚未完成官方授权')
+            source = row['owner_tg_id']
+            if source == target:
+                return {'moved': [], 'source': source, 'target': target}
+            self._ensure(conn, target)
+            conn.execute('UPDATE accounts SET owner_tg_id=? WHERE id=?', (target, account_id))
+            # 主号身份不能跟着走，交给新使用者重新 /login 证明。
+            conn.execute('UPDATE tg_users SET primary_account_id=NULL '
+                         'WHERE primary_account_id=? AND tg_id<>?', (account_id, target))
+            conn.execute('UPDATE tg_users SET active_account_id=? WHERE tg_id=?',
+                         (account_id, target))
+            if source is not None:
+                remaining = conn.execute(
+                    'SELECT id FROM accounts WHERE owner_tg_id=? ORDER BY id LIMIT 1',
+                    (source,)).fetchone()
+                if remaining is None:
+                    conn.execute('DELETE FROM tg_users WHERE tg_id=?', (source,))
+                else:
+                    conn.execute('UPDATE tg_users SET active_account_id=? WHERE tg_id=? '
+                                 'AND (active_account_id IS NULL OR active_account_id NOT IN '
+                                 '(SELECT id FROM accounts WHERE owner_tg_id=?))',
+                                 (remaining['id'], source, source))
+                    conn.execute('UPDATE tg_users SET primary_account_id=NULL WHERE tg_id=? '
+                                 'AND primary_account_id NOT IN '
+                                 '(SELECT id FROM accounts WHERE owner_tg_id=?)',
+                                 (source, source))
+        return {'moved': [account_id], 'source': source, 'target': target}
+
+    def transfer_owner(self, source_tg_id, target_tg_id) -> dict:
+        """整组换号：把源 TG 名下全部账号改归目标 TG，源行删除。
+
+        迁移后目标 TG 保留自己的主号证明；源 TG 的网页会话随行删除级联失效。
+        """
+        source = _positive_id(source_tg_id)
+        target = _positive_id(target_tg_id)
+        if source == target:
+            raise DomainError('源 TG 与目标 TG 相同，无需迁移')
+        with self._write() as conn:
+            rows = conn.execute('SELECT id FROM accounts WHERE owner_tg_id=? ORDER BY id',
+                                (source,)).fetchall()
+            if not rows:
+                raise DomainError('源 TG 名下没有可迁移的账号')
+            self._ensure(conn, target)
+            ids = [row['id'] for row in rows]
+            conn.executemany('UPDATE accounts SET owner_tg_id=? WHERE id=?',
+                             [(target, account_id) for account_id in ids])
+            conn.execute('UPDATE tg_users SET active_account_id=? WHERE tg_id=?',
+                         (ids[0], target))
+            conn.execute('DELETE FROM tg_users WHERE tg_id=?', (source,))
+        return {'moved': ids, 'source': source, 'target': target}
 
     def visible(self, tg_id) -> list:
         """按实时授权返回脱敏账号列表；生产仅本人，历史夹具保留根及一跳。"""
@@ -1043,8 +1140,8 @@ class AccountService:
     def watchers(self, account_id) -> list:
         """按账号授权查通知接收人，返回前再核 owner；发送时还需再次核验。"""
         account_id = _positive_id(account_id)
-        owner = self._owner_id()
-        if owner == 0:
+        policy = self._policy()
+        if policy == 0:
             return []
         with self._owner_lock:
             current_mode = self._owner_mode_seen
@@ -1054,9 +1151,9 @@ class AccountService:
                        'WHERE u.chat_id=u.tg_id AND a.id=? '
                        "AND a.emos_id IS NOT NULL AND a.emos_id<>''")
                 params = (account_id,)
-                if owner is not None:
-                    sql += ' AND u.tg_id=?'
-                    params += (owner,)
+                if policy:
+                    sql += ' AND u.tg_id IN (%s)' % ','.join('?' * len(policy))
+                    params += tuple(policy)
                 rows = conn.execute(sql, params).fetchall()
             else:
                 rows = conn.execute("""
@@ -1071,6 +1168,6 @@ class AccountService:
                     SELECT u.* FROM tg_users u JOIN recipients r ON r.tg_id=u.tg_id
                     WHERE u.chat_id=u.tg_id ORDER BY u.tg_id
                 """, (account_id, account_id)).fetchall()
-        if self._owner_id() != owner:
+        if self._policy() != policy:
             return []
         return [_user(row) for row in rows]

@@ -545,11 +545,14 @@ class RuntimeTests(unittest.TestCase):
         from envconfig import SCHEMA, validate_env
         base = {key: field.default for key, field in SCHEMA.items()}
         base['PANEL_PASSWORD'] = 'abcdefgh'
-        for bad in ('0', '-5', 'abc', '101;202', '101,202', '101 202', '9999999999999999999999'):
+        for bad in ('0', '-5', 'abc', '9999999999999999999999', '101,abc', '101,,0'):
             with self.assertRaises(envconfig.EnvConfigError, msg=bad):
                 validate_env(dict(base, TG_ALLOWED_USER_IDS=bad))
         ok = validate_env(dict(base, TG_ALLOWED_USER_IDS='101'))
         self.assertEqual(ok['TG_ALLOWED_USER_IDS'], '101')
+        # 多个 ID 合法，去重并规范为逗号分隔。
+        multi = validate_env(dict(base, TG_ALLOWED_USER_IDS='202, 101 202;303'))
+        self.assertEqual(multi['TG_ALLOWED_USER_IDS'], '101,202,303')
 
     def test_every_env_setting_is_reachable_from_the_web_panel(self):
         # 配置 schema 与网页映射逐项对照，防止遗漏新增字段。

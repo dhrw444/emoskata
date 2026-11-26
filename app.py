@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 
 from envconfig import (ConfigStore, EnvConfigError, CFG_TO_ENV, SCHEMA, config_path,
-                       FIXED_ZONE_OFFSETS, owner_permitted, tg_access_owner)
+                       FIXED_ZONE_OFFSETS, owner_permitted, tg_access_owners)
 from runtime_info import (container_ip, snapshot as resource_snapshot, prepare_requirements,
                           start_public_ip_probe, public_ip_status, management_url)
 from emos import EmosClient, EmosError, clamp_sign_time, pick_content
@@ -382,7 +382,8 @@ def personal_web():
     with _web_service_lock:
         if _web_service is None:
             accounts = AccountService(db, write_db, cfg_all)
-            _web_service = WebService(db, write_db, cfg_all, accounts, run_user)
+            _web_service = WebService(db, write_db, cfg_all, accounts, run_user,
+                                      refresh_balances=refresh_balances)
         return _web_service
 
 
@@ -411,6 +412,9 @@ class Store:
 
     def run_user(self, tg_id, include_links=True, expected_root=None, content=None):
         return run_user(tg_id, include_links, expected_root, content)
+
+    def refresh_balances(self, tg_id, include_links=True, expected_root=None):
+        return refresh_balances(tg_id, include_links, expected_root)
 
 
 # 密码校验
@@ -618,7 +622,8 @@ def _deliver_notification(task):
     token = str(cfg.get('tg_bot_token') or '')
     if not token:
         return False
-    recipient = tg_id if owner_mode else current['chat_id']
+    # 通知发给账号归属者本人，不再假设全局只有一个 owner。
+    recipient = current['chat_id']
     TG(token, Store()).send(recipient, build_report([row], 0, 0))
     return True
 
@@ -824,6 +829,63 @@ def _run_ids(cfg, account_ids, trigger='manual', actor=None, root_id=None, scope
         _run_lock.release()
 
 
+def refresh_balances(tg_id, include_links=True, expected_root=None):
+    """只读取各账号官方余额并写回缓存；不签到、不写日志、不改启用状态。
+
+    与签到共用执行锁，避免并发请求；单账号失败只影响该行结果。
+    """
+    live = cfg_all()
+    if 'tg_allowed_user_ids' in live and not owner_permitted(live, tg_id):
+        raise DomainError('只允许配置的 TG 用户操作。')
+    if _draining.is_set():
+        raise DomainError('应用核心正在重启，暂不刷新余额。')
+    cfg = cfg_all()
+    scope = Store().accounts.run_scope(tg_id, include_links)
+    if expected_root is not None and scope['root_id'] != expected_root:
+        raise DomainError('当前账号已切换，本次未刷新余额。')
+    if not _run_lock.acquire(blocking=False):
+        return None
+    rows = []
+    try:
+        for account_id in dict.fromkeys(scope['account_ids']):
+            if _shutdown.is_set():
+                break
+            account = _account_record(account_id)
+            if not account or not account['enabled']:
+                continue
+            endpoint = (account.get('base_url') or cfg.get('base_url')
+                        or SCHEMA['EMOS_BASE_URL'].default)
+            try:
+                client = EmosClient(account['token'], endpoint, timeout=cfg['emos_timeout'])
+                client.expected_user_id = account['emos_id']
+                profile = client.profile()
+            except EmosError as error:
+                rows.append({'id': account['id'], 'name': account['name'],
+                             'emos_id': account['emos_id'], 'balance': None,
+                             'status': error.kind, 'message': error.message})
+                continue
+            except Exception:
+                rows.append({'id': account['id'], 'name': account['name'],
+                             'emos_id': account['emos_id'], 'balance': None,
+                             'status': 'failed', 'message': '余额读取失败。'})
+                continue
+            balance = profile.get('_carrot')
+            if balance is not None:
+                with write_db() as conn:
+                    # 只在账号凭据未变时写回，避免覆盖切换或重登后的新数据。
+                    conn.execute('UPDATE accounts SET carrot=?,carrot_at=? '
+                                 'WHERE id=? AND token=? AND emos_id=?',
+                                 (balance, int(time.time()), account['id'],
+                                  account['token'], account['emos_id']))
+            rows.append({'id': account['id'], 'name': account['name'],
+                         'emos_id': account['emos_id'], 'balance': balance,
+                         'status': 'ok' if balance is not None else 'unknown',
+                         'message': '' if balance is not None else '官方未返回余额。'})
+        return rows
+    finally:
+        _run_lock.release()
+
+
 def run_user(tg_id, include_links=True, expected_root=None, content=None):
     """验 owner、当前选择和明确范围后执行签到；拒收状态不接受新任务。
 
@@ -878,21 +940,22 @@ def scheduler_tick(cfg=None):
     now = now_local(cfg)
     scopes = {}
     owner_mode = 'tg_allowed_user_ids' in cfg
-    owner = tg_access_owner(cfg) if owner_mode else None
-    if owner_mode and (owner == 0 or (owner is not None and not Store().accounts.has_primary_account(owner))):
+    policy = tg_access_owners(cfg) if owner_mode else None
+    if owner_mode and policy == 0:
         return []
     with db() as conn:
         if owner_mode:
-            if owner is None:
-                all_accounts = [dict(row) for row in conn.execute(
-                    'SELECT a.* FROM accounts a JOIN tg_users u ON u.tg_id=a.owner_tg_id '
-                    'JOIN accounts p ON p.id=u.primary_account_id AND p.owner_tg_id=u.tg_id '
-                    "WHERE a.enabled=1 AND p.enabled=1 AND TRIM(COALESCE(p.token,''))<>'' "
-                    "AND p.emos_id IS NOT NULL AND p.emos_id<>'' "
-                    "AND COALESCE(p.last_status,'')<>'invalid' ORDER BY a.id")]
-            else:
-                all_accounts = [dict(row) for row in conn.execute(
-                    'SELECT * FROM accounts WHERE enabled=1 AND owner_tg_id=? ORDER BY id', (owner,))]
+            # 名单模式只取名单内的人；公开模式取所有有效主号名下账号。
+            sql = ('SELECT a.* FROM accounts a JOIN tg_users u ON u.tg_id=a.owner_tg_id '
+                   'JOIN accounts p ON p.id=u.primary_account_id AND p.owner_tg_id=u.tg_id '
+                   "WHERE a.enabled=1 AND p.enabled=1 AND TRIM(COALESCE(p.token,''))<>'' "
+                   "AND p.emos_id IS NOT NULL AND p.emos_id<>'' "
+                   "AND COALESCE(p.last_status,'')<>'invalid'")
+            params = ()
+            if policy:
+                sql += ' AND a.owner_tg_id IN (%s)' % ','.join('?' * len(policy))
+                params = tuple(policy)
+            all_accounts = [dict(row) for row in conn.execute(sql + ' ORDER BY a.id', params)]
             grants = []
         else:
             all_accounts = [dict(row) for row in conn.execute('SELECT * FROM accounts WHERE enabled=1 ORDER BY id')]
@@ -969,7 +1032,7 @@ async function go(ev){
 </script></body></html>"""
 
 
-PAGE = '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>emoskata · 核心管理</title><style>\n:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#101318;color:#eef2f7;font:14px/1.6 system-ui,sans-serif}main{max-width:960px;margin:auto;padding:22px 16px 60px}h1{font-size:24px}h2{font-size:17px;margin-top:0}section{background:#191f28;border:1px solid #303a49;border-radius:12px;padding:20px;margin:16px 0}label{display:block;margin-top:12px}input,select{width:100%;padding:9px;background:#111722;color:inherit;border:1px solid #303a49;border-radius:8px;font:inherit}button{padding:9px 14px;margin:12px 8px 0 0;border:0;border-radius:8px;background:#76a7ff;color:#111722;font:600 14px system-ui;cursor:pointer}button.secondary{background:#2b3646;color:inherit}button.danger{background:#51323a;color:#ffc1c7}.muted,small{color:#9caabd}small{display:block}.check{display:flex;gap:8px;align-items:center}.check input{width:auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:12px}.grid label{margin:0;padding:10px;border-bottom:1px solid #303a49}#message{white-space:pre-wrap;color:#a7d8bc}#runtime{white-space:pre-wrap}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:8px;border-bottom:1px solid #303a49}.scroll{overflow:auto}.top{display:flex;align-items:center;justify-content:space-between}\n</style></head><body><main><div class="top"><h1>🥕 emoskata · 核心管理</h1><button id="logout" class="secondary">退出</button></div><p class="muted">系统参数只读写同一份 .env。账号、签到设置和通知保存在 SQLite；历史共享数据保留但不启用；管理员密码不能用于个人登录。</p>\n<section><h2>Bot 服务</h2><label>Telegram Bot Token<input id="token" type="password" autocomplete="off" placeholder="留空保留，不回显"></label><label class="check"><input id="clear-token" type="checkbox">明确清除 Bot Token</label><p id="configured" class="muted"></p><p class="muted">emos 用户 ID 在下方系统参数的 EMOS_USER_ID 配置；填写后 Bot 的 /login 直接跳转官方授权，不再索要。官方授权后按账号 ID 与 TG 绑定核验。</p><label>个人网页公开地址<input id="web-base" placeholder="https://sign.example.com"></label><small>公网 HTTPS；仅填写域名和可选端口，不含路径。</small></section>\n<section><h2>全部系统参数</h2><p class="muted">带“重启生效”的参数保存后点击下面的核心重启。改变 DATA_DIR 会切换数据库位置，不会搬迁数据；仅更新程序时保持原目录。</p><div id="fields" class="grid"></div><button id="save">保存到 .env</button><button id="reload" class="secondary">重新读取配置</button></section><div id="message" role="status" aria-live="polite"></div>\n<section><h2>应用核心</h2><div id="runtime">正在读取…</div><button id="refresh-runtime" class="secondary">刷新运行信息</button><button id="restart" class="danger">重启应用核心</button><p class="muted">不重启宿主机，不需要 root。先删除旧 emoskata.py，再把新文件上传到同一路径，确认上传完成后点击重启。文件缺失或语法错误会拒绝重启并保留旧核心。</p></section>\n<section><h2>账号运行状态 · 只读</h2><div class="scroll"><table><thead><tr><th>账号</th><th>官方 ID</th><th>状态</th><th>可用余额</th><th>本次所得</th><th>最近签到</th></tr></thead><tbody id="rows"></tbody></table></div><p class="muted">首号官方授权、其他账号 Token 添加及账号设置请从 TG Bot 进入。旧版账号和记录不会因更新被清空。</p></section></main><script>\nconst $=id=>document.getElementById(id);let revision=\'\',controls=new Map();\nasync function api(path,body){const r=await fetch(\'/api/\'+path,{credentials:\'same-origin\',method:body===undefined?\'GET\':\'POST\',headers:{\'Content-Type\':\'application/json\'},body:body===undefined?undefined:JSON.stringify(body)});const j=await r.json();if(r.status===401){location.replace(\'/login\');throw Error(\'管理员会话已失效\');}if(!r.ok)throw Error(j.error||\'操作失败\');return j;}\nfunction say(text){$(\'message\').textContent=text||\'\';}\nasync function runtime(){const s=await api(\'runtime\');$(\'runtime\').textContent=\'核心 PID：\'+s.pid+\' · 线程：\'+s.threads+\'\\n当前内存：\'+(s.rss_bytes==null?\'不可读取\':(s.rss_bytes/1048576).toFixed(1)+\' MiB\')+\' · 峰值：\'+(s.max_rss_bytes==null?\'不可读取\':(s.max_rss_bytes/1048576).toFixed(1)+\' MiB\')+\'\\n服务器公网 IP：\'+(s.server_public_ip||(s.public_ip_status===\'pending\'?\'探测中\':\'不可获取\'))+\'\\n管理访问地址：\'+(s.management_url||\'请配置 PUBLIC_BASE\')+\'\\n容器监听：\'+s.bind_host+\':\'+s.port+\' · 内网 IP（仅诊断）：\'+s.container_ip+\'\\n状态：\'+s.restart_status+\' · 网页待办：\'+s.pending_web_jobs+\' · 通知待办：\'+s.notification_queue+(s.restart_error?\'\\n\'+s.restart_error:\'\');}\nasync function load(){const c=await api(\'config\');revision=c.revision;controls=new Map([[\'TG_BOT_TOKEN\',$(\'token\')],[\'WEB_BASE_URL\',$(\'web-base\')]]);$(\'token\').value=\'\';$(\'clear-token\').checked=false;$(\'web-base\').value=c.web_base_url||\'\';$(\'configured\').textContent=c.tg_bot_configured?\'Token 已配置。留空保存保持不变。\':\'尚未配置 Token。\';$(\'fields\').replaceChildren();for(const f of c.fields){if(controls.has(f.key))continue;const label=document.createElement(\'label\');label.append(document.createTextNode(f.label+(f.restart?\' · 重启生效\':\'\')));const input=document.createElement(f.kind===\'bool\'?\'select\':\'input\');if(f.kind===\'bool\'){for(const [value,text] of [[\'1\',\'开启\'],[\'0\',\'关闭\']]){const option=document.createElement(\'option\');option.value=value;option.textContent=text;input.append(option);}}else{input.type=f.secret?\'password\':f.kind===\'int\'?\'number\':\'text\';if(f.kind===\'int\'){input.min=f.minimum;input.max=f.maximum;}if(f.secret){input.autocomplete=\'new-password\';input.placeholder=f.configured?\'已配置，留空保留\':\'留空保留\';}}input.value=f.value;input.dataset.key=f.key;label.append(input);const detail=document.createElement(\'small\');detail.textContent=f.description;label.append(detail);$(\'fields\').append(label);controls.set(f.key,input);}const rows=await api(\'accounts\');$(\'rows\').replaceChildren();for(const row of rows){const tr=document.createElement(\'tr\');for(const text of [row.name,row.emos_id||\'待重新授权\',row.last_status||\'未运行\',Number.isInteger(row.carrot)?row.carrot:\'未知\',Number.isInteger(row.last_carrot)?\'+\'+row.last_carrot:\'—\',row.last_run||\'—\']){const td=document.createElement(\'td\');td.textContent=text;tr.append(td);}$(\'rows\').append(tr);}await runtime();}\nasync function operation(fn){document.querySelectorAll(\'button\').forEach(b=>b.disabled=true);try{await fn();}catch(e){say(e.message||\'操作失败\');}finally{document.querySelectorAll(\'button\').forEach(b=>b.disabled=false);}}\n$(\'save\').onclick=()=>operation(async()=>{const changes={};for(const [key,control] of controls)changes[key]=control.value;const clear_secrets=$(\'clear-token\').checked?[\'TG_BOT_TOKEN\']:[];const result=await api(\'config\',{changes,revision,clear_secrets});say(\'已保存到唯一配置文件 .env。\'+(result.restart_required.length?\'\\n重启生效：\'+result.restart_required.join(\', \'):\'\'));if(result.changed.includes(\'PANEL_PASSWORD\'))location.replace(\'/login\');else await load();});\n$(\'reload\').onclick=()=>operation(load);$(\'refresh-runtime\').onclick=()=>operation(runtime);\n$(\'restart\').onclick=()=>operation(async()=>{if(!confirm(\'确认新 py 已上传完成？这只重启应用核心，账号和配置不删除。\'))return;const r=await api(\'restart\',{confirm:true});say(r.message+\'\\n网络任务收尾后重启，可稍后刷新运行信息。\');});\n$(\'logout\').onclick=()=>operation(async()=>{await api(\'logout\',{});location.replace(\'/login\');});load().catch(e=>say(e.message));\n</script></body></html>\n'
+PAGE = '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>emoskata · 核心管理</title><style>\n:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#101318;color:#eef2f7;font:14px/1.6 system-ui,sans-serif}main{max-width:960px;margin:auto;padding:22px 16px 60px}h1{font-size:24px}h2{font-size:17px;margin-top:0}section{background:#191f28;border:1px solid #303a49;border-radius:12px;padding:20px;margin:16px 0}label{display:block;margin-top:12px}input,select{width:100%;padding:9px;background:#111722;color:inherit;border:1px solid #303a49;border-radius:8px;font:inherit}button{padding:9px 14px;margin:12px 8px 0 0;border:0;border-radius:8px;background:#76a7ff;color:#111722;font:600 14px system-ui;cursor:pointer}button.secondary{background:#2b3646;color:inherit}button.danger{background:#51323a;color:#ffc1c7}.muted,small{color:#9caabd}small{display:block}.check{display:flex;gap:8px;align-items:center}.check input{width:auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:12px}.grid label{margin:0;padding:10px;border-bottom:1px solid #303a49}#message{white-space:pre-wrap;color:#a7d8bc}#runtime{white-space:pre-wrap}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:8px;border-bottom:1px solid #303a49}.scroll{overflow:auto}.top{display:flex;align-items:center;justify-content:space-between}\n</style></head><body><main><div class="top"><h1>🥕 emoskata · 核心管理</h1><button id="logout" class="secondary">退出</button></div><p class="muted">系统参数只读写同一份 .env。账号、签到设置和通知保存在 SQLite；历史共享数据保留但不启用；管理员密码不能用于个人登录。</p>\n<section><h2>Bot 服务</h2><label>Telegram Bot Token<input id="token" type="password" autocomplete="off" placeholder="留空保留，不回显"></label><label class="check"><input id="clear-token" type="checkbox">明确清除 Bot Token</label><p id="configured" class="muted"></p><p class="muted">emos 用户 ID 在下方系统参数的 EMOS_USER_ID 配置；填写后 Bot 的 /login 直接跳转官方授权，不再索要。官方授权后按账号 ID 与 TG 绑定核验。</p><label>个人网页公开地址<input id="web-base" placeholder="https://sign.example.com"></label><small>公网 HTTPS；仅填写域名和可选端口，不含路径。</small></section>\n<section><h2>全部系统参数</h2><p class="muted">带“重启生效”的参数保存后点击下面的核心重启。改变 DATA_DIR 会切换数据库位置，不会搬迁数据；仅更新程序时保持原目录。</p><div id="fields" class="grid"></div><button id="save">保存到 .env</button><button id="reload" class="secondary">重新读取配置</button></section><div id="message" role="status" aria-live="polite"></div>\n<section><h2>应用核心</h2><div id="runtime">正在读取…</div><button id="refresh-runtime" class="secondary">刷新运行信息</button><button id="restart" class="danger">重启应用核心</button><p class="muted">不重启宿主机，不需要 root。先删除旧 emoskata.py，再把新文件上传到同一路径，确认上传完成后点击重启。文件缺失或语法错误会拒绝重启并保留旧核心。</p></section>\n<section><h2>账号归属迁移</h2><p class="muted">列出所有登记过的 TG 使用者与账号数。迁移单个账号只搬这一个号；整组换号把该 TG 的全部账号改归目标 TG，源 TG 行删除、网页会话立即失效。主号迁走后只保留为普通账号，需在新 TG 重新 /login 官方授权。</p><label>目标 TG 用户 ID<input id="transfer-target" inputmode="numeric" placeholder="例如 123456789"></label><div class="scroll"><table><thead><tr><th>TG 用户 ID</th><th>账号数</th><th>账号</th><th>操作</th></tr></thead><tbody id="owners"></tbody></table></div></section><section><h2>账号运行状态 · 只读</h2><div class="scroll"><table><thead><tr><th>账号</th><th>官方 ID</th><th>状态</th><th>可用余额</th><th>本次所得</th><th>最近签到</th></tr></thead><tbody id="rows"></tbody></table></div><p class="muted">首号官方授权、其他账号 Token 添加及账号设置请从 TG Bot 进入。旧版账号和记录不会因更新被清空。</p></section></main><script>\nconst $=id=>document.getElementById(id);let revision=\'\',controls=new Map();\nasync function api(path,body){const r=await fetch(\'/api/\'+path,{credentials:\'same-origin\',method:body===undefined?\'GET\':\'POST\',headers:{\'Content-Type\':\'application/json\'},body:body===undefined?undefined:JSON.stringify(body)});const j=await r.json();if(r.status===401){location.replace(\'/login\');throw Error(\'管理员会话已失效\');}if(!r.ok)throw Error(j.error||\'操作失败\');return j;}\nfunction say(text){$(\'message\').textContent=text||\'\';}\nasync function runtime(){const s=await api(\'runtime\');$(\'runtime\').textContent=\'核心 PID：\'+s.pid+\' · 线程：\'+s.threads+\'\\n当前内存：\'+(s.rss_bytes==null?\'不可读取\':(s.rss_bytes/1048576).toFixed(1)+\' MiB\')+\' · 峰值：\'+(s.max_rss_bytes==null?\'不可读取\':(s.max_rss_bytes/1048576).toFixed(1)+\' MiB\')+\'\\n服务器公网 IP：\'+(s.server_public_ip||(s.public_ip_status===\'pending\'?\'探测中\':\'不可获取\'))+\'\\n管理访问地址：\'+(s.management_url||\'请配置 PUBLIC_BASE\')+\'\\n容器监听：\'+s.bind_host+\':\'+s.port+\' · 内网 IP（仅诊断）：\'+s.container_ip+\'\\n状态：\'+s.restart_status+\' · 网页待办：\'+s.pending_web_jobs+\' · 通知待办：\'+s.notification_queue+(s.restart_error?\'\\n\'+s.restart_error:\'\');}\nasync function load(){const c=await api(\'config\');revision=c.revision;controls=new Map([[\'TG_BOT_TOKEN\',$(\'token\')],[\'WEB_BASE_URL\',$(\'web-base\')]]);$(\'token\').value=\'\';$(\'clear-token\').checked=false;$(\'web-base\').value=c.web_base_url||\'\';$(\'configured\').textContent=c.tg_bot_configured?\'Token 已配置。留空保存保持不变。\':\'尚未配置 Token。\';$(\'fields\').replaceChildren();for(const f of c.fields){if(controls.has(f.key))continue;const label=document.createElement(\'label\');label.append(document.createTextNode(f.label+(f.restart?\' · 重启生效\':\'\')));const input=document.createElement(f.kind===\'bool\'?\'select\':\'input\');if(f.kind===\'bool\'){for(const [value,text] of [[\'1\',\'开启\'],[\'0\',\'关闭\']]){const option=document.createElement(\'option\');option.value=value;option.textContent=text;input.append(option);}}else{input.type=f.secret?\'password\':f.kind===\'int\'?\'number\':\'text\';if(f.kind===\'int\'){input.min=f.minimum;input.max=f.maximum;}if(f.secret){input.autocomplete=\'new-password\';input.placeholder=f.configured?\'已配置，留空保留\':\'留空保留\';}}input.value=f.value;input.dataset.key=f.key;label.append(input);const detail=document.createElement(\'small\');detail.textContent=f.description;label.append(detail);$(\'fields\').append(label);controls.set(f.key,input);}const rows=await api(\'accounts\');$(\'rows\').replaceChildren();for(const row of rows){const tr=document.createElement(\'tr\');for(const text of [row.name,row.emos_id||\'待重新授权\',row.last_status||\'未运行\',Number.isInteger(row.carrot)?row.carrot:\'未知\',Number.isInteger(row.last_carrot)?\'+\'+row.last_carrot:\'—\',row.last_run||\'—\']){const td=document.createElement(\'td\');td.textContent=text;tr.append(td);}$(\'rows\').append(tr);}await runtime();}\nasync function operation(fn){document.querySelectorAll(\'button\').forEach(b=>b.disabled=true);try{await fn();}catch(e){say(e.message||\'操作失败\');}finally{document.querySelectorAll(\'button\').forEach(b=>b.disabled=false);}}\n$(\'save\').onclick=()=>operation(async()=>{const changes={};for(const [key,control] of controls)changes[key]=control.value;const clear_secrets=$(\'clear-token\').checked?[\'TG_BOT_TOKEN\']:[];const result=await api(\'config\',{changes,revision,clear_secrets});say(\'已保存到唯一配置文件 .env。\'+(result.restart_required.length?\'\\n重启生效：\'+result.restart_required.join(\', \'):\'\'));if(result.changed.includes(\'PANEL_PASSWORD\'))location.replace(\'/login\');else await load();});\n$(\'reload\').onclick=()=>operation(load);$(\'refresh-runtime\').onclick=()=>operation(runtime);\n$(\'restart\').onclick=()=>operation(async()=>{if(!confirm(\'确认新 py 已上传完成？这只重启应用核心，账号和配置不删除。\'))return;const r=await api(\'restart\',{confirm:true});say(r.message+\'\\n网络任务收尾后重启，可稍后刷新运行信息。\');});\n$(\'logout\').onclick=()=>operation(async()=>{await api(\'logout\',{});location.replace(\'/login\');});async function ownersLoad(){const owners=await api(\'owners\');const rows=await api(\'accounts\');const body=$(\'owners\');body.replaceChildren();for(const owner of owners){const tr=document.createElement(\'tr\');for(const text of [owner.tg_id,owner.accounts]){const td=document.createElement(\'td\');td.textContent=text;tr.append(td);}const pickCell=document.createElement(\'td\');const pick=document.createElement(\'select\');const blank=document.createElement(\'option\');blank.value=\'\';blank.textContent=\'选择账号\';pick.append(blank);for(const row of rows.filter(r=>r.owner_tg_id===owner.tg_id)){const option=document.createElement(\'option\');option.value=row.id;option.textContent=(row.name||\'未命名\')+\' · \'+(row.emos_id||\'未授权\');pick.append(option);}pickCell.append(pick);tr.append(pickCell);const actions=document.createElement(\'td\');const one=document.createElement(\'button\');one.textContent=\'迁移所选\';one.className=\'secondary\';one.onclick=()=>operation(async()=>{const target=$(\'transfer-target\').value.trim();if(!pick.value)throw Error(\'请先选择要迁移的账号。\');if(!target)throw Error(\'请填写目标 TG ID。\');if(!confirm(\'确认把该账号迁到 TG \'+target+\'？主号迁走后需重新 /login。\'))return;await api(\'transfer\',{action:\'account\',account_id:Number(pick.value),target_tg_id:target});say(\'已迁移到 TG \'+target+\'。\');await ownersLoad();await load();});const all=document.createElement(\'button\');all.textContent=\'整组换号\';all.className=\'danger\';all.onclick=()=>operation(async()=>{const target=$(\'transfer-target\').value.trim();if(!target)throw Error(\'请填写目标 TG ID。\');if(!confirm(\'确认把 TG \'+owner.tg_id+\' 的全部账号改归 TG \'+target+\'？源 TG 行删除，网页会话立即失效。\'))return;await api(\'transfer\',{action:\'owner\',source_tg_id:owner.tg_id,target_tg_id:target});say(\'已把 TG \'+owner.tg_id+\' 的账号全部迁到 \'+target+\'。\');await ownersLoad();await load();});actions.append(one,all);tr.append(actions);body.append(tr);}}load().then(ownersLoad).catch(e=>say(e.message));\n</script></body></html>\n'
 
 
 # HTTP 入口
@@ -1223,13 +1286,20 @@ class Handler(BaseHTTPRequestHandler):
                     'FROM accounts ORDER BY id').fetchall()]
             return self._send(200, rows)
 
+        if path == '/api/owners':
+            return self._send(200, Store().accounts.owners_overview())
+
         if path == "/api/logs":
             if "tg_allowed_user_ids" in cfg_all():
-                policy = tg_access_owner(cfg_all())
+                policy = tg_access_owners(cfg_all())
                 if policy == 0:
                     return self._send(200, [])
-                if policy is not None:
-                    return self._send(200, Store().accounts.logs(policy, limit=100))
+                if policy:
+                    rows = []
+                    for owner in policy:
+                        rows.extend(Store().accounts.logs(owner, limit=100))
+                    rows.sort(key=lambda row: row.get('ts') or '', reverse=True)
+                    return self._send(200, rows[:150])
                 with db() as conn:
                     rows = [dict(row) for row in conn.execute(
                         'SELECT l.id,l.account_id,l.name,l.ts,l.status,l.message,l.carrot,'
@@ -1310,6 +1380,20 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/api/accounts':
             return self._send(410, {'ok': False, 'error': '请在 TG Bot 通过官方 Bot 登录添加账号。'})
 
+        if path == '/api/transfer':
+            action = body.get('action')
+            target = body.get('target_tg_id')
+            try:
+                if action == 'account':
+                    result = Store().accounts.transfer_account(body.get('account_id'), target)
+                elif action == 'owner':
+                    result = Store().accounts.transfer_owner(body.get('source_tg_id'), target)
+                else:
+                    return self._send(400, {'ok': False, 'error': '迁移类型必须为 account 或 owner。'})
+            except DomainError as error:
+                return self._send(400, {'ok': False, 'error': str(error)})
+            return self._send(200, dict(result, ok=True))
+
         if path == '/api/run':
             return self._send(410, {'ok': False, 'error': '请在 TG Bot 内签到。'})
 
@@ -1374,7 +1458,7 @@ def bot_supervisor():
                     _shutdown.wait(1)
                     continue
                 wanted = (cfg['tg_bot_token'], cfg['tg_api_base_url'], cfg['tg_poll_timeout'],
-                          cfg['bot_workers'], cfg['bot_max_jobs'], tg_access_owner(cfg))
+                          cfg['bot_workers'], cfg['bot_max_jobs'], tg_access_owners(cfg))
                 dead = current is not None and current._poll_thread is not None and not current._poll_thread.is_alive()
                 if wanted != identity or (wanted[0] and dead):
                     if current:
@@ -1741,7 +1825,7 @@ def main():
             print('[config] 部分旧配置无效，请在管理页检查。')
         if cfg['http_enabled']:
             init_password()
-        if not cfg['http_enabled'] and (not cfg['tg_bot_token'] or tg_access_owner(cfg) == 0):
+        if not cfg['http_enabled'] and (not cfg['tg_bot_token'] or tg_access_owners(cfg) == 0):
             raise EnvConfigError('纯 Bot 模式需要 Bot Token 和有效访问策略；TG ID 留空为公开。')
         _shutdown.clear()
         _notification_wakeup.clear()

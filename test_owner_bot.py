@@ -151,8 +151,10 @@ class OwnerBotTests(unittest.TestCase):
                 for row in a[3] or [] for b in row if 'url' in b]
         self.assertIn('https://t.me/emospg_bot?start=link_ePrimary-emos_test_bot', urls)
         self.message('/login eExtra')
-        self.assertIn('其他账号', self.text())
-        self.assertFalse(any('link_eExtra' in u for u in urls))
+        # 官方换绑：显式 ID 覆盖旧主号，生成新授权链接而不是拒绝。
+        new_urls = [b['url'] for a in self.tg.actions if a[0] in {'send', 'edit'}
+                    for row in a[3] or [] for b in row if 'url' in b]
+        self.assertTrue(any('link_eExtra' in u for u in new_urls))
 
     def test_foreign_actor_group_and_wrong_chat_cannot_operate(self):
         self.message('/login ePrimary', actor=202)
@@ -201,7 +203,7 @@ class OwnerBotTests(unittest.TestCase):
         self.app.Store().accounts.switch(101, primary['id'])
         views = [self.b._view_accounts(101), self.b._view_settings(101), self.b._view_logs(101)]
         keyboards = [bot.menu_kb(primary)] + [keyboard for _, keyboard in views]
-        allowed = {'sign', 'signall', 'accounts', 'settings', 'logs', 'login', 'token', 'web', 'help',
+        allowed = {'sign', 'signall', 'balance', 'accounts', 'settings', 'logs', 'login', 'token', 'web', 'help',
                    'mode', 'auto', 'guide', 'pref', 'menu', 'switch', 'cancel', 'relogin', 'hide', 'logout'}
         for keyboard in keyboards:
             for row in keyboard:

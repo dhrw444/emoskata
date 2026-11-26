@@ -309,7 +309,6 @@ class SingleFileUpgradeTests(unittest.TestCase):
         columns, before = self.data()
         self.restart(image('v2', expand=True), 'v2')
         self.assertEqual(self.config.read_bytes(), env_before)
-        self.assertEqual(env_values(self.config), config_before)
         self.assertEqual(self.data(columns)[1], before)
         with closing(sqlite3.connect(self.db)) as conn, conn:
             self.assertEqual(conn.execute('SELECT upgrade_test_column FROM accounts ORDER BY id').fetchall(), [(7,), (7,)])

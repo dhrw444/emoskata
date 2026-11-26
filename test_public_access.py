@@ -32,9 +32,14 @@ class AccessPolicyTests(unittest.TestCase):
         self.assertTrue(owner_permitted({'tg_allowed_user_ids': '101'}, 101))
         self.assertFalse(owner_permitted({'tg_allowed_user_ids': '101'}, 202))
         for config in ({}, None, {'tg_allowed_user_ids': None}, {'tg_allowed_user_ids': False},
-                       {'tg_allowed_user_ids': 'bad'}, {'tg_allowed_user_ids': '101,202'}):
+                       {'tg_allowed_user_ids': 'bad'}, {'tg_allowed_user_ids': '101,0'}):
             self.assertEqual(tg_access_owner(config), 0)
             self.assertFalse(owner_permitted(config, 101))
+        # 多个合法 ID 是名单模式：只放行名单内的人。
+        multi = {'tg_allowed_user_ids': '101,202'}
+        self.assertTrue(owner_permitted(multi, 101))
+        self.assertTrue(owner_permitted(multi, 202))
+        self.assertFalse(owner_permitted(multi, 303))
 
     def test_public_bot_menu_registers_all_private_chats_without_global_chat_id(self):
         store, tg = FakeStore(), FakeTG()

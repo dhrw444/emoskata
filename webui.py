@@ -75,9 +75,11 @@ def _only(body, allowed):
 
 class WebService:
     """持有个人会话域和有界签到队列；首次签到才启动一个 worker。"""
-    def __init__(self, db, write, cfg, accounts, run_user):
+    def __init__(self, db, write, cfg, accounts, run_user, refresh_balances=None):
         self.db, self.write, self.cfg = db, write, cfg
         self.accounts, self.run_user = accounts, run_user
+        # 只读余额刷新由 app 注入；缺省时网页按钮返回明确错误而不是静默失败。
+        self.refresh_balances = refresh_balances
         self.lock = threading.RLock()
         self.jobs, self.requests, self.pending = {}, {}, {}
         self.logout_confirmations = {}
@@ -249,6 +251,7 @@ class WebService:
             'review': ('account_id', 'source_id', 'target_id', 'approve'),
             'withdraw': ('account_id', 'source_id', 'target_id'),
             'account-logout': ('account_id', 'all_accounts', 'confirmation'),
+            'balance': ('account_id',),
         }
         if action not in fields:
             raise DomainError('网页操作无效。')
@@ -257,6 +260,13 @@ class WebService:
             self.accounts.set_preferences(tg_id, **body)
             return {'ok': True}
         root = _local_id(body.get('account_id'), allow_zero=action == 'switch')
+        if action == 'balance':
+            if not callable(self.refresh_balances):
+                raise DomainError('余额刷新暂不可用。')
+            rows = self.refresh_balances(tg_id, include_links=True, expected_root=root)
+            if rows is None:
+                raise DomainError('已有签到或刷新正在运行，请稍后再试。')
+            return {'ok': True, 'rows': rows}
         if action == 'account-logout':
             return self._account_logout(tg_id, root, body)
         if action == 'switch':
@@ -510,7 +520,7 @@ button.secondary{background:#2b3646;color:var(--ink)}button.danger{background:#5
 _DASHBOARD_HTML = '''
 <header><div><h1>🥕 我的签到配置</h1><p class="muted">首个账号通过官方 Bot 授权，其他账号用 emos Token 添加。这里显示全部账号。</p></div><button id="logout" class="secondary">退出网页</button></header>
 <div id="flash" role="status" aria-live="polite"></div>
-<section><h2>当前账号</h2><label for="accounts">选择已登录账号</label><select id="accounts"></select><p id="identity" class="muted"></p><div class="row"><button id="sign">签到当前账号</button><button id="sign-all" class="secondary">签到全部账号</button><button id="refresh" class="secondary">刷新状态</button></div><div class="row"><button id="account-logout" class="danger">退出当前账号</button><button id="accounts-logout-all" class="danger">全部账号退出</button></div><p class="muted">账号退出需再次确认：只清除本地 Token 并关闭签到，保留账号、萝卜、日志与偏好；不代表官方 Token 失效。「退出网页」只关闭网页会话。</p><div id="result" role="status"></div></section>
+<section><h2>当前账号</h2><label for="accounts">选择已登录账号</label><select id="accounts"></select><p id="identity" class="muted"></p><div class="row"><button id="sign">签到当前账号</button><button id="sign-all" class="secondary">签到全部账号</button><button id="balance" class="secondary">刷新余额</button><button id="refresh" class="secondary">刷新状态</button></div><div class="row"><button id="account-logout" class="danger">退出当前账号</button><button id="accounts-logout-all" class="danger">全部账号退出</button></div><p class="muted">账号退出需再次确认：只清除本地 Token 并关闭签到，保留账号、萝卜、日志与偏好；不代表官方 Token 失效。「退出网页」只关闭网页会话。</p><div id="result" role="status"></div></section>
 <div class="grid"><section><h2>我的签到设置</h2><p class="muted">此处仅改变当前账号。</p><label class="check"><input id="auto" type="checkbox">自动签到</label><label for="time">签到时间（00:xx 自动调整到 01:xx）</label><input id="time" type="time" value="08:00"><p id="timezone" class="muted"></p><label for="sign-mode">签到模式</label><select id="sign-mode"><option value="normal">普通签到（不带附言）</option><option value="random">随机字签到（自动带附言）</option></select><p class="muted">奖励由官方决定。每个账号保留自己的选择，关联方不能修改。</p><button id="save-settings">保存签到设置</button></section>
 <section><h2>我的通知</h2><label class="check"><input id="n-success" type="checkbox">签到成功通知</label><label class="check"><input id="n-fail" type="checkbox">签到失败通知</label><label class="check"><input id="n-already" type="checkbox">已签到通知</label><button id="save-preferences">保存通知设置</button><p class="muted">发送到你的 TG 私聊。</p></section></div>
 <section><h2>关联账号 · 我代签（已停用）</h2><p class="muted">目标必须已在同一个 Bot 登录。官方账号 ID 用来定位，目标的一次性码用来申请；目标账号二次确认后授权。</p><form id="link-form"><div class="row"><div><label for="target">目标官方账号 ID</label><input id="target" autocomplete="off" placeholder="eXXXXXXXXs" maxlength="256" required></div><div><label for="link-code">目标的一次性关联码</label><input id="link-code" type="password" autocomplete="off" maxlength="256" required></div></div><button type="submit">添加关联</button></form><div id="outgoing"></div></section>
@@ -554,6 +564,7 @@ $('copy-code').onclick=()=>operation(async()=>{if(!issued)throw Error('请先生
 async function startSign(allAccounts){const expected=root();if(!requestKey||requestKey.root!==expected||requestKey.all!==allAccounts)requestKey={root:expected,all:allAccounts,key:newKey()};const result=await api('sign',{account_id:expected,request_id:requestKey.key,all_accounts:allAccounts});if(jobTimer)clearTimeout(jobTimer);await pollJob(result.job_id,expected);}
 $('sign').onclick=()=>operation(()=>startSign(false));
 $('sign-all').onclick=()=>operation(()=>startSign(true));
+$('balance').onclick=()=>operation(async()=>{const data=await api('balance',{account_id:root()});const lines=data.rows.map(row=>row.name+' · '+row.emos_id+'：'+(Number.isInteger(row.balance)?row.balance:'读取失败'));$('result').textContent=lines.join('\n')||'没有可刷新的账号。';await load();});
 $('refresh').onclick=()=>operation(load);
 async function logoutAccounts(allAccounts){const expected=root();const prepared=await api('account-logout',{account_id:expected,all_accounts:allAccounts});const label=allAccounts?'全部 '+prepared.accounts+' 个账号':'当前账号';if(!confirm('确认退出'+label+'？\n清除本地 Token、关闭签到并取消授权与输入。\n账号、萝卜、日志与偏好保留。不代表官方 Token 失效。'))return;const result=await api('account-logout',{account_id:expected,all_accounts:allAccounts,confirmation:prepared.confirmation});hideCode();requestKey=null;if(jobTimer)clearTimeout(jobTimer);$('result').textContent='已本地退出 '+result.accounts+' 个账号。主号 /login 官方重授权，其他账号 /token 重登。';flash('本地密钥已清除；没有向官方发起 Token 撤销。');location.replace('/web/login');}
 $('account-logout').onclick=()=>operation(()=>logoutAccounts(false));

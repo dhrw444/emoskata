@@ -159,7 +159,7 @@ EMOS_ENV_FILE="$PWD/config/.env" python3 runtime/emoskata.py --check-config
 EMOS_ENV_FILE=/app/config/.env python3 /app/runtime/emoskata.py
 ```
 
-`HTTP_ENABLED` 应写进 `.env`；进程环境不参与配置。纯 Bot 必须有 Token，TG ID 留空即可公开；非法 ID 拒绝启动。纯 Bot 模式目前没有等价的 Bot 核心重启命令。
+`HTTP_ENABLED` 应写进 `.env`；进程环境不参与配置。纯 Bot 必须有 Token，TG ID 留空即可公开，可用逗号分隔多个 ID 限制访问；非法 ID 拒绝启动。纯 Bot 模式目前没有等价的 Bot 核心重启命令。
 
 ### 分文件
 

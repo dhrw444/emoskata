@@ -52,8 +52,8 @@ SCHEMA = {
     'RETRY_DELAYS': Field('300,900,2700', '失败退避（秒）', '1–5 档递增，每档至少 300 秒；当天耗尽后停止。', 'delays'),
     'BOT_WORKERS': Field('2', 'Bot 操作线程数', '默认 2；1 更省内存，最多 8。', 'int', 1, 8, restart=True),
     'BOT_MAX_JOBS': Field('16', 'Bot 待办上限', '包含正在运行任务；达到上限后明确拒绝新操作。', 'int', 4, 128, restart=True),
-    'TG_ALLOWED_USER_IDS': Field('', 'TG 访问限制',
-                                 '留空公开使用；填写一个正整数仅允许该 TG ID。公开用户只管理自己的账号，通知发送给本人。', 'owner_id'),
+    'TG_ALLOWED_USER_IDS': Field('', '允许使用的 TG 用户 ID',
+                                 '留空公开使用；填一个正整数仅允许该 ID；可用逗号分隔多个 ID。', 'owner_id'),
     'EMOS_USER_ID': Field('', 'emos 用户 ID',
                           '仅指定 TG ID 模式的 /login 默认账号 ID；公开模式首登由各用户发送自己的 ID。', 'emos_id'),
     'EMOS_AUTH_BOT': Field('emospg_bot', 'emos 官方授权 Bot',
@@ -209,8 +209,12 @@ def validate_env(values, allow_unset_password=False):
                     raise EnvConfigError('SIGN_TIMEZONE 不可用，请安装 tzdata 或选常用固定时区。') from None
         elif field.kind == 'owner_id':
             # 留空显式开启公开使用；非法非空值不能降级为公开模式。
-            if value and (not re.fullmatch(r'[1-9][0-9]{0,18}', value) or int(value) >= 2**63):
-                raise EnvConfigError('%s 只能填一个正整数 TG 用户 ID。' % key)
+            if value:
+                parts = [piece for piece in re.split(r'[,;\s]+', value) if piece]
+                if (not parts or any(not re.fullmatch(r'[1-9][0-9]{0,18}', piece)
+                                     or int(piece) >= 2**63 for piece in parts)):
+                    raise EnvConfigError('%s 只能填正整数 TG 用户 ID，可用逗号分隔多个。' % key)
+                value = ','.join(str(number) for number in sorted({int(piece) for piece in parts}))
         elif field.kind == 'tg_bot':
             # Telegram 用户名规则：字母开头，5–32 位字母数字下划线。
             if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{4,31}', value):
@@ -243,35 +247,58 @@ def validate_env(values, allow_unset_password=False):
     return normalized
 
 
-def tg_access_owner(cfg):
-    """返回访问策略：None 为显式留空公开，正整数为指定用户，0 为非法配置。
+def tg_access_owners(cfg):
+    """返回访问策略：() 为显式留空公开，非空元组为允许的 TG ID，None 为非法配置。
 
-    缺键和非字符串空值不表示公开；生产配置由 schema 提供该键。"""
+    缺键和非字符串空值不表示公开；生产配置由 schema 提供该键。
+    """
     if not isinstance(cfg, dict) or 'tg_allowed_user_ids' not in cfg:
-        return 0
+        return None
     raw = cfg['tg_allowed_user_ids']
-    if isinstance(raw, str):
-        raw = raw.strip()
-        if not raw:
+    if type(raw) is int:
+        return (raw,) if 0 < raw < 2**63 else None
+    if not isinstance(raw, str):
+        return None
+    raw = raw.strip()
+    if not raw:
+        return ()
+    values = []
+    for piece in (part for part in re.split(r'[,;\s]+', raw) if part):
+        if not re.fullmatch(r'[1-9][0-9]{0,18}', piece):
             return None
-        if not re.fullmatch(r'[1-9][0-9]{0,18}', raw):
-            return 0
-        raw = int(raw)
-    return raw if type(raw) is int and 0 < raw < 2**63 else 0
+        value = int(piece)
+        if value >= 2**63:
+            return None
+        values.append(value)
+    return tuple(sorted(set(values)))
+
+
+def tg_access_owner(cfg):
+    """单值视图：非法返回 0，公开返回 None，单个 ID 返回该 ID；多 ID 也返回 None。"""
+    owners = tg_access_owners(cfg)
+    if owners is None:
+        return 0
+    return owners[0] if len(owners) == 1 else None
+
+
+def configured_owners(cfg):
+    """允许使用的 TG ID 元组；公开模式与非法配置都返回空元组。"""
+    return tg_access_owners(cfg) or ()
 
 
 def configured_owner(cfg):
-    """仅返回指定 TG ID；公开或非法配置没有固定操作者，需另用访问策略判断。"""
-    owner = tg_access_owner(cfg)
-    return owner if owner else None
+    """仅返回唯一的指定 TG ID；公开、多 ID 或非法配置没有单一操作者。"""
+    return tg_access_owner(cfg)
 
 
 def owner_permitted(cfg, tg_id):
-    """公开模式准许合法 TG 私聊身份；指定模式只准该 ID，非法配置一律拒绝。"""
+    """公开模式准许合法 TG 私聊身份；指定模式只准名单内 ID，非法配置一律拒绝。"""
     if type(tg_id) is not int or not 0 < tg_id < 2**63:
         return False
-    owner = tg_access_owner(cfg)
-    return owner is None or owner == tg_id
+    owners = tg_access_owners(cfg)
+    if owners is None:
+        return False
+    return not owners or tg_id in owners
 
 
 def serialize_env(values):
@@ -365,6 +392,7 @@ class ConfigStore:
             raise EnvConfigError('.env 必须是普通文件；不支持符号链接或单文件 secret 挂载。')
         _, existing = _read(self.path)
         self.provided_keys = set(existing)
+
         self.snapshot()
 
     @contextmanager
@@ -429,6 +457,7 @@ class ConfigStore:
                 raw, parsed = _read(self.path)
                 values = complete_values(parsed)
                 self.provided_keys = set(parsed)
+
                 self._cache = values
                 self._revision = hashlib.sha256(raw).hexdigest()
                 self._fingerprint = stamp

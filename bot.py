@@ -17,7 +17,7 @@ import urllib.request
 
 from accounts import DomainError
 from emos import EmosClient, EmosError, pick_content
-from envconfig import SCHEMA, tg_access_owner, owner_permitted
+from envconfig import SCHEMA, owner_permitted, tg_access_owners
 
 POLL_TIMEOUT = 30
 PAGE_SIZE = 8
@@ -29,14 +29,15 @@ _SECRET = re.compile(
 
 
 def _allowed_users(cfg):
-    """None 表示显式公开；指定 ID 返回单元素集合，非法配置返回空集合。"""
-    owner = tg_access_owner(cfg)
-    return None if owner is None else {owner} if owner else set()
-
+    """返回允许的 TG 名单：None 为公开，空集为非法配置，否则为名单集合。"""
+    owners = tg_access_owners(cfg)
+    if owners is None:
+        return set()
+    return set(owners) if owners else None
 
 def allowed_actor(tg_id, cfg):
-    """留空允许任意合法 TG 私聊用户，填写时仅允许指定用户；每次读取当前配置。"""
-    return owner_permitted(cfg, tg_id)
+    """公开模式允许任意合法 TG 私聊身份；名单模式只准名单内 ID，非法配置拒绝。"""
+    return _positive(tg_id) and owner_permitted(cfg, tg_id)
 
 
 def _carrot_text(account):
@@ -311,6 +312,7 @@ def menu_kb(account=None):
     signall = "signall:%s" % root if account else "login:0"
     return [[{"text": "✅ 签到当前账号", "callback_data": sign},
              {"text": "✅ 签到全部账号", "callback_data": signall}],
+            [{"text": "🥕 刷新余额", "callback_data": "balance:%d" % root}],
             [{"text": "👤 账号 / 切换", "callback_data": "accounts:%d:0" % root}],
             [{"text": "⚙️ 签到设置", "callback_data": "settings:%d" % root},
              {"text": "📜 签到记录", "callback_data": "logs:%d:0" % root}],
@@ -332,6 +334,7 @@ HELP = """<b>🥕 emoskata · 多账号签到 Bot</b>
 /sign — 只签到当前账号
 <code>/sign 任意附言</code> — 只给当前账号本次签到带附言
 /signall — 签到全部有效账号，各按保存模式执行
+/balance — 只读取各账号当前余额，不签到
 /account 或 /accounts — 查看全部账号、余额与切换
 /web — 配置网页，管理账号、签到与通知
 /settings — 当前账号自动签到、时间、模式及通知
@@ -353,7 +356,7 @@ COMMANDS = (
     ("start", "打开签到机器人"), ("menu", "主菜单"),
     ("login", "首个账号官方授权／主账号重新授权"),
     ("token", "用 emos Token 添加其他账号"),
-    ("sign", "签到当前账号"), ("signall", "签到全部账号"),
+    ("sign", "签到当前账号"), ("signall", "签到全部账号"), ("balance", "刷新各账号余额"),
     ("accounts", "全部账号、余额与切换"),
     ("settings", "当前账号签到与通知设置"), ("time", "修改当前账号签到时间"),
     ("logs", "全部账号签到记录"), ("web", "打开配置网页"),
@@ -490,17 +493,18 @@ class Bot:
                 return
             print("[bot] @%s 已上线" % self.me["username"])
             try:
-                owner = tg_access_owner(self.store.cfg_all())
-                if owner != 0:
-                    scope = ({"type": "all_private_chats"} if owner is None
-                             else {"type": "chat", "chat_id": owner})
-                    self.tg._api("setMyCommands", {
-                        "commands": command_menu(), "scope": scope
-                    }, timeout=12)
-                    button = {"menu_button": {"type": "commands"}}
-                    if owner is not None:
-                        button['chat_id'] = owner
-                    self.tg._api("setChatMenuButton", button, timeout=12)
+                policy = tg_access_owners(self.store.cfg_all())
+                if policy != 0:
+                    scopes = ([{"type": "all_private_chats"}] if not policy
+                              else [{"type": "chat", "chat_id": owner} for owner in policy])
+                    for scope in scopes:
+                        self.tg._api("setMyCommands", {
+                            "commands": command_menu(), "scope": scope
+                        }, timeout=12)
+                        button = {"menu_button": {"type": "commands"}}
+                        if "chat_id" in scope:
+                            button["chat_id"] = scope["chat_id"]
+                        self.tg._api("setChatMenuButton", button, timeout=12)
             except Exception:
                 print("[bot] 斜杠菜单注册失败；命令仍可直接输入，未计作注册成功。")
             delay = self.retry_base
@@ -648,8 +652,14 @@ class Bot:
             except Exception:
                 print("[bot] 操作失败；原始输入、凭据及异常详情不记录。")
                 self._reply(chat_id, "操作暂时失败，请刷新菜单后重试。", menu_kb())
-        if not self._jobs.submit(tg_id, work):
-            self._control_call(lambda: self.tg.send(chat_id, "已有操作在处理或队列已满。本次未执行，请稍后重试。"))
+        # 签到是长任务（多账号 + 间隔 + 网络），用独立键，避免堵住同一用户的其它命令。
+        long_running = bool(re.match(r'/sign(?:all)?(?:@[A-Za-z0-9_]+)?(?:\s|$)', text, re.I)) or (
+            callback and isinstance(data, str) and data.split(':', 1)[0] in {'sign', 'signall'})
+        key = (tg_id, 'sign') if long_running else tg_id
+        if not self._jobs.submit(key, work):
+            message = ('签到已在进行中，请等待本次完成。' if long_running
+                       else '已有操作在处理或队列已满。本次未执行，请稍后重试。')
+            self._control_call(lambda: self.tg.send(chat_id, message))
 
     def _reply(self, chat_id, text, keyboard=None, msg_id=None):
         """发送或编辑结果；权限撤销或已停止时不发消息。
@@ -756,13 +766,13 @@ class Bot:
         if expected is not None:
             self._selection(tg_id, expected)
             root = expected
-        if primary:
-            if official_id is not None and official_id != primary['emos_id']:
-                raise DomainError('已有官方主账号；其他账号请使用 /token 添加。')
-            official_id = primary['emos_id']
+        configured = ''
         if official_id is None:
             cfg = self.store.cfg_all()
-            if tg_access_owner(cfg) is None:
+            policy = tg_access_owners(cfg)
+            configured = str(cfg.get('emos_user_id') or '').strip()
+            if not policy:
+                # 公开模式：每人自己输入 emos ID，不共用全局账号。
                 self.accounts.cancel_login(tg_id)
                 self._clear_input(tg_id)
                 self.accounts.set_input(tg_id, 'login', ttl=600)
@@ -773,19 +783,23 @@ class Bot:
                                    '请发送你自己的 emos 用户 ID（官网账号卡片上的 ID，不是 Token）。\n'
                                    '也可发送 <code>/login 你的emosID</code>。输入 10 分钟有效。',
                                    [[{'text': '取消', 'callback_data': 'cancel'}]], msg_id)
-            configured = str(cfg.get('emos_user_id') or '').strip()
-            if not configured:
+            if configured:
+                official_id = configured
+            elif primary is not None:
+                official_id = primary['emos_id']
+            else:
+                # 名单模式但未配置全局 ID：允许本人手动输入，不阻断首登。
                 self.accounts.cancel_login(tg_id)
                 self._clear_input(tg_id)
+                self.accounts.set_input(tg_id, 'login', ttl=600)
+                user = self.accounts.user(tg_id)
+                with self._state_lock:
+                    self._guided[tg_id] = ('login', root, user['input_until'])
                 return self._reply(chat_id, '<b>🔐 第一个账号：官方 Bot 授权</b>\n\n'
-                                   '尚未配置 emos 用户 ID。\n'
-                                   '请在系统配置 <code>.env</code> 填写 <code>EMOS_USER_ID</code>'
-                                   '（emos 官网账号卡片上的用户 ID，不是 Token），保存后直接发送 /login。\n'
-                                   '也可临时使用 <code>/login 你的emosID</code>。',
-                                   [[{'text': '在官网查看 emos ID',
-                                      'url': str(self.store.cfg_all().get('base_url') or SCHEMA['EMOS_BASE_URL'].default).rstrip('/') + '/'}],
-                                    [{'text': '返回菜单', 'callback_data': 'menu'}]], msg_id)
-            official_id = configured
+                                   '尚未配置 <code>EMOS_USER_ID</code>。\n'
+                                   '请发送你自己的 emos 用户 ID（官网账号卡片上的 ID，不是 Token）。\n'
+                                   '也可发送 <code>/login 你的emosID</code>。输入 10 分钟有效。',
+                                   [[{'text': '取消', 'callback_data': 'cancel'}]], msg_id)
         if (not isinstance(official_id, str) or not re.fullmatch(r'[A-Za-z0-9_]{1,48}', official_id)
                 or re.fullmatch(r'[0-9]+_[A-Za-z0-9_-]{8,}', official_id)):
             raise DomainError('emos 用户 ID 无效：请检查 .env 的 EMOS_USER_ID，不要填 Token。')
@@ -822,7 +836,7 @@ class Bot:
                      [{'text': '返回菜单', 'callback_data': 'menu'}]])
 
     def _show_menu(self, tg_id, chat_id, msg_id=None):
-        primary = self.accountmary = self.accounts.primary_account(tg_id)
+        primary = self.accounts.primary_account(tg_id)
         account = self._active(tg_id)
         if not primary or not account:
             return self._show_login(tg_id, chat_id, msg_id)
@@ -867,7 +881,8 @@ class Bot:
         if nav:
             keyboard.append(nav)
         primary = self.accounts.primary_account(tg_id)
-        keyboard.extend([[{"text": "添加 Token 账号" if primary else "官方授权第一个账号",
+        keyboard.extend([[{"text": "🥕 刷新余额", "callback_data": "balance:%d" % root}],
+                         [{"text": "添加 Token 账号" if primary else "官方授权第一个账号",
                            "callback_data": ("token:%d" if primary else "login:%d") % root}],
                          [{"text": "主菜单", "callback_data": "menu"}]])
         return "\n".join(lines), keyboard
@@ -1111,8 +1126,7 @@ class Bot:
             official = profile.get("_user_id")
         if official is None or isinstance(official, bool) or not str(official).strip():
             raise DomainError("官方资料缺少账号 ID，授权未保存。")
-        if str(official).strip() != requested_id:
-            raise DomainError('官方回传账号 ID 与本次填写的 ID 不一致，账号未保存。')
+        # 官方可能已换绑账号；回传 ID 与发起时不同不算错误，落库以回传 ID 为准。
         linked_tg = profile.get("telegram_user_id")
         if linked_tg in (None, ""):
             self._reply(chat_id, '官方账号尚未绑定 Telegram，当前凭证不能证明是你自己的账号。\n'
@@ -1136,6 +1150,28 @@ class Bot:
         self._clear_input(tg_id)
         self._reply(chat_id, "✅ 已登录 <b>%s</b> · 官方 ID <code>%s</code>。" %
                     (_esc(account.get("name")), _esc(account.get("emos_id"))), menu_kb(account))
+
+    def _refresh_balance(self, tg_id, chat_id, expected, msg_id=None):
+        """只读刷新全部账号余额；不签到、不改状态，结果直接显示。"""
+        root = self._root(tg_id, expected)
+        if self.stop_event.is_set():
+            return
+        self._reply(chat_id, "⏳ 正在读取各账号余额…", msg_id=msg_id)
+        result = self.store.refresh_balances(tg_id, include_links=True, expected_root=expected)
+        if result is None:
+            self._reply(chat_id, "已有签到或刷新正在运行，请稍后再试。", menu_kb(root))
+            return
+        if not isinstance(result, list) or not result:
+            self._reply(chat_id, "没有可刷新的账号。", menu_kb(root))
+            return
+        lines = ["<b>🥕 账号余额</b>", ""]
+        for row in result:
+            balance = row.get('balance')
+            shown = _carrot_text({'carrot': balance}) if balance is not None else "🍥 读取失败"
+            lines.append("%s · <code>%s</code>\n%s" % (
+                _esc(row.get('name') or row.get('emos_id') or '未命名', 120),
+                _esc(row.get('emos_id'), 128), shown))
+        self._reply(chat_id, "\n".join(lines), menu_kb(root))
 
     def _run_and_report(self, tg_id, chat_id, expected, content=None, all_accounts=False):
         """按明确当前或全部范围执行并返回脱敏报告；返回前重新查询可见账号。"""
@@ -1257,6 +1293,10 @@ class Bot:
             if args:
                 raise DomainError('请直接发送 /web 打开配置。')
             return self._show_web(tg_id, chat_id, expected)
+        if cmd == "/balance":
+            if args:
+                raise DomainError('用法：/balance，刷新全部账号余额。')
+            return self._refresh_balance(tg_id, chat_id, expected)
         if cmd == "/signall":
             if args:
                 raise DomainError('批量签到请发送 /signall。')
@@ -1342,6 +1382,11 @@ class Bot:
             user = self.accounts.user(tg_id) or {}
             self.accounts.set_preferences(tg_id, **{key: not _flag(user.get(key))})
             return self._show(chat_id, self._view_settings(tg_id), msg_id)
+        if action == "balance" and len(parts) == 2:
+            expected = 0 if parts[1] == "0" else _number(parts[1])
+            self._selection(tg_id, expected)
+            self._selection(tg_id, arrival_root)
+            return self._refresh_balance(tg_id, chat_id, expected, msg_id)
         if action in {'login', 'relogin', 'token', 'sign', 'signall', 'code', 'settings', 'auto', 'web'} and len(parts) == 2:
             expected = _page(parts[1]) if parts[1] == "0" else _number(parts[1])
             self._selection(tg_id, expected)

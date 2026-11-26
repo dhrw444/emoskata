@@ -464,15 +464,17 @@ class BotTests(unittest.TestCase):
             self.assertIsNone(bot._allowed_users(self.store.cfg_all()))
             self.assertTrue(bot.allowed_actor(101, self.store.cfg_all()))
             self.assertTrue(bot.allowed_actor(202, self.store.cfg_all()))
-        for value in (None, False, True, [], {}, '0', '101,202'):
+        for value in (None, False, True, [], {}, '0', '101,abc'):
             self.store.config['tg_allowed_user_ids'] = value
             self.assertEqual(bot._allowed_users(self.store.cfg_all()), set())
             self.assertFalse(bot.allowed_actor(101, self.store.cfg_all()))
 
-    def test_allowed_users_accepts_only_one_id(self):
-        for value in ('101,202', '101 202'):
+    def test_allowed_users_accepts_multiple_ids_and_denies_others(self):
+        for value in ('101,202', '101 202', '202,101'):
             self.store.config['tg_allowed_user_ids'] = value
-            self.assertFalse(bot.allowed_actor(101, self.store.cfg_all()))
+            self.assertTrue(bot.allowed_actor(101, self.store.cfg_all()))
+            self.assertTrue(bot.allowed_actor(202, self.store.cfg_all()))
+            self.assertFalse(bot.allowed_actor(303, self.store.cfg_all()))
         self.store.config['tg_allowed_user_ids'] = '101'
         self.assertTrue(bot.allowed_actor(101, self.store.cfg_all()))
         self.assertFalse(bot.allowed_actor(202, self.store.cfg_all()))
@@ -557,14 +559,13 @@ class BotTests(unittest.TestCase):
         self.assertTrue(self.store.accounts.login_pending(101))
         self.assertLessEqual(self.store.accounts.user(101)["login_until"], int(time.time()) + 600)
 
-    def test_missing_configured_user_id_reports_env_key_without_asking_for_input(self):
-        # 未配置 EMOS_USER_ID 时不进入输入态，只指向 .env 的配置项。
+    def test_missing_configured_user_id_falls_back_to_manual_input(self):
+        # 未配置 EMOS_USER_ID 时允许本人手动输入，不阻断首登。
         self.message("/login")
         self.assertFalse(any(button.get('url','').startswith('https://t.me/emospg_bot') for button in self.buttons()))
         self.assertIn('EMOS_USER_ID', self.text())
-        self.assertIn('.env', self.text())
         self.assertFalse(self.store.accounts.login_pending(101))
-        self.assertEqual(self.store.accounts.input_state(101), '')
+        self.assertEqual(self.store.accounts.input_state(101), 'login')
 
     def test_configured_user_id_jumps_to_official_bot_without_asking(self):
         # 配好 EMOS_USER_ID 后 /login 直接给出官方授权链接，不再索要 ID。
@@ -772,8 +773,11 @@ class BotTests(unittest.TestCase):
                                  'test_bot 的替身 %s 与生产签名不一致，测试会假通过' % name)
         # 反向也要守：生产新增了 Bot 会调用的公开方法而替身没有，一调用就 AttributeError。
         # 私有实现细节（_now/_active 等）和 init_schema 不在替身职责内。
+        # 后台管理专用方法不属于 Bot 的调用面，替身不需要实现。
+        admin_only = {'init_schema', 'watchers', 'owners_overview',
+                      'transfer_account', 'transfer_owner'}
         missing = sorted(name for name in set(prod) - set(fake)
-                         if not name.startswith('_') and name not in ('init_schema', 'watchers'))
+                         if not name.startswith('_') and name not in admin_only)
         self.assertEqual(missing, [], '这些生产方法在 test_bot 替身里缺失：%s' % missing)
 
     def test_sign_mode_toggle_persists_and_shows_mark(self):
