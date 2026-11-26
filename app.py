@@ -1481,7 +1481,7 @@ def bot_supervisor():
                         mode = '公开私聊' if wanted[-1] is None else '指定 TG ID'
                         print('[bot] %s模式：官方首登、Token 多账号及网页入口已启用。' % mode)
                     else:
-                        print('[bot] 请配置 Bot Token；TG ID 留空公开，填一个正整数限制访问。')
+                        print('[bot] 请配置 Bot Token；TG ID 留空公开，填一个或多个正整数限制访问。')
             except Exception:
                 print('[bot] 当前配置或网络暂不可用，稍后重试。')
             _shutdown.wait(5)
