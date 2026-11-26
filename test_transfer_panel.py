@@ -108,6 +108,68 @@ class TransferPanelTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=3)
 
+    def test_accounts_without_emos_id_still_listed_and_movable(self):
+        """历史账号可能没有 emos_id；迁移面板必须能看见并搬运它们。"""
+        with self.app.write_db() as conn:
+            conn.execute("INSERT INTO tg_users(tg_id,chat_id) VALUES(?,?)", (910000001, 910000001))
+            conn.execute("INSERT INTO tg_users(tg_id,chat_id) VALUES(?,?)", (910000002, 910000002))
+            cur = conn.execute(
+                "INSERT INTO accounts(name,token,emos_id,owner_tg_id) VALUES(?,?,?,?)",
+                ('历史账号', 'tok_legacy', '', 910000001))
+            account_id = cur.lastrowid
+        server = ThreadingHTTPServer(('127.0.0.1', 0), self.app.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            self.login(server)
+            # 迁移清单来自 /api/owners，不受管理员策略筛选影响。
+            code, data = self.request(server, '/api/owners')
+            self.assertEqual(code, 200, data)
+            owners = {row['tg_id']: row for row in json.loads(data)}
+            items = {item['id']: item for item in owners[910000001]['items']}
+            self.assertIn(account_id, items)
+            self.assertEqual(items[account_id]['emos_id'], '')
+            code, data = self.request(server, '/api/transfer', 'POST',
+                                      {'action': 'account', 'account_id': str(account_id),
+                                       'target_tg_id': '910000002'})
+            self.assertEqual(code, 200, data)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
+    def test_unattributed_accounts_have_their_own_row_and_move_individually(self):
+        """owner_tg_id 为空的历史账号归入「未归属」，只能逐个迁移。"""
+        with self.app.write_db() as conn:
+            conn.execute("INSERT INTO tg_users(tg_id,chat_id) VALUES(?,?)", (920000001, 920000001))
+            cur = conn.execute(
+                "INSERT INTO accounts(name,token,emos_id,owner_tg_id) VALUES(?,?,?,?)",
+                ('游离账号', 'tok_orphan', 'eOrphan', None))
+            account_id = cur.lastrowid
+        server = ThreadingHTTPServer(('127.0.0.1', 0), self.app.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            self.login(server)
+            code, data = self.request(server, '/api/owners')
+            self.assertEqual(code, 200, data)
+            rows = json.loads(data)
+            stray = [row for row in rows if row['tg_id'] is None]
+            self.assertEqual(len(stray), 1, rows)
+            self.assertEqual(stray[0]['accounts'], 1)
+            code, data = self.request(server, '/api/transfer', 'POST',
+                                      {'action': 'account', 'account_id': str(account_id),
+                                       'target_tg_id': '920000001'})
+            self.assertEqual(code, 200, data)
+            with self.app.db() as conn:
+                owner = conn.execute('SELECT owner_tg_id FROM accounts WHERE id=?',
+                                     (account_id,)).fetchone()[0]
+            self.assertEqual(owner, 920000001)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=3)
+
     def test_panel_uses_section_message_and_sends_numbers(self):
         """静态接线：状态行在迁移区块内，目标 ID 以数字提交。"""
         page = self.app.PAGE
@@ -116,6 +178,10 @@ class TransferPanelTests(unittest.TestCase):
         self.assertIn('target_tg_id:Number(target)', page)
         self.assertIn("function tsay(text)", page)
         self.assertNotIn("target_tg_id:target}", page)
+        # 迁移选择只用 /api/owners 自带的 items，避免受策略筛选影响。
+        self.assertIn('for(const row of (owner.items||[]))', page)
+        owners_load = page.split('async function ownersLoad', 1)[1].split('load()', 1)[0]
+        self.assertNotIn("api(\\'accounts\\')", owners_load)
 
 
 if __name__ == '__main__':

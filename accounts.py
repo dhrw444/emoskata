@@ -935,16 +935,18 @@ class AccountService:
     def admin_overview(self) -> list:
         """返回管理员脱敏投影；指定模式只选该 ID，公开模式返回全部登记账号。
 
+        未完成官方授权的历史账号同样返回，由前端标为未授权；Token 不在投影里。
         管理员认证由调用方负责，非法或读取期间变化的策略不返回账号。"""
         policy = self._policy()
         if policy == 0:
             return []
         with closing(self._db()) as conn:
-            sql = "SELECT * FROM accounts WHERE emos_id IS NOT NULL AND emos_id<>'' "
+            # 迁移面板需要历史账号：不再按 emos_id 过滤，是否授权由前端标注。
+            sql = 'SELECT * FROM accounts '
             params = ()
             if policy:
                 marks = ','.join('?' * len(policy))
-                sql += 'AND owner_tg_id IN (%s) ' % marks
+                sql += 'WHERE owner_tg_id IN (%s) ' % marks
                 params = tuple(policy)
             rows = conn.execute(sql + 'ORDER BY owner_tg_id,id', params).fetchall()
         if self._policy() != policy:
@@ -972,16 +974,32 @@ class AccountService:
                 "SELECT owner_tg_id AS tg_id,COUNT(*) AS accounts FROM accounts "
                 "WHERE owner_tg_id IS NOT NULL AND owner_tg_id NOT IN "
                 "(SELECT tg_id FROM tg_users) GROUP BY owner_tg_id").fetchall()
+            unattributed = conn.execute(
+                'SELECT COUNT(*) FROM accounts WHERE owner_tg_id IS NULL').fetchone()[0]
+            # 迁移选择需要具体账号；按归属分组，不返回 Token。
+            crowded = {}
+            for item in conn.execute(
+                    'SELECT id,name,emos_id,owner_tg_id FROM accounts ORDER BY id').fetchall():
+                crowded.setdefault(item['owner_tg_id'], []).append(
+                    {'id': item['id'], 'name': item['name'] or '',
+                     'emos_id': item['emos_id'] or ''})
         result = []
         for row in rows:
             result.append({'tg_id': row['tg_id'], 'chat_id': row['chat_id'],
                            'accounts': int(row['accounts'] or 0),
-                           'is_primary_owner': row['primary_id'] is not None})
+                           'is_primary_owner': row['primary_id'] is not None,
+                           'items': crowded.get(row['tg_id'], [])})
+        # 没有任何归属的历史账号单独一行，tg_id 为 None；只能逐个迁移。
+        if unattributed:
+            result.append({'tg_id': None, 'chat_id': None,
+                           'accounts': int(unattributed), 'is_primary_owner': False,
+                           'items': crowded.get(None, [])})
         for row in orphans:
             if row['tg_id'] not in known:
                 result.append({'tg_id': row['tg_id'], 'chat_id': None,
                                'accounts': int(row['accounts'] or 0),
-                               'is_primary_owner': False})
+                               'is_primary_owner': False,
+                               'items': crowded.get(row['tg_id'], [])})
         return result
 
     def transfer_account(self, account_id, target_tg_id) -> dict:
@@ -994,8 +1012,9 @@ class AccountService:
         target = _positive_id(target_tg_id)
         with self._write() as conn:
             row = conn.execute('SELECT * FROM accounts WHERE id=?', (account_id,)).fetchone()
-            if row is None or not str(row['emos_id'] or '').strip():
-                raise DomainError('账号不存在或尚未完成官方授权')
+            if row is None or not (str(row['emos_id'] or '').strip()
+                                   or str(row['token'] or '').strip()):
+                raise DomainError('账号不存在或尚未完成授权')
             source = row['owner_tg_id']
             if source == target:
                 return {'moved': [], 'source': source, 'target': target}
