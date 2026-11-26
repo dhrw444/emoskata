@@ -157,6 +157,7 @@ class TransferPanelTests(unittest.TestCase):
             stray = [row for row in rows if row['tg_id'] is None]
             self.assertEqual(len(stray), 1, rows)
             self.assertEqual(stray[0]['accounts'], 1)
+            self.assertEqual([item['id'] for item in stray[0]['items']], [account_id])
             code, data = self.request(server, '/api/transfer', 'POST',
                                       {'action': 'account', 'account_id': str(account_id),
                                        'target_tg_id': '920000001'})
